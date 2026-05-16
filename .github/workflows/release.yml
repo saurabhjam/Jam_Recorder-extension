@@ -1,0 +1,298 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '8.15.0'
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Validate the tag and extract version info
+  # ──────────────────────────────────────────────
+  validate:
+    name: Validate Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      prerelease: ${{ steps.extract.outputs.prerelease }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: extract
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          # Detect pre-release (alpha, beta, rc)
+          if echo "$VERSION" | grep -qE "(alpha|beta|rc)"; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          echo "Tag: $TAG, Version: $VERSION"
+
+  # ──────────────────────────────────────────────
+  # Build and package the Chrome Extension
+  # ──────────────────────────────────────────────
+  build-extension:
+    name: Build Chrome Extension
+    runs-on: ubuntu-latest
+    needs: [validate]
+    outputs:
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Update extension version in manifest
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          MANIFEST="apps/extension/public/manifest.json"
+          if [ -f "$MANIFEST" ]; then
+            node -e "
+              const fs = require('fs');
+              const manifest = JSON.parse(fs.readFileSync('$MANIFEST', 'utf8'));
+              manifest.version = '$VERSION';
+              fs.writeFileSync('$MANIFEST', JSON.stringify(manifest, null, 2));
+              console.log('Updated manifest version to', manifest.version);
+            "
+          else
+            echo "No manifest.json found at $MANIFEST, skipping version update"
+          fi
+
+      - name: Build extension (production)
+        run: pnpm --filter "@snaptrace/extension" build:prod
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL || 'https://api.yourapp.com' }}
+          VITE_APP_VERSION: ${{ needs.validate.outputs.version }}
+
+      - name: Verify extension build output
+        run: |
+          ls -la apps/extension/dist/
+          test -f apps/extension/dist/manifest.json || (echo "Missing manifest.json" && exit 1)
+
+      - name: Package extension as ZIP
+        id: package
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ARTIFACT_NAME="snaptrace-extension-v${VERSION}.zip"
+          cd apps/extension/dist
+          zip -r "../../../${ARTIFACT_NAME}" .
+          echo "artifact-name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          echo "Created: ${ARTIFACT_NAME}"
+          ls -lh "../../../${ARTIFACT_NAME}"
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-zip
+          path: snaptrace-extension-v${{ needs.validate.outputs.version }}.zip
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # Build all other packages
+  # ──────────────────────────────────────────────
+  build-all:
+    name: Build All Packages
+    runs-on: ubuntu-latest
+    needs: [validate]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all workspaces
+        run: pnpm build
+
+  # ──────────────────────────────────────────────
+  # Build and push Docker images for release
+  # ──────────────────────────────────────────────
+  docker-release:
+    name: Docker Release Images
+    runs-on: ubuntu-latest
+    needs: [validate, build-all]
+    if: ${{ secrets.REGISTRY_URL != '' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          target: production
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/snaptrace-backend:${{ needs.validate.outputs.version }}
+            ${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
+
+      - name: Build and push worker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/worker.Dockerfile
+          target: production
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/snaptrace-worker:${{ needs.validate.outputs.version }}
+            ${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
+
+      - name: Build and push dashboard
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/dashboard.Dockerfile
+          target: production
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VITE_API_URL=${{ secrets.VITE_API_URL }}
+            VITE_WS_URL=${{ secrets.VITE_WS_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:${{ needs.validate.outputs.version }}
+            ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
+
+  # ──────────────────────────────────────────────
+  # Generate changelog and create GitHub Release
+  # ──────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate, build-extension, build-all]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download extension zip
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-zip
+          path: ./release-assets/
+
+      - name: Generate changelog from git log
+        id: changelog
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+            echo "Generating changelog from ${RANGE}"
+          else
+            RANGE="HEAD"
+            echo "First release – using full history"
+          fi
+
+          CHANGELOG=$(git log $RANGE --pretty=format:"- %s (%h)" --no-merges)
+
+          # Categorize commits
+          FEATURES=$(echo "$CHANGELOG" | grep -i "^- feat" || echo "")
+          FIXES=$(echo "$CHANGELOG" | grep -i "^- fix" || echo "")
+          CHORES=$(echo "$CHANGELOG" | grep -iv "^- feat\|^- fix" || echo "")
+
+          {
+            echo "CHANGELOG<<EOF"
+            echo "## What's Changed in v${VERSION}"
+            echo ""
+            if [ -n "$FEATURES" ]; then
+              echo "### Features"
+              echo "$FEATURES"
+              echo ""
+            fi
+            if [ -n "$FIXES" ]; then
+              echo "### Bug Fixes"
+              echo "$FIXES"
+              echo ""
+            fi
+            if [ -n "$CHORES" ]; then
+              echo "### Other Changes"
+              echo "$CHORES"
+              echo ""
+            fi
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...v${VERSION}"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: List release assets
+        run: ls -la ./release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: 'SnapTrace v${{ needs.validate.outputs.version }}'
+          body: ${{ steps.changelog.outputs.CHANGELOG }}
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          draft: false
+          files: |
+            ./release-assets/*.zip
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

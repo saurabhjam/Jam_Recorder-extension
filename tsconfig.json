@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "apps/backend" },
+    { "path": "apps/dashboard" },
+    { "path": "apps/extension" },
+    { "path": "apps/worker" },
+    { "path": "packages/config" },
+    { "path": "packages/shared" },
+    { "path": "packages/types" },
+    { "path": "packages/ui" }
+  ]
+}

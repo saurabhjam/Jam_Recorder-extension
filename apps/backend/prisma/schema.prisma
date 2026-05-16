@@ -1,0 +1,262 @@
+// ============================================================
+// SnapTrace Platform - Prisma Schema
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum RecordingStatus {
+  UPLOADING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum RecordingType {
+  SCREEN
+  TAB
+  WEBCAM
+  SCREENSHOT
+}
+
+enum Plan {
+  FREE
+  PRO
+  TEAM
+  ENTERPRISE
+}
+
+enum NotificationType {
+  RECORDING_READY
+  COMMENT
+  TEAM_INVITE
+  SHARE_VIEWED
+}
+
+model User {
+  id                   String          @id @default(cuid())
+  email                String          @unique
+  name                 String
+  password             String
+  avatar               String?
+  isVerified           Boolean         @default(false)
+  isActive             Boolean         @default(true)
+  teamId               String?
+  team                 Team?           @relation(fields: [teamId], references: [id])
+  recordings           Recording[]
+  sessions             Session[]
+  comments             Comment[]
+  notifications        Notification[]
+  activityLogs         ActivityLog[]
+  passwordResets       PasswordReset[]
+  googleId             String?         @unique
+  passwordResetToken   String?         @unique
+  passwordResetExpires DateTime?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+
+  @@index([email])
+  @@index([teamId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken String   @unique
+  userAgent    String?
+  ip           String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([refreshToken])
+}
+
+model Team {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  plan        Plan         @default(FREE)
+  logo        String?
+  members     User[]
+  recordings  Recording[]
+  invites     TeamInvite[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([slug])
+}
+
+model TeamInvite {
+  id        String   @id @default(cuid())
+  teamId    String
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  email     String
+  role      Role     @default(MEMBER)
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([teamId])
+  @@index([token])
+  @@index([email])
+}
+
+model Recording {
+  id            String          @id @default(cuid())
+  title         String          @default("Untitled Recording")
+  description   String?
+  userId        String
+  user          User            @relation(fields: [userId], references: [id])
+  teamId        String?
+  team          Team?           @relation(fields: [teamId], references: [id])
+  status        RecordingStatus @default(UPLOADING)
+  type          RecordingType   @default(SCREEN)
+  url           String?
+  thumbnailUrl  String?
+  duration      Int? // seconds
+  size          BigInt? // bytes
+  mimeType      String?
+  shareId       String          @unique @default(cuid())
+  isPublic      Boolean         @default(false)
+  allowDownload Boolean         @default(true)
+  viewCount     Int             @default(0)
+  metadata      Json?
+  chunks        UploadChunk[]
+  shareLinks    ShareLink[]
+  comments      Comment[]
+  analytics     Analytics[]
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@index([userId])
+  @@index([teamId])
+  @@index([shareId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model UploadChunk {
+  id          String    @id @default(cuid())
+  recordingId String
+  recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  chunkIndex  Int
+  totalChunks Int
+  size        Int
+  checksum    String?
+  cloudUrl    String?
+  uploadedAt  DateTime  @default(now())
+
+  @@unique([recordingId, chunkIndex])
+  @@index([recordingId])
+}
+
+model ShareLink {
+  id                  String    @id @default(cuid())
+  recordingId         String
+  recording           Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  token               String    @unique
+  password            String?
+  expiresAt           DateTime?
+  isPasswordProtected Boolean   @default(false)
+  allowDownload       Boolean   @default(true)
+  viewCount           Int       @default(0)
+  createdAt           DateTime  @default(now())
+
+  @@index([recordingId])
+  @@index([token])
+}
+
+model Comment {
+  id          String    @id @default(cuid())
+  recordingId String
+  recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  content     String
+  timestamp   Float? // video timestamp in seconds
+  parentId    String?
+  parent      Comment?  @relation("Replies", fields: [parentId], references: [id])
+  replies     Comment[] @relation("Replies")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([recordingId])
+  @@index([userId])
+  @@index([parentId])
+}
+
+model Analytics {
+  id          String    @id @default(cuid())
+  recordingId String
+  recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  event       String
+  visitorId   String?
+  ip          String?
+  userAgent   String?
+  referer     String?
+  metadata    Json?
+  createdAt   DateTime  @default(now())
+
+  @@index([recordingId])
+  @@index([event])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  message   String
+  isRead    Boolean          @default(false)
+  metadata  Json?
+  createdAt DateTime         @default(now())
+
+  @@index([userId])
+  @@index([isRead])
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  action    String
+  resource  String?
+  metadata  Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model PasswordReset {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([token])
+  @@index([userId])
+}

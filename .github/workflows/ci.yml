@@ -1,0 +1,373 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '8.15.0'
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Lint all workspaces
+  # ──────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run ESLint
+        run: pnpm lint
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  # ──────────────────────────────────────────────
+  # TypeScript type checking
+  # ──────────────────────────────────────────────
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: pnpm --filter "@snaptrace/types" build 2>/dev/null || true
+
+      - name: Run TypeScript type check
+        run: pnpm type-check
+
+  # ──────────────────────────────────────────────
+  # Backend unit + integration tests
+  # ──────────────────────────────────────────────
+  test-backend:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: jamdb_test
+          POSTGRES_USER: jam_test
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jam_test -d jamdb_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://jam_test:testpassword@localhost:5432/jamdb_test
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: test-jwt-secret-not-for-production
+      CLOUDINARY_CLOUD_NAME: test
+      CLOUDINARY_API_KEY: test
+      CLOUDINARY_API_SECRET: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Prisma migrations (test DB)
+        run: pnpm --filter backend exec prisma migrate deploy
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://jam_test:testpassword@localhost:5432/jamdb_test
+
+      - name: Run backend tests
+        run: pnpm --filter backend test --coverage
+        env:
+          DATABASE_URL: postgresql://jam_test:testpassword@localhost:5432/jamdb_test
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/coverage/
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # Build all workspaces
+  # ──────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, type-check]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all workspaces
+        run: pnpm build
+
+      - name: Upload extension build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-dist
+          path: apps/extension/dist/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload dashboard build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: apps/dashboard/dist/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ──────────────────────────────────────────────
+  # Docker build validation
+  # ──────────────────────────────────────────────
+  docker-build:
+    name: Docker Build Validation
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create dummy pnpm-lock.yaml if missing
+        run: |
+          if [ ! -f pnpm-lock.yaml ]; then
+            echo "lockfileVersion: '6.0'" > pnpm-lock.yaml
+          fi
+
+      - name: Build backend Docker image (validate)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          target: production
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: snaptrace-backend:ci
+
+      - name: Build worker Docker image (validate)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/worker.Dockerfile
+          target: production
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: snaptrace-worker:ci
+
+      - name: Build dashboard Docker image (validate)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/dashboard.Dockerfile
+          target: production
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: snaptrace-dashboard:ci
+
+  # ──────────────────────────────────────────────
+  # Deploy to production (main branch only)
+  # ──────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, test-backend, docker-build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_URL }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ secrets.REGISTRY_URL }}/snaptrace-backend
+            ${{ secrets.REGISTRY_URL }}/snaptrace-worker
+            ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          target: production
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ secrets.REGISTRY_URL }}/snaptrace-backend:${{ github.sha }},${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
+
+      - name: Build and push worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/worker.Dockerfile
+          target: production
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ secrets.REGISTRY_URL }}/snaptrace-worker:${{ github.sha }},${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
+
+      - name: Build and push dashboard image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/dashboard.Dockerfile
+          target: production
+          push: true
+          build-args: |
+            VITE_API_URL=${{ secrets.VITE_API_URL }}
+            VITE_WS_URL=${{ secrets.VITE_WS_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:${{ github.sha }},${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH || '/opt/snaptrace' }}
+
+            # Pull latest images
+            docker pull ${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
+            docker pull ${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
+            docker pull ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
+
+            # Update image tags in compose
+            export BACKEND_IMAGE=${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
+            export WORKER_IMAGE=${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
+            export DASHBOARD_IMAGE=${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
+
+            # Rolling restart (keeps DB and Redis running)
+            docker compose up -d --no-deps backend worker dashboard nginx
+
+            # Run migrations
+            docker compose exec -T backend node dist/migrate.js || true
+
+            # Health check
+            sleep 10
+            docker compose ps
+            curl -f http://localhost/nginx-health || (echo "Health check failed" && exit 1)
+
+            echo "Deployment successful: ${{ github.sha }}"
+
+      - name: Notify on deployment failure
+        if: failure()
+        run: |
+          echo "::error::Deployment to production failed for commit ${{ github.sha }}"
+          # Add Slack/email notification here if needed
