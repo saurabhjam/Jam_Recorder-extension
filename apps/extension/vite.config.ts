@@ -40,9 +40,8 @@ export default defineConfig(({ mode }) => {
       react(),
       webExtension({
         manifest: './public/manifest.json',
-        // Include both the content script and offscreen document as separate bundles.
-        // The offscreen HTML is served as a standalone extension page.
-        additionalInputs: ['src/content/index.ts', 'src/offscreen/index.html'],
+        // offscreen and editor are not in the manifest so they need their own entries
+        additionalInputs: ['src/offscreen/index.html', 'src/editor/index.html'],
         disableAutoLaunch: true,
       }),
       fixManifestExtensions(),

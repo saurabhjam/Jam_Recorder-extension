@@ -4,16 +4,15 @@
   "version": "1.0.0",
   "description": "Record your screen, capture bugs, and share instantly with SnapTrace",
   "permissions": [
-    "activeTab",
-    "tabs",
     "storage",
+    "tabs",
     "scripting",
-    "desktopCapture",
     "tabCapture",
-    "notifications",
+    "desktopCapture",
     "offscreen",
+    "activeTab",
     "downloads",
-    "alarms"
+    "windows"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -40,7 +39,7 @@
     {
       "matches": ["<all_urls>"],
       "js": ["src/content/index.ts"],
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [

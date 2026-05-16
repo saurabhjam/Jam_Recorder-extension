@@ -259,7 +259,7 @@ export class ChunkUploader {
 
       xhr.onerror = () => reject(new Error(`Network error on chunk ${chunkIndex}`));
       xhr.ontimeout = () => reject(new Error(`Timeout on chunk ${chunkIndex}`));
-      xhr.timeout = 60_000;
+      xhr.timeout = 300_000;
       xhr.send(formData);
     });
   }

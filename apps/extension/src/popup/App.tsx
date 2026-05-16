@@ -5,7 +5,6 @@ import { useRecordingStore } from '@/store/recording.store';
 import { useSettingsStore } from '@/store/settings.store';
 import { LoginView } from './views/LoginView';
 import { HomeView } from './views/HomeView';
-import { RecordingView } from './views/RecordingView';
 import { UploadView } from './views/UploadView';
 import { ShareView } from './views/ShareView';
 import { LibraryView } from './views/LibraryView';
@@ -16,7 +15,6 @@ import { SettingsView } from './views/SettingsView';
 type View =
   | 'login'
   | 'home'
-  | 'recording'
   | 'upload'
   | 'share'
   | 'library'
@@ -83,7 +81,8 @@ export default function App() {
       case 'recording':
       case 'paused':
       case 'requesting':
-        setCurrentView('recording');
+        // Close popup — floating toolbar on the page is the control surface
+        window.close();
         break;
       case 'uploading':
       case 'stopping':
@@ -94,7 +93,7 @@ export default function App() {
         break;
       case 'idle':
       case 'error':
-        if (currentView === 'recording' || currentView === 'upload') {
+        if (currentView === 'upload') {
           setCurrentView('home');
         }
         break;
@@ -145,20 +144,6 @@ export default function App() {
             className="flex-1 overflow-hidden"
           >
             <HomeView onNavigate={navigate} />
-          </motion.div>
-        )}
-
-        {currentView === 'recording' && (
-          <motion.div
-            key="recording"
-            variants={PAGE_VARIANTS}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            transition={PAGE_TRANSITION}
-            className="flex-1 overflow-hidden"
-          >
-            <RecordingView onCancel={() => navigate('home')} />
           </motion.div>
         )}
 

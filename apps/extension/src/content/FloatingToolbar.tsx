@@ -1,22 +1,6 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
-import { motion, AnimatePresence, useDragControls } from 'framer-motion';
-import {
-  Square,
-  Pause,
-  Play,
-  Camera,
-  Edit3,
-  Mic,
-  MicOff,
-  Video,
-  VideoOff,
-  ChevronDown,
-  ChevronUp,
-  GripVertical,
-} from 'lucide-react';
+import { useState, useCallback, useRef } from 'react';
+import { motion } from 'framer-motion';
 import { formatDuration } from '@/utils';
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface FloatingToolbarProps {
   recordingId: string;
@@ -28,312 +12,212 @@ interface FloatingToolbarProps {
   onAnnotate: (imageUrl: string) => void;
 }
 
-// ─── FloatingToolbar ──────────────────────────────────────────────────────────
-
-export function FloatingToolbar({
-  duration,
-  onStop,
-  onPause,
-  onResume,
-  onScreenshot,
-}: FloatingToolbarProps) {
+export function FloatingToolbar({ duration, onStop, onPause, onResume }: FloatingToolbarProps) {
   const [isPaused, setIsPaused] = useState(false);
-  const [isMicMuted, setIsMicMuted] = useState(false);
-  const [isWebcamOn, setIsWebcamOn] = useState(false);
-  const [isMinimized, setIsMinimized] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-
-  const dragControls = useDragControls();
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  // Drag bounds (keep toolbar within viewport)
-  const dragConstraints = {
-    top: -window.innerHeight + 120,
-    left: -window.innerWidth + 180,
-    right: 0,
-    bottom: 0,
-  };
+  const constraintsRef = useRef<HTMLDivElement>(null);
 
   const handlePauseResume = useCallback(() => {
-    if (isPaused) {
-      onResume();
-    } else {
-      onPause();
-    }
+    if (isPaused) onResume();
+    else onPause();
     setIsPaused((p) => !p);
   }, [isPaused, onPause, onResume]);
 
   const handleStop = useCallback(() => {
+    setIsStopping(true);
     onStop();
   }, [onStop]);
 
-  const handleScreenshot = useCallback(() => {
-    onScreenshot();
-  }, [onScreenshot]);
-
-  // Pulse animation for recording dot
-  useEffect(() => {
-    // Intentionally empty – pulse handled via CSS animation
-  }, []);
-
   return (
-    <motion.div
-      ref={containerRef}
-      drag
-      dragControls={dragControls}
-      dragMomentum={false}
-      dragConstraints={dragConstraints}
-      dragElastic={0.05}
-      onDragStart={() => setIsDragging(true)}
-      onDragEnd={() => setIsDragging(false)}
-      initial={{ opacity: 0, scale: 0.8, y: 20 }}
-      animate={{ opacity: 1, scale: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.8, y: 20 }}
-      transition={{ type: 'spring', stiffness: 350, damping: 25 }}
-      className="floating-toolbar"
-      style={{ cursor: isDragging ? 'grabbing' : 'default' }}
-    >
+    <>
+      <style>{`
+        @keyframes st-dot-pulse {
+          0%,100% { opacity:1; transform:scale(1); }
+          50% { opacity:0.45; transform:scale(1.4); }
+        }
+      `}</style>
+
+      {/* Full-page invisible drag boundary */}
       <div
+        ref={constraintsRef}
         style={{
-          background: 'rgba(9, 9, 11, 0.95)',
-          backdropFilter: 'blur(20px)',
-          WebkitBackdropFilter: 'blur(20px)',
-          border: '1px solid rgba(255,255,255,0.1)',
-          borderRadius: '20px',
-          boxShadow: '0 16px 64px rgba(0,0,0,0.5), 0 0 0 1px rgba(99,102,241,0.15)',
-          minWidth: isMinimized ? '160px' : '200px',
-          overflow: 'hidden',
+          position: 'fixed',
+          inset: 0,
+          pointerEvents: 'none',
+          zIndex: 2147483646,
+          visibility: 'hidden',
+        }}
+      />
+
+      <motion.div
+        drag
+        dragMomentum={false}
+        dragElastic={0}
+        dragConstraints={constraintsRef}
+        onDragStart={() => setIsDragging(true)}
+        onDragEnd={() => setIsDragging(false)}
+        initial={{ opacity: 0, scale: 0.85, y: 0 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.85 }}
+        transition={{ type: 'spring', stiffness: 380, damping: 28 }}
+        style={{
+          position: 'fixed',
+          bottom: '32px',
+          left: '50%',
+          translateX: '-50%',
+          zIndex: 2147483647,
+          cursor: isDragging ? 'grabbing' : 'grab',
           userSelect: 'none',
+          touchAction: 'none',
+          pointerEvents: 'all',
         }}
       >
-        {/* Drag Handle + Header */}
         <div
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: '8px',
-            padding: '10px 12px 8px',
-            borderBottom: isMinimized ? 'none' : '1px solid rgba(255,255,255,0.06)',
-            cursor: 'grab',
+            gap: '6px',
+            padding: '8px 10px',
+            borderRadius: '100px',
+            background: 'rgba(9,9,13,0.92)',
+            backdropFilter: 'blur(20px)',
+            WebkitBackdropFilter: 'blur(20px)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            boxShadow: '0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(139,92,246,0.12)',
+            whiteSpace: 'nowrap',
           }}
-          onPointerDown={(e) => dragControls.start(e)}
         >
-          {/* Recording indicator */}
+          {/* Recording dot */}
           <span
             style={{
-              width: '8px',
-              height: '8px',
+              width: '7px',
+              height: '7px',
               borderRadius: '50%',
-              background: isPaused ? '#f59e0b' : '#ef4444',
-              boxShadow: isPaused ? '0 0 8px rgba(245,158,11,0.6)' : '0 0 8px rgba(239,68,68,0.6)',
-              animation: isPaused ? 'none' : 'jam-pulse 1.5s ease-in-out infinite',
               flexShrink: 0,
+              background: isPaused ? '#f59e0b' : '#ef4444',
+              boxShadow: isPaused ? '0 0 6px rgba(245,158,11,0.7)' : '0 0 6px rgba(239,68,68,0.7)',
+              animation: isPaused ? 'none' : 'st-dot-pulse 1.4s ease-in-out infinite',
             }}
           />
 
           {/* Timer */}
           <span
             style={{
-              fontFamily: "'Inter', monospace",
-              fontSize: '14px',
-              fontWeight: '700',
+              fontFamily: "'Inter', ui-monospace, monospace",
+              fontSize: '13px',
+              fontWeight: 700,
               color: 'white',
-              letterSpacing: '-0.5px',
-              flex: 1,
+              letterSpacing: '0.5px',
+              minWidth: '48px',
+              textAlign: 'center',
             }}
           >
             {formatDuration(duration)}
           </span>
 
-          <GripVertical size={14} style={{ color: 'rgba(148,163,184,0.4)', flexShrink: 0 }} />
-
-          {/* Minimize toggle */}
-          <button
-            onClick={() => setIsMinimized((m) => !m)}
+          {/* Divider */}
+          <span
             style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: '22px',
-              height: '22px',
-              borderRadius: '6px',
-              border: 'none',
-              background: 'rgba(255,255,255,0.08)',
-              color: 'rgba(148,163,184,0.8)',
-              cursor: 'pointer',
+              width: '1px',
+              height: '16px',
+              background: 'rgba(255,255,255,0.12)',
               flexShrink: 0,
             }}
+          />
+
+          {/* Pause / Resume */}
+          <PillButton
+            onClick={handlePauseResume}
+            title={isPaused ? 'Resume' : 'Pause'}
+            color="rgba(255,255,255,0.1)"
+            hoverColor="rgba(255,255,255,0.18)"
           >
-            {isMinimized ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-          </button>
+            {isPaused ? <PlaySvg /> : <PauseSvg />}
+          </PillButton>
+
+          {/* Stop */}
+          <PillButton
+            onClick={handleStop}
+            title="Stop Recording"
+            color="rgba(239,68,68,0.2)"
+            hoverColor="rgba(239,68,68,0.35)"
+            disabled={isStopping}
+          >
+            <StopSvg />
+          </PillButton>
         </div>
-
-        {/* Controls */}
-        <AnimatePresence>
-          {!isMinimized && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.2, ease: 'easeInOut' }}
-              style={{ overflow: 'hidden' }}
-            >
-              {/* Primary controls */}
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  padding: '10px 12px',
-                }}
-              >
-                {/* Pause/Resume */}
-                <ToolbarButton
-                  onClick={handlePauseResume}
-                  title={isPaused ? 'Resume' : 'Pause'}
-                  active={false}
-                  color={isPaused ? '#f59e0b' : undefined}
-                >
-                  {isPaused ? <Play size={14} /> : <Pause size={14} />}
-                </ToolbarButton>
-
-                {/* Stop */}
-                <ToolbarButton onClick={handleStop} title="Stop Recording" color="#ef4444" danger>
-                  <Square size={14} />
-                </ToolbarButton>
-
-                {/* Screenshot */}
-                <ToolbarButton onClick={handleScreenshot} title="Screenshot">
-                  <Camera size={14} />
-                </ToolbarButton>
-              </div>
-
-              {/* Secondary controls */}
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                  padding: '0 12px 10px',
-                }}
-              >
-                {/* Mic */}
-                <ToolbarButton
-                  onClick={() => setIsMicMuted((m) => !m)}
-                  title={isMicMuted ? 'Unmute Mic' : 'Mute Mic'}
-                  active={isMicMuted}
-                  activeColor="rgba(239,68,68,0.2)"
-                >
-                  {isMicMuted ? (
-                    <MicOff size={13} style={{ color: '#ef4444' }} />
-                  ) : (
-                    <Mic size={13} />
-                  )}
-                </ToolbarButton>
-
-                {/* Webcam */}
-                <ToolbarButton
-                  onClick={() => setIsWebcamOn((w) => !w)}
-                  title={isWebcamOn ? 'Hide Webcam' : 'Show Webcam'}
-                  active={isWebcamOn}
-                  activeColor="rgba(99,102,241,0.2)"
-                >
-                  {isWebcamOn ? (
-                    <Video size={13} style={{ color: '#818cf8' }} />
-                  ) : (
-                    <VideoOff size={13} />
-                  )}
-                </ToolbarButton>
-
-                {/* Annotate */}
-                <ToolbarButton
-                  onClick={() => {
-                    // Capture page screenshot and open annotation
-                    chrome.runtime.sendMessage({ type: 'TAKE_SCREENSHOT' }, (response) => {
-                      if (response?.shareUrl) {
-                        // In real implementation, we'd capture locally and annotate
-                      }
-                    });
-                  }}
-                  title="Annotate"
-                >
-                  <Edit3 size={13} />
-                </ToolbarButton>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-
-      {/* Keyframe animation injected into document */}
-      <style>{`
-        @keyframes jam-pulse {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.5; transform: scale(1.3); }
-        }
-      `}</style>
-    </motion.div>
+      </motion.div>
+    </>
   );
 }
 
-// ─── Toolbar Button ───────────────────────────────────────────────────────────
+// ─── Pill Button ──────────────────────────────────────────────────────────────
 
-interface ToolbarButtonProps {
+interface PillButtonProps {
   onClick: () => void;
   title: string;
   children: React.ReactNode;
-  active?: boolean;
-  color?: string;
-  activeColor?: string;
-  danger?: boolean;
+  color: string;
+  hoverColor: string;
+  disabled?: boolean;
 }
 
-function ToolbarButton({
-  onClick,
-  title,
-  children,
-  active = false,
-  color,
-  activeColor,
-  danger = false,
-}: ToolbarButtonProps) {
-  const [isHovered, setIsHovered] = useState(false);
-
-  const bgColor = danger
-    ? isHovered
-      ? 'rgba(239,68,68,0.3)'
-      : 'rgba(239,68,68,0.15)'
-    : active
-      ? (activeColor ?? 'rgba(255,255,255,0.12)')
-      : isHovered
-        ? 'rgba(255,255,255,0.12)'
-        : 'rgba(255,255,255,0.06)';
-
-  const textColor = color ?? (danger ? '#ef4444' : active ? 'white' : 'rgba(148,163,184,0.9)');
-
+function PillButton({ onClick, title, children, color, hoverColor, disabled }: PillButtonProps) {
+  const [hovered, setHovered] = useState(false);
   return (
     <motion.button
       whileTap={{ scale: 0.88 }}
       onClick={onClick}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
+      disabled={disabled}
       title={title}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       style={{
+        width: '28px',
+        height: '28px',
+        borderRadius: '50%',
+        border: 'none',
+        background: hovered ? hoverColor : color,
+        color: 'white',
+        cursor: disabled ? 'not-allowed' : 'pointer',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        width: '32px',
-        height: '32px',
-        borderRadius: '10px',
-        border: danger ? '1px solid rgba(239,68,68,0.3)' : '1px solid transparent',
-        background: bgColor,
-        color: textColor,
-        cursor: 'pointer',
-        transition: 'all 0.15s ease',
         flexShrink: 0,
+        opacity: disabled ? 0.5 : 1,
+        transition: 'background 0.15s',
+        padding: 0,
       }}
     >
       {children}
     </motion.button>
+  );
+}
+
+// ─── SVG Icons ────────────────────────────────────────────────────────────────
+
+function PauseSvg() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="white">
+      <rect x="5" y="3" width="5" height="18" rx="1.5" />
+      <rect x="14" y="3" width="5" height="18" rx="1.5" />
+    </svg>
+  );
+}
+
+function PlaySvg() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="white">
+      <polygon points="6,3 20,12 6,21" />
+    </svg>
+  );
+}
+
+function StopSvg() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="#ef4444">
+      <rect x="3" y="3" width="18" height="18" rx="2.5" />
+    </svg>
   );
 }

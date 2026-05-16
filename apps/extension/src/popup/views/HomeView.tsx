@@ -2,33 +2,22 @@ import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Monitor,
-  Chrome,
-  AppWindow,
   Camera,
-  FileImage,
-  Crop,
   Settings,
   Mic,
   MicOff,
   Video,
   VideoOff,
   Play,
-  ChevronDown,
-  MoreHorizontal,
-  Cloud,
-  CloudOff,
-  LogOut,
-  ChevronRight,
-  Timer,
-  MousePointer,
+  FileImage,
+  Crop,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { useRecordingStore } from '@/store/recording.store';
 import { useSettingsStore } from '@/store/settings.store';
-import { RecordingTypeCard } from '@/components/RecordingTypeCard';
 import { Avatar } from '@/components/ui/Avatar';
-import { formatRelativeDate, formatDuration, cn } from '@/utils';
-import type { Recording, RecordingType } from '@/types';
+import { cn } from '@/utils';
+import type { RecordingType } from '@/types';
 
 type View =
   | 'home'
@@ -42,44 +31,44 @@ type View =
   | 'annotation';
 
 type MainTab = 'record' | 'screenshot';
-type ScreenshotType = 'full-page' | 'area' | 'full-screen';
-type ScreenshotDelay = 'none' | '3s' | '5s';
-type ScreenshotFormat = 'PNG' | 'JPG' | 'WEBP';
+type ScreenshotType = 'full-page' | 'area' | 'visible';
 
 interface HomeViewProps {
   onNavigate: (view: View) => void;
 }
 
-const CONTAINER_VARIANTS = {
-  hidden: { opacity: 0 },
-  show: {
-    opacity: 1,
-    transition: { staggerChildren: 0.05, delayChildren: 0.08 },
-  },
-};
+// ─── Tab icon: Chrome tab SVG (matches the image) ──────────────────────────────
+function TabIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 18 18" fill="none">
+      <rect x="1" y="4" width="16" height="12" rx="2" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M1 8h16" stroke="currentColor" strokeWidth="1.4" />
+      <rect x="3" y="5.5" width="5" height="2.5" rx="1" fill="currentColor" />
+    </svg>
+  );
+}
 
-const ITEM_VARIANTS = {
-  hidden: { opacity: 0, y: 10 },
-  show: { opacity: 1, y: 0, transition: { type: 'spring', stiffness: 380, damping: 26 } },
-};
-
-const RECORD_TYPES: Array<{
+const RECORD_OPTIONS: Array<{
   type: RecordingType;
   icon: React.ReactNode;
   title: string;
   description: string;
 }> = [
   {
+    type: 'tab',
+    icon: <TabIcon size={18} />,
+    title: 'Record Tab',
+    description: 'Capture only current tab',
+  },
+  {
     type: 'screen',
     icon: <Monitor size={18} />,
-    title: 'Full Screen',
-    description: 'Entire screen',
+    title: 'Record Desktop',
+    description: 'Capture entire screen, window or any tab',
   },
-  { type: 'tab', icon: <Chrome size={18} />, title: 'Tab', description: 'Current tab' },
-  { type: 'screen', icon: <AppWindow size={18} />, title: 'Window', description: 'Choose window' },
 ];
 
-const SCREENSHOT_TYPES: Array<{
+const SCREENSHOT_OPTIONS: Array<{
   type: ScreenshotType;
   icon: React.ReactNode;
   title: string;
@@ -87,76 +76,52 @@ const SCREENSHOT_TYPES: Array<{
 }> = [
   {
     type: 'full-page',
-    icon: <FileImage size={18} />,
+    icon: <FileImage size={16} />,
     title: 'Full Page',
-    description: 'Entire page',
+    description: 'Capture entire page',
   },
-  { type: 'area', icon: <Crop size={18} />, title: 'Selected Area', description: 'Choose area' },
   {
-    type: 'full-screen',
-    icon: <Monitor size={18} />,
-    title: 'Full Screen',
-    description: 'Your screen',
+    type: 'area',
+    icon: <Crop size={16} />,
+    title: 'Selected Area',
+    description: 'Select any area',
+  },
+  {
+    type: 'visible',
+    icon: <Monitor size={16} />,
+    title: 'Visible Screen',
+    description: 'Capture visible area',
   },
 ];
 
 export function HomeView({ onNavigate }: HomeViewProps) {
   const { user, logout, isAuthenticated } = useAuthStore();
-  const { recordings, startRecording, takeScreenshot, fetchRecordings } = useRecordingStore();
-  const { settings, toggleMic, toggleWebcam, setQuality } = useSettingsStore();
+  const { startRecording, takeScreenshot, fetchRecordings } = useRecordingStore();
+  const { settings, toggleMic, toggleWebcam } = useSettingsStore();
 
   const [activeTab, setActiveTab] = useState<MainTab>('record');
-  const [selectedRecordIndex, setSelectedRecordIndex] = useState(0);
+  const [selectedRecordType, setSelectedRecordType] = useState<RecordingType>('tab');
   const [selectedScreenshotType, setSelectedScreenshotType] = useState<ScreenshotType>('full-page');
   const [isStarting, setIsStarting] = useState(false);
-  const [userMenuOpen, setUserMenuOpen] = useState(false);
-  const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
-  const [fpsMenuOpen, setFpsMenuOpen] = useState(false);
-  const [delayMenuOpen, setDelayMenuOpen] = useState(false);
-  const [formatMenuOpen, setFormatMenuOpen] = useState(false);
-  const [screenshotDelay, setScreenshotDelay] = useState<ScreenshotDelay>('none');
-  const [includeCursor, setIncludeCursor] = useState(true);
-  const [screenshotFormat, setScreenshotFormat] = useState<ScreenshotFormat>('PNG');
-  const [isOnline] = useState(navigator.onLine);
 
-  const recentRecordings = recordings.slice(0, 4);
-
-  // Only fetch recordings when the user is actually authenticated
   useEffect(() => {
-    if (isAuthenticated) {
-      void fetchRecordings();
-    }
+    if (isAuthenticated) void fetchRecordings();
   }, [isAuthenticated, fetchRecordings]);
 
-  // Close menus when clicking outside
-  useEffect(() => {
-    const close = () => {
-      setUserMenuOpen(false);
-      setQualityMenuOpen(false);
-      setFpsMenuOpen(false);
-      setDelayMenuOpen(false);
-      setFormatMenuOpen(false);
-    };
-    document.addEventListener('click', close);
-    return () => document.removeEventListener('click', close);
-  }, []);
-
-  const selectedRecordType = RECORD_TYPES[selectedRecordIndex];
-
   const handleStartRecording = async () => {
-    if (!selectedRecordType) return;
     setIsStarting(true);
     try {
       await startRecording({
-        type: selectedRecordType.type,
+        type: selectedRecordType,
         quality: settings.recordingQuality,
         micEnabled: settings.micEnabled,
         webcamOverlay: settings.webcamOverlay,
         systemAudio: settings.systemAudio,
       });
+      // Close the popup so the floating toolbar (injected into the page) takes over
+      window.close();
     } catch (err) {
       console.error('Failed to start recording:', err);
-    } finally {
       setIsStarting(false);
     }
   };
@@ -165,664 +130,396 @@ export function HomeView({ onNavigate }: HomeViewProps) {
     try {
       await takeScreenshot();
     } catch (err) {
-      console.error('Failed to take screenshot:', err);
+      console.error('Screenshot failed:', err);
     }
   };
 
-  const fpsValue =
-    settings.recordingQuality === 'high' || settings.recordingQuality === '4k' ? '60' : '30';
-
-  const qualityLabel =
-    settings.recordingQuality === '4k'
-      ? '4K'
-      : settings.recordingQuality === 'high'
-        ? '1080p'
-        : settings.recordingQuality === 'medium'
-          ? '720p'
-          : '480p';
-
-  const storageUsedGB = 2.4;
-  const storageTotalGB = 10;
-  const storagePercent = (storageUsedGB / storageTotalGB) * 100;
-
   return (
-    <div className="h-full flex flex-col overflow-hidden bg-dark-950">
+    <div className="h-full flex flex-col bg-dark-950 overflow-hidden">
       {/* ─── Header ─── */}
       <motion.div
-        initial={{ opacity: 0, y: -8 }}
+        initial={{ opacity: 0, y: -6 }}
         animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.25 }}
-        className="flex items-center justify-between px-4 pt-3.5 pb-2.5 shrink-0"
+        transition={{ duration: 0.2 }}
+        className="flex items-center justify-between px-4 pt-3.5 pb-3 shrink-0"
       >
-        {/* Logo */}
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-jam-500 via-jam-400 to-violet-400 flex items-center justify-center shadow-jam shrink-0">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-jam-500 to-violet-600 flex items-center justify-center shadow-jam shrink-0">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <path d="M8 2L14 8L8 14L2 8L8 2Z" fill="white" fillOpacity="0.95" />
-              <circle cx="8" cy="8" r="2.5" fill="white" />
+              <circle cx="8" cy="8" r="3" fill="white" />
+              <circle cx="8" cy="8" r="6" stroke="white" strokeWidth="1.5" strokeOpacity="0.5" />
             </svg>
           </div>
           <div className="flex items-center gap-1.5">
-            <h1 className="text-sm font-bold text-white tracking-tight">SnapTrace</h1>
-            <span className="text-xxs font-semibold bg-jam-500/25 text-jam-300 border border-jam-500/30 px-1.5 py-0.5 rounded-md">
+            <span className="text-sm font-bold text-white tracking-tight">SnapTrace</span>
+            <span className="text-[10px] font-semibold bg-jam-500/20 text-jam-300 border border-jam-500/30 px-1.5 py-0.5 rounded-md leading-none">
               v1
             </span>
           </div>
         </div>
 
-        {/* Right controls */}
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => onNavigate('settings')}
-            className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
-            title="Settings"
-          >
-            <Settings size={15} />
-          </button>
-
-          {/* User avatar + dropdown */}
-          {user && (
-            <div className="relative">
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setUserMenuOpen((v) => !v);
-                }}
-                className="flex items-center gap-1.5 rounded-lg px-1.5 py-1 hover:bg-white/6 transition-colors"
-              >
-                <Avatar src={user.avatar ?? undefined} name={user.name} size="xs" />
-                <ChevronDown size={11} className="text-dark-400" />
-              </button>
-
-              <AnimatePresence>
-                {userMenuOpen && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -6, scale: 0.96 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    exit={{ opacity: 0, y: -6, scale: 0.96 }}
-                    transition={{ duration: 0.15 }}
-                    className="absolute right-0 top-full mt-1 w-44 glass-card rounded-xl py-1.5 z-50"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <div className="px-3 py-2 border-b border-white/6">
-                      <p className="text-xs font-semibold text-white truncate">{user.name}</p>
-                      <p className="text-xxs text-dark-400 truncate">{user.email}</p>
-                    </div>
-                    <button
-                      onClick={() => {
-                        setUserMenuOpen(false);
-                        onNavigate('settings');
-                      }}
-                      className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-dark-300 hover:text-white hover:bg-white/6 transition-colors"
-                    >
-                      <Settings size={12} />
-                      Settings
-                    </button>
-                    <button
-                      onClick={() => void logout()}
-                      className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-dark-300 hover:text-red-400 hover:bg-red-500/8 transition-colors"
-                    >
-                      <LogOut size={12} />
-                      Sign out
-                    </button>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          )}
-        </div>
+        <button
+          onClick={() => onNavigate('settings')}
+          className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
+        >
+          <Settings size={15} />
+        </button>
       </motion.div>
 
       {/* ─── Tab Bar ─── */}
-      <div className="px-4 pb-2.5 shrink-0">
-        <div className="flex gap-0.5 bg-dark-900/60 border border-white/6 rounded-xl p-0.5">
-          <TabButton
+      <div className="px-4 pb-3 shrink-0">
+        <div className="flex gap-0.5 bg-dark-900 border border-white/6 rounded-xl p-1">
+          <TabPill
             active={activeTab === 'record'}
+            label="Recording"
             onClick={() => setActiveTab('record')}
-            icon={<Video size={13} />}
-            label="Record"
           />
-          <TabButton
+          <TabPill
             active={activeTab === 'screenshot'}
-            onClick={() => setActiveTab('screenshot')}
-            icon={<Camera size={13} />}
             label="Screenshot"
+            onClick={() => setActiveTab('screenshot')}
           />
         </div>
       </div>
 
-      {/* ─── Scrollable Content ─── */}
-      <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin">
+      {/* ─── Scrollable Body ─── */}
+      <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-none">
         <AnimatePresence mode="wait">
           {activeTab === 'record' ? (
             <motion.div
-              key="record-tab"
-              variants={CONTAINER_VARIANTS}
-              initial="hidden"
-              animate="show"
-              exit={{ opacity: 0 }}
-              className="flex flex-col gap-3.5 px-4 pb-4"
+              key="record"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18 }}
+              className="px-4 pb-4 flex flex-col gap-4"
             >
-              {/* Recording Options */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <p className="text-xxs font-semibold text-dark-500 uppercase tracking-widest mb-2">
-                  Recording Options
+              {/* Title */}
+              <div className="pt-1">
+                <h2 className="text-base font-bold text-white leading-tight">Record something</h2>
+                <p className="text-xs text-dark-400 mt-0.5">
+                  Capture bugs, flows and issues with logs.
                 </p>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {RECORD_TYPES.map(({ icon, title, description }, idx) => (
-                    <RecordingTypeCard
-                      key={`${title}-${idx}`}
-                      icon={icon}
-                      title={title}
-                      description={description}
-                      selected={selectedRecordIndex === idx}
-                      onClick={() => setSelectedRecordIndex(idx)}
-                    />
-                  ))}
-                </div>
-              </motion.div>
+              </div>
 
-              {/* Controls Row */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {/* Mic toggle */}
-                  <ToggleControl
-                    icon={settings.micEnabled ? <Mic size={12} /> : <MicOff size={12} />}
-                    label="Mic"
-                    value={settings.micEnabled ? 'On' : 'Off'}
-                    active={settings.micEnabled}
-                    onClick={() => void toggleMic()}
+              {/* Record type cards */}
+              <div className="flex flex-col gap-2">
+                {RECORD_OPTIONS.map((opt) => (
+                  <RecordCard
+                    key={opt.type}
+                    icon={opt.icon}
+                    title={opt.title}
+                    description={opt.description}
+                    selected={selectedRecordType === opt.type}
+                    onClick={() => setSelectedRecordType(opt.type)}
                   />
+                ))}
+              </div>
 
-                  {/* Camera toggle */}
-                  <ToggleControl
-                    icon={settings.webcamOverlay ? <Video size={12} /> : <VideoOff size={12} />}
-                    label="Camera"
-                    value={settings.webcamOverlay ? 'On' : 'Off'}
-                    active={settings.webcamOverlay}
-                    onClick={() => void toggleWebcam()}
-                  />
-
-                  {/* Quality dropdown */}
-                  <div className="relative">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setQualityMenuOpen((v) => !v);
-                      }}
-                      className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-dark-800/70 border border-white/8 text-xxs font-medium text-dark-300 hover:text-white hover:border-white/16 transition-all"
-                    >
-                      <Monitor size={11} />
-                      <span>{qualityLabel}</span>
-                      <ChevronDown size={10} />
-                    </button>
-                    <AnimatePresence>
-                      {qualityMenuOpen && (
-                        <DropdownMenu onClose={() => setQualityMenuOpen(false)}>
-                          {(['low', 'medium', 'high', '4k'] as const).map((q) => (
-                            <DropdownItem
-                              key={q}
-                              label={
-                                q === '4k'
-                                  ? '4K'
-                                  : q === 'high'
-                                    ? '1080p'
-                                    : q === 'medium'
-                                      ? '720p'
-                                      : '480p'
-                              }
-                              active={settings.recordingQuality === q}
-                              onClick={() => {
-                                void setQuality(q);
-                                setQualityMenuOpen(false);
-                              }}
-                            />
-                          ))}
-                        </DropdownMenu>
-                      )}
-                    </AnimatePresence>
-                  </div>
-
-                  {/* FPS dropdown */}
-                  <div className="relative">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setFpsMenuOpen((v) => !v);
-                      }}
-                      className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-dark-800/70 border border-white/8 text-xxs font-medium text-dark-300 hover:text-white hover:border-white/16 transition-all"
-                    >
-                      <span>{fpsValue} fps</span>
-                      <ChevronDown size={10} />
-                    </button>
-                    <AnimatePresence>
-                      {fpsMenuOpen && (
-                        <DropdownMenu onClose={() => setFpsMenuOpen(false)}>
-                          {(['24', '30', '60'] as const).map((fps) => (
-                            <DropdownItem
-                              key={fps}
-                              label={`${fps} fps`}
-                              active={fpsValue === fps}
-                              onClick={() => setFpsMenuOpen(false)}
-                            />
-                          ))}
-                        </DropdownMenu>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                </div>
-              </motion.div>
+              {/* Controls */}
+              <div className="flex items-center gap-2">
+                <ControlToggle
+                  icon={settings.micEnabled ? <Mic size={12} /> : <MicOff size={12} />}
+                  label="Mic"
+                  active={settings.micEnabled}
+                  onClick={() => void toggleMic()}
+                />
+                <ControlToggle
+                  icon={settings.webcamOverlay ? <Video size={12} /> : <VideoOff size={12} />}
+                  label="Cam"
+                  active={settings.webcamOverlay}
+                  onClick={() => void toggleWebcam()}
+                />
+              </div>
 
               {/* Start Recording CTA */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <motion.button
-                  whileTap={{ scale: 0.97 }}
-                  whileHover={{ y: -1 }}
-                  disabled={isStarting}
-                  onClick={() => void handleStartRecording()}
-                  className={cn(
-                    'w-full h-12 rounded-2xl flex items-center justify-center gap-2.5',
-                    'bg-gradient-to-r from-jam-500 to-violet-400',
-                    'hover:from-jam-600 hover:to-violet-500',
-                    'text-white font-semibold text-sm shadow-jam',
-                    'transition-all duration-200 relative overflow-hidden',
-                    'disabled:opacity-60 disabled:cursor-not-allowed',
-                  )}
-                >
-                  {/* Animated shimmer */}
-                  <motion.div
-                    className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent"
-                    animate={{ x: ['-100%', '100%'] }}
-                    transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
-                  />
-                  <span className="relative flex items-center gap-2.5">
-                    <span className="w-2 h-2 rounded-full bg-white/90 animate-recording-pulse" />
-                    <Play size={15} className="fill-white" />
-                    <span>{isStarting ? 'Starting...' : 'Start Recording'}</span>
-                  </span>
-                </motion.button>
-              </motion.div>
-
-              {/* Recent Recordings */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <div className="flex items-center justify-between mb-2">
-                  <p className="text-xxs font-semibold text-dark-500 uppercase tracking-widest">
-                    Recent Recordings
-                  </p>
-                  {recentRecordings.length > 0 && (
-                    <button
-                      onClick={() => onNavigate('library')}
-                      className="text-xxs font-medium text-jam-400 hover:text-jam-300 transition-colors"
-                    >
-                      View all
-                    </button>
-                  )}
-                </div>
-
-                {recentRecordings.length > 0 ? (
-                  <div className="flex flex-col gap-1.5">
-                    {recentRecordings.map((recording, i) => (
-                      <RecentRecordingItem key={recording.id} recording={recording} index={i} />
-                    ))}
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-2 py-5 text-center">
-                    <div className="w-10 h-10 rounded-xl bg-dark-800/80 border border-white/6 flex items-center justify-center">
-                      <Monitor size={18} className="text-dark-500" />
-                    </div>
-                    <div>
-                      <p className="text-xs font-medium text-dark-400">No recordings yet</p>
-                      <p className="text-xxs text-dark-600 mt-0.5">
-                        Start your first recording above
-                      </p>
-                    </div>
-                  </div>
+              <motion.button
+                whileTap={{ scale: 0.97 }}
+                whileHover={{ y: -1 }}
+                disabled={isStarting}
+                onClick={() => void handleStartRecording()}
+                className={cn(
+                  'w-full h-12 rounded-2xl flex items-center justify-center gap-2.5 relative overflow-hidden',
+                  'bg-gradient-to-r from-jam-500 to-violet-500',
+                  'hover:from-jam-600 hover:to-violet-600',
+                  'text-white font-semibold text-sm shadow-jam',
+                  'transition-all duration-200',
+                  'disabled:opacity-60 disabled:cursor-not-allowed',
                 )}
-              </motion.div>
+              >
+                <motion.div
+                  className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent"
+                  animate={{ x: ['-100%', '100%'] }}
+                  transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
+                />
+                <span className="relative flex items-center gap-2.5">
+                  {isStarting ? (
+                    <span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                  ) : (
+                    <>
+                      <span className="w-2 h-2 rounded-full bg-white/90 animate-recording-pulse" />
+                      <Play size={14} className="fill-white" />
+                    </>
+                  )}
+                  <span>{isStarting ? 'Starting…' : 'Start Recording'}</span>
+                </span>
+              </motion.button>
             </motion.div>
           ) : (
-            /* ─── Screenshot Tab ─── */
             <motion.div
-              key="screenshot-tab"
-              variants={CONTAINER_VARIANTS}
-              initial="hidden"
-              animate="show"
-              exit={{ opacity: 0 }}
-              className="flex flex-col gap-3.5 px-4 pb-4"
+              key="screenshot"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18 }}
+              className="px-4 pb-4 flex flex-col gap-4"
             >
-              {/* Screenshot Options */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <p className="text-xxs font-semibold text-dark-500 uppercase tracking-widest mb-2">
-                  Screenshot Options
-                </p>
-                <div className="grid grid-cols-3 gap-1.5">
-                  {SCREENSHOT_TYPES.map(({ type, icon, title, description }) => (
-                    <RecordingTypeCard
-                      key={type}
-                      icon={icon}
-                      title={title}
-                      description={description}
-                      selected={selectedScreenshotType === type}
-                      onClick={() => setSelectedScreenshotType(type)}
-                    />
-                  ))}
-                </div>
-              </motion.div>
+              {/* Title */}
+              <div className="pt-1">
+                <h2 className="text-base font-bold text-white leading-tight">Take a screenshot</h2>
+                <p className="text-xs text-dark-400 mt-0.5">Capture your screen instantly.</p>
+              </div>
 
-              {/* Controls Row */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {/* Delay dropdown */}
-                  <div className="relative">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDelayMenuOpen((v) => !v);
-                      }}
-                      className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-dark-800/70 border border-white/8 text-xxs font-medium text-dark-300 hover:text-white hover:border-white/16 transition-all"
-                    >
-                      <Timer size={11} />
-                      <span>Delay: {screenshotDelay === 'none' ? 'None' : screenshotDelay}</span>
-                      <ChevronDown size={10} />
-                    </button>
-                    <AnimatePresence>
-                      {delayMenuOpen && (
-                        <DropdownMenu onClose={() => setDelayMenuOpen(false)}>
-                          {(['none', '3s', '5s'] as const).map((d) => (
-                            <DropdownItem
-                              key={d}
-                              label={d === 'none' ? 'None' : d}
-                              active={screenshotDelay === d}
-                              onClick={() => {
-                                setScreenshotDelay(d);
-                                setDelayMenuOpen(false);
-                              }}
-                            />
-                          ))}
-                        </DropdownMenu>
-                      )}
-                    </AnimatePresence>
-                  </div>
-
-                  {/* Cursor toggle */}
-                  <ToggleControl
-                    icon={<MousePointer size={12} />}
-                    label="Cursor"
-                    value={includeCursor ? 'On' : 'Off'}
-                    active={includeCursor}
-                    onClick={() => setIncludeCursor((v) => !v)}
+              {/* Screenshot type cards */}
+              <div className="grid grid-cols-3 gap-2">
+                {SCREENSHOT_OPTIONS.map((opt) => (
+                  <ScreenshotCard
+                    key={opt.type}
+                    icon={opt.icon}
+                    title={opt.title}
+                    description={opt.description}
+                    selected={selectedScreenshotType === opt.type}
+                    onClick={() => setSelectedScreenshotType(opt.type)}
                   />
-
-                  {/* Format dropdown */}
-                  <div className="relative">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setFormatMenuOpen((v) => !v);
-                      }}
-                      className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-dark-800/70 border border-white/8 text-xxs font-medium text-dark-300 hover:text-white hover:border-white/16 transition-all"
-                    >
-                      <span>Format: {screenshotFormat}</span>
-                      <ChevronDown size={10} />
-                    </button>
-                    <AnimatePresence>
-                      {formatMenuOpen && (
-                        <DropdownMenu onClose={() => setFormatMenuOpen(false)}>
-                          {(['PNG', 'JPG', 'WEBP'] as const).map((fmt) => (
-                            <DropdownItem
-                              key={fmt}
-                              label={fmt}
-                              active={screenshotFormat === fmt}
-                              onClick={() => {
-                                setScreenshotFormat(fmt);
-                                setFormatMenuOpen(false);
-                              }}
-                            />
-                          ))}
-                        </DropdownMenu>
-                      )}
-                    </AnimatePresence>
-                  </div>
-                </div>
-              </motion.div>
+                ))}
+              </div>
 
               {/* Take Screenshot CTA */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <motion.button
-                  whileTap={{ scale: 0.97 }}
-                  whileHover={{ y: -1 }}
-                  onClick={() => void handleScreenshot()}
-                  className="w-full h-12 rounded-2xl flex items-center justify-center gap-2.5 bg-gradient-to-r from-jam-500 to-violet-400 hover:from-jam-600 hover:to-violet-500 text-white font-semibold text-sm shadow-jam transition-all duration-200 relative overflow-hidden"
-                >
-                  <motion.div
-                    className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent"
-                    animate={{ x: ['-100%', '100%'] }}
-                    transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
-                  />
-                  <span className="relative flex items-center gap-2.5">
-                    <Camera size={15} />
-                    <span>Take Screenshot</span>
-                  </span>
-                </motion.button>
-              </motion.div>
-
-              {/* Recent Screenshots empty state */}
-              <motion.div variants={ITEM_VARIANTS}>
-                <div className="flex items-center justify-between mb-2">
-                  <p className="text-xxs font-semibold text-dark-500 uppercase tracking-widest">
-                    Recent Screenshots
-                  </p>
-                </div>
-                <div className="flex flex-col items-center gap-2 py-5 text-center">
-                  <div className="w-10 h-10 rounded-xl bg-dark-800/80 border border-white/6 flex items-center justify-center">
-                    <Camera size={18} className="text-dark-500" />
-                  </div>
-                  <div>
-                    <p className="text-xs font-medium text-dark-400">No screenshots yet</p>
-                    <p className="text-xxs text-dark-600 mt-0.5">
-                      Capture your first screenshot above
-                    </p>
-                  </div>
-                </div>
-              </motion.div>
+              <motion.button
+                whileTap={{ scale: 0.97 }}
+                whileHover={{ y: -1 }}
+                onClick={() => void handleScreenshot()}
+                className="w-full h-12 rounded-2xl flex items-center justify-center gap-2.5 relative overflow-hidden bg-gradient-to-r from-jam-500 to-violet-500 hover:from-jam-600 hover:to-violet-600 text-white font-semibold text-sm shadow-jam transition-all duration-200"
+              >
+                <motion.div
+                  className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent"
+                  animate={{ x: ['-100%', '100%'] }}
+                  transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
+                />
+                <span className="relative flex items-center gap-2.5">
+                  <Camera size={15} />
+                  <span>Take Screenshot</span>
+                </span>
+              </motion.button>
             </motion.div>
           )}
         </AnimatePresence>
       </div>
 
-      {/* ─── Bottom Status Bar ─── */}
-      <div className="px-4 py-2.5 border-t border-white/6 shrink-0">
-        <div className="flex items-center justify-between">
-          {/* Sync status */}
-          <div className="flex items-center gap-1.5">
-            {isOnline ? (
-              <>
-                <Cloud size={13} className="text-emerald-400" />
-                <span className="text-xxs text-dark-400">All files synced</span>
-              </>
-            ) : (
-              <>
-                <CloudOff size={13} className="text-amber-400" />
-                <span className="text-xxs text-amber-400">Offline</span>
-              </>
-            )}
-          </div>
-
-          {/* Storage usage */}
-          <div className="flex items-center gap-1.5">
-            <div className="w-20 h-1.5 rounded-full bg-dark-700 overflow-hidden">
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-jam-500 to-violet-400 transition-all"
-                style={{ width: `${storagePercent}%` }}
-              />
+      {/* ─── User Footer ─── */}
+      {user && (
+        <div className="shrink-0 border-t border-white/6 px-4 py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2.5">
+              <Avatar src={user.avatar ?? undefined} name={user.name} size="sm" />
+              <div>
+                <p className="text-xs font-semibold text-white leading-tight">
+                  {user.name
+                    .split(' ')
+                    .slice(0, 2)
+                    .join(' ')
+                    .replace(/ (\w+)$/, ' $1')
+                    .slice(0, 14)}
+                </p>
+                <span className="text-[10px] text-jam-400 font-medium">Pro Plan</span>
+              </div>
             </div>
-            <span className="text-xxs text-dark-500">
-              {storageUsedGB} GB / {storageTotalGB} GB
-            </span>
+
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => onNavigate('settings')}
+                className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
+                title="Settings"
+              >
+                <Settings size={14} />
+              </button>
+              <button
+                onClick={() => void logout()}
+                className="text-[10px] text-dark-500 hover:text-red-400 transition-colors px-1"
+                title="Sign out"
+              >
+                Sign out
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
-// ─── Tab Button ───────────────────────────────────────────────────────────────
+// ─── Tab Pill ─────────────────────────────────────────────────────────────────
 
-interface TabButtonProps {
+function TabPill({
+  active,
+  label,
+  onClick,
+}: {
   active: boolean;
-  onClick: () => void;
-  icon: React.ReactNode;
   label: string;
-}
-
-function TabButton({ active, onClick, icon, label }: TabButtonProps) {
+  onClick: () => void;
+}) {
   return (
     <button
       onClick={onClick}
       className={cn(
-        'flex-1 flex items-center justify-center gap-1.5 h-8 rounded-lg text-xs font-medium transition-all duration-200',
+        'flex-1 h-8 rounded-lg text-xs font-semibold transition-all duration-200',
         active
-          ? 'bg-jam-500/20 text-jam-300 border border-jam-500/30'
-          : 'text-dark-400 hover:text-dark-200 border border-transparent',
+          ? 'bg-jam-500/25 text-jam-200 border border-jam-500/35 shadow-sm'
+          : 'text-dark-400 hover:text-dark-200',
       )}
     >
-      {icon}
       {label}
     </button>
   );
 }
 
-// ─── Toggle Control ───────────────────────────────────────────────────────────
+// ─── Record Card (large, horizontal) ─────────────────────────────────────────
 
-interface ToggleControlProps {
+interface RecordCardProps {
   icon: React.ReactNode;
-  label: string;
-  value: string;
-  active: boolean;
+  title: string;
+  description: string;
+  selected: boolean;
   onClick: () => void;
 }
 
-function ToggleControl({ icon, label, value, active, onClick }: ToggleControlProps) {
+function RecordCard({ icon, title, description, selected, onClick }: RecordCardProps) {
   return (
     <motion.button
-      whileTap={{ scale: 0.93 }}
+      whileTap={{ scale: 0.985 }}
       onClick={onClick}
       className={cn(
-        'flex items-center gap-1 px-2 py-1.5 rounded-lg text-xxs font-medium transition-all duration-200 border',
-        active
-          ? 'bg-jam-500/20 text-jam-300 border-jam-500/30'
-          : 'bg-dark-800/70 text-dark-400 border-white/8 hover:text-white hover:border-white/16',
+        'w-full flex items-center gap-3.5 px-4 py-3.5 rounded-2xl border text-left transition-all duration-200',
+        selected
+          ? 'bg-jam-500/12 border-jam-500/40 shadow-[0_0_0_1px_rgba(139,92,246,0.2)]'
+          : 'bg-dark-900/70 border-white/8 hover:bg-dark-800/80 hover:border-white/14',
       )}
     >
-      {icon}
-      <span>{label}:</span>
-      <span className={active ? 'text-jam-200 font-semibold' : 'text-dark-300'}>{value}</span>
+      {/* Icon box */}
+      <div
+        className={cn(
+          'w-9 h-9 rounded-xl flex items-center justify-center shrink-0 transition-all duration-200',
+          selected
+            ? 'bg-jam-500/25 text-jam-300'
+            : 'bg-dark-800 text-dark-400 group-hover:text-dark-200',
+        )}
+      >
+        {icon}
+      </div>
+
+      {/* Text */}
+      <div>
+        <p
+          className={cn(
+            'text-sm font-semibold leading-tight',
+            selected ? 'text-white' : 'text-dark-200',
+          )}
+        >
+          {title}
+        </p>
+        <p className="text-xs text-dark-500 mt-0.5 leading-snug">{description}</p>
+      </div>
+
+      {/* Selected dot */}
+      <div className="ml-auto shrink-0">
+        <div
+          className={cn(
+            'w-4 h-4 rounded-full border-2 transition-all duration-200 flex items-center justify-center',
+            selected ? 'border-jam-400 bg-jam-500' : 'border-dark-600 bg-transparent',
+          )}
+        >
+          {selected && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+        </div>
+      </div>
     </motion.button>
   );
 }
 
-// ─── Dropdown Menu ────────────────────────────────────────────────────────────
+// ─── Screenshot Card (small, vertical) ───────────────────────────────────────
 
-interface DropdownMenuProps {
-  children: React.ReactNode;
-  onClose: () => void;
-}
-
-function DropdownMenu({ children }: DropdownMenuProps) {
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: -6, scale: 0.95 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={{ opacity: 0, y: -6, scale: 0.95 }}
-      transition={{ duration: 0.15 }}
-      className="absolute left-0 top-full mt-1 min-w-[100px] glass-card rounded-xl py-1 z-50"
-      onClick={(e) => e.stopPropagation()}
-    >
-      {children}
-    </motion.div>
-  );
-}
-
-interface DropdownItemProps {
-  label: string;
-  active: boolean;
+interface ScreenshotCardProps {
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+  selected: boolean;
   onClick: () => void;
 }
 
-function DropdownItem({ label, active, onClick }: DropdownItemProps) {
+function ScreenshotCard({ icon, title, description, selected, onClick }: ScreenshotCardProps) {
   return (
-    <button
+    <motion.button
+      whileTap={{ scale: 0.96 }}
       onClick={onClick}
       className={cn(
-        'w-full text-left px-3 py-1.5 text-xs transition-colors',
-        active
-          ? 'text-jam-300 font-semibold bg-jam-500/10'
-          : 'text-dark-300 hover:text-white hover:bg-white/6',
+        'flex flex-col items-center gap-2 px-2 py-3.5 rounded-2xl border text-center transition-all duration-200',
+        selected
+          ? 'bg-jam-500/12 border-jam-500/40'
+          : 'bg-dark-900/70 border-white/8 hover:bg-dark-800/80 hover:border-white/14',
       )}
     >
-      {label}
-    </button>
+      <div
+        className={cn(
+          'w-8 h-8 rounded-xl flex items-center justify-center',
+          selected ? 'bg-jam-500/25 text-jam-300' : 'bg-dark-800 text-dark-400',
+        )}
+      >
+        {icon}
+      </div>
+      <div>
+        <p
+          className={cn(
+            'text-[11px] font-semibold leading-tight',
+            selected ? 'text-white' : 'text-dark-300',
+          )}
+        >
+          {title}
+        </p>
+        <p className="text-[10px] text-dark-600 mt-0.5 leading-snug">{description}</p>
+      </div>
+    </motion.button>
   );
 }
 
-// ─── Recent Recording Item ────────────────────────────────────────────────────
+// ─── Control Toggle ───────────────────────────────────────────────────────────
 
-interface RecentRecordingItemProps {
-  recording: Recording;
-  index: number;
-}
-
-function RecentRecordingItem({ recording, index }: RecentRecordingItemProps) {
-  const handleOpen = () => {
-    if (recording.shareUrl) {
-      chrome.tabs.create({ url: recording.shareUrl });
-    }
-  };
-
+function ControlToggle({
+  icon,
+  label,
+  active,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
   return (
-    <motion.div
-      initial={{ opacity: 0, x: -8 }}
-      animate={{ opacity: 1, x: 0 }}
-      transition={{ delay: index * 0.04 }}
-      className="flex items-center gap-2.5 p-2 rounded-xl hover:bg-dark-800/60 transition-all duration-150 group border border-transparent hover:border-white/6"
+    <motion.button
+      whileTap={{ scale: 0.92 }}
+      onClick={onClick}
+      className={cn(
+        'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all duration-200',
+        active
+          ? 'bg-jam-500/15 text-jam-300 border-jam-500/30'
+          : 'bg-dark-800/70 text-dark-400 border-white/8 hover:text-dark-200 hover:border-white/14',
+      )}
     >
-      {/* Thumbnail */}
-      <div className="w-12 h-8 rounded-lg overflow-hidden shrink-0 bg-dark-700/80 border border-white/6 flex items-center justify-center">
-        {recording.thumbnailUrl ? (
-          <img
-            src={recording.thumbnailUrl}
-            alt={recording.title}
-            className="w-full h-full object-cover"
-          />
-        ) : (
-          <Monitor size={12} className="text-dark-500" />
-        )}
-      </div>
-
-      {/* Info */}
-      <div className="flex-1 min-w-0">
-        <p className="text-xs font-medium text-white truncate group-hover:text-jam-200 transition-colors">
-          {recording.title}
-        </p>
-        <div className="flex items-center gap-1.5 mt-0.5">
-          <span className="text-xxs text-dark-500">{formatDuration(recording.duration)}</span>
-          <span className="text-dark-700 text-xxs">·</span>
-          <span className="text-xxs text-dark-500">{formatRelativeDate(recording.createdAt)}</span>
-        </div>
-      </div>
-
-      {/* 3-dot menu */}
-      <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          onClick={handleOpen}
-          className="w-6 h-6 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
-        >
-          <ChevronRight size={12} />
-        </button>
-        <button className="w-6 h-6 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all">
-          <MoreHorizontal size={12} />
-        </button>
-      </div>
-    </motion.div>
+      {icon}
+      <span>{label}</span>
+      <span className={cn('text-[10px] font-semibold', active ? 'text-jam-400' : 'text-dark-600')}>
+        {active ? 'ON' : 'OFF'}
+      </span>
+    </motion.button>
   );
 }

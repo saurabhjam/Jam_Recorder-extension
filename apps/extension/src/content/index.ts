@@ -17,6 +17,11 @@ import { FloatingToolbar } from './FloatingToolbar';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { RecordingPreviewPanel } from './RecordingPreviewPanel';
 
+declare global {
+  interface Window {
+    __snaptraceCaptureInitialized?: boolean;
+  }
+}
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
 interface NetworkCapture {
@@ -48,7 +53,8 @@ let previewRoot: Root | null = null;
 let currentDuration = 0;
 let isToolbarVisible = false;
 let networkCaptures: NetworkCapture[] = [];
-let isCapturingNetwork = false;
+let consoleLogs: { level: string; message: string; timestamp: number; url: string }[] = [];
+let isCapturing = false;
 
 // ─── Toolbar Management ───────────────────────────────────────────────────────
 
@@ -231,10 +237,14 @@ function unmountPreviewPanel(): void {
 
 // ─── Network Capture ──────────────────────────────────────────────────────────
 
-function startNetworkCapture(): void {
-  if (isCapturingNetwork) return;
-  isCapturingNetwork = true;
+function startCapture(): void {
+  if (window.__snaptraceCaptureInitialized) return;
+
+  window.__snaptraceCaptureInitialized = true;
+
+  isCapturing = true;
   networkCaptures = [];
+  consoleLogs = [];
 
   // Inject interceptor script into page context
   const script = document.createElement('script');
@@ -309,6 +319,17 @@ function startNetworkCapture(): void {
       throw err;
     }
   };
+
+  window.addEventListener('error', function(event) {
+    window.postMessage({
+      __st: true,
+      kind: 'console',
+      level: 'error',
+      message: event.message,
+      timestamp: Date.now(),
+      url: window.location.href,
+    }, '*');
+  });
 })();
   `;
   document.head.appendChild(script);
@@ -318,13 +339,15 @@ function startNetworkCapture(): void {
 }
 
 function stopNetworkCapture(): NetworkCapture[] {
-  isCapturingNetwork = false;
+  isCapturing = false;
   window.removeEventListener('message', handlePageNetworkMessage);
   return networkCaptures;
 }
 
 function handlePageNetworkMessage(e: MessageEvent): void {
-  if (!e.data?.__snaptrace || e.data.type !== 'network') return;
+  //if (!e.data?.__snaptrace || e.data.type !== 'network') return;
+  if (!e.source || e.source !== window) return;
+  if (!e.data?.__st) return;
   networkCaptures.push({
     url: e.data.url as string,
     method: e.data.method as string,
@@ -343,7 +366,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       const payload = message.payload as { recordingId: string } | undefined;
       if (payload?.recordingId) {
         mountToolbar(payload.recordingId);
-        startNetworkCapture();
+        startCapture();
       }
       sendResponse({ success: true });
       break;
@@ -430,25 +453,21 @@ document.addEventListener('visibilitychange', () => {
 
 function getToolbarStyles(): string {
   return `
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
     :host {
       all: initial;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 2147483646;
+      pointer-events: none;
     }
 
     #jam-toolbar-inner {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 2147483647;
+      pointer-events: none;
+      width: 100%;
+      height: 100%;
     }
   `;
 }

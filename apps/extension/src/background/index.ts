@@ -17,7 +17,7 @@
 
 import { authManager } from './auth.manager';
 import type { ExtensionMessage, RecordingOptions } from '@/types';
-import { STORAGE_KEYS, AUTH_REFRESH_ALARM } from '@/types';
+import { STORAGE_KEYS } from '@/types';
 import { generateId } from '@/utils';
 
 // ─── Offscreen Management ─────────────────────────────────────────────────────
@@ -112,10 +112,10 @@ async function pushPreviewToTab(payload: {
         })
         .catch(() => {
           // Content script not injected yet — inject then retry
-          chrome.scripting
-            .executeScript({ target: { tabId: tab.id! }, files: ['src/content/index.js'] })
-            .then(() => chrome.tabs.sendMessage(tab.id!, { type: 'SHOW_PREVIEW', payload }))
-            .catch(() => {});
+          // chrome.scripting
+          //   .executeScript({ target: { tabId: tab.id! }, files: ['src/content/index.js'] })
+          //   .then(() => chrome.tabs.sendMessage(tab.id!, { type: 'SHOW_PREVIEW', payload }))
+          //   .catch(() => { });
         });
     }
   } catch {
@@ -169,15 +169,17 @@ async function injectFloatingToolbar(): Promise<void> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
 
-  // Try messaging first (content script already loaded)
+  const showMsg = {
+    type: 'SHOW_TOOLBAR' as const,
+    payload: { recordingId: currentRecordingId },
+  } satisfies ExtensionMessage;
+
+  // Try messaging first (content script already running)
   try {
-    await chrome.tabs.sendMessage(tab.id, {
-      type: 'SHOW_TOOLBAR',
-      payload: { recordingId: currentRecordingId },
-    } satisfies ExtensionMessage);
+    await chrome.tabs.sendMessage(tab.id, showMsg);
     return;
   } catch {
-    /* fall through — inject script then retry */
+    // Content script not ready — inject it programmatically then retry
   }
 
   try {
@@ -185,12 +187,11 @@ async function injectFloatingToolbar(): Promise<void> {
       target: { tabId: tab.id },
       files: ['src/content/index.js'],
     });
-    await chrome.tabs.sendMessage(tab.id, {
-      type: 'SHOW_TOOLBAR',
-      payload: { recordingId: currentRecordingId },
-    } satisfies ExtensionMessage);
+    // Give the script a moment to initialise its message listener
+    await new Promise<void>((r) => setTimeout(r, 250));
+    await chrome.tabs.sendMessage(tab.id, showMsg);
   } catch (err) {
-    console.warn('[Background] Could not inject floating toolbar:', err);
+    console.error('[Background] Could not inject toolbar:', err);
   }
 }
 
@@ -207,18 +208,18 @@ async function hideFloatingToolbar(): Promise<void> {
 
 // ─── desktopCapture Stream ID ─────────────────────────────────────────────────
 
-function chooseDesktopMedia(sources: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    // @ts-expect-error — desktopCapture types
-    chrome.desktopCapture.chooseDesktopMedia(sources, (streamId: string) => {
-      if (chrome.runtime.lastError || !streamId) {
-        reject(new Error(chrome.runtime.lastError?.message ?? 'User cancelled or capture failed'));
-        return;
-      }
-      resolve(streamId);
-    });
-  });
-}
+// function chooseDesktopMedia(sources: string[]): Promise<string> {
+//   return new Promise((resolve, reject) => {
+//     // @ts-expect-error — desktopCapture types
+//     chrome.desktopCapture.chooseDesktopMedia(sources, (streamId: string) => {
+//       if (chrome.runtime.lastError || !streamId) {
+//         reject(new Error(chrome.runtime.lastError?.message ?? 'User cancelled or capture failed'));
+//         return;
+//       }
+//       resolve(streamId);
+//     });
+//   });
+// }
 
 function getTabStreamId(tabId: number): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -250,7 +251,7 @@ async function handleStartRecording(
 
   try {
     if (options.type === 'screen') {
-      streamId = await chooseDesktopMedia(['screen', 'window']);
+      streamId = 'native-display-media';
     } else if (options.type === 'tab') {
       const tabId =
         options.tabId ?? (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
@@ -313,9 +314,19 @@ async function handleStopRecording(
   sendResponse: (r: unknown) => void,
   cancel = false,
 ): Promise<void> {
+  // SW may have restarted — restore in-memory state from storage
   if (!isRecordingActive) {
-    sendResponse({ error: 'No active recording' });
-    return;
+    const stored = await chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]);
+    const state = stored[STORAGE_KEYS.RECORDING_STATE] as
+      | { isRecording: boolean; recordingId: string; options: RecordingOptions }
+      | undefined;
+    if (!state?.isRecording) {
+      sendResponse({ error: 'No active recording' });
+      return;
+    }
+    isRecordingActive = true;
+    currentRecordingId = state.recordingId;
+    currentRecordingOptions = state.options;
   }
 
   stopTimer();
@@ -341,31 +352,49 @@ async function handleStopRecording(
     return;
   }
 
-  // Instruct offscreen to finalize + upload
+  const recordingId = currentRecordingId;
+  const quality = currentRecordingOptions?.quality ?? 'high';
+  const hasAudio =
+    (currentRecordingOptions?.micEnabled || currentRecordingOptions?.systemAudio) ?? true;
+  const hasWebcam = currentRecordingOptions?.webcamOverlay ?? false;
+
+  currentRecordingId = null;
+  currentRecordingOptions = null;
+  elapsedSeconds = 0;
+
+  // Instruct offscreen to finalize blob into IndexedDB then upload
   try {
     await sendToOffscreen('OFFSCREEN_STOP_RECORDING', {
+      recordingId,
       title: recordingTitle,
       type: recordingType,
       duration: recordingDuration,
-      quality: currentRecordingOptions?.quality ?? 'high',
-      hasAudio:
-        (currentRecordingOptions?.micEnabled || currentRecordingOptions?.systemAudio) ?? true,
-      hasWebcam: currentRecordingOptions?.webcamOverlay ?? false,
+      quality,
+      hasAudio,
+      hasWebcam,
     });
   } catch (err) {
     console.error('[Background] Stop recording error:', err);
     broadcastToAll({ type: 'RECORDING_ERROR', error: 'Failed to finalize recording' });
   }
-
-  currentRecordingId = null;
-  currentRecordingOptions = null;
-  elapsedSeconds = 0;
+  // Editor window is opened by handleOffscreenMessage when OFFSCREEN_RECORDING_READY fires
 }
 
 // ─── PAUSE / RESUME ───────────────────────────────────────────────────────────
 
 async function handlePauseRecording(): Promise<void> {
-  if (!isRecordingActive || isPaused) return;
+  // SW may have restarted — restore in-memory state from storage
+  if (!isRecordingActive) {
+    const stored = await chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]);
+    const state = stored[STORAGE_KEYS.RECORDING_STATE] as
+      | { isRecording: boolean; recordingId: string; options: RecordingOptions }
+      | undefined;
+    if (!state?.isRecording) return;
+    isRecordingActive = true;
+    currentRecordingId = state.recordingId;
+    currentRecordingOptions = state.options;
+  }
+  if (isPaused) return;
   try {
     await sendToOffscreen('OFFSCREEN_PAUSE_RECORDING');
     isPaused = true;
@@ -393,7 +422,7 @@ async function handleResumeRecording(): Promise<void> {
 async function handleTakeScreenshot(sendResponse: (r: unknown) => void): Promise<void> {
   let streamId: string;
   try {
-    streamId = await chooseDesktopMedia(['screen', 'window']);
+    streamId = 'native-display-media';
   } catch (err) {
     sendResponse({ error: err instanceof Error ? err.message : 'Screenshot cancelled' });
     return;
@@ -407,17 +436,6 @@ async function handleTakeScreenshot(sendResponse: (r: unknown) => void): Promise
     const error = err instanceof Error ? err.message : 'Screenshot failed';
     sendResponse({ error });
   }
-}
-
-// ─── Utility ─────────────────────────────────────────────────────────────────
-
-function dataUrlToBlob(dataUrl: string): Blob {
-  const [header, data] = dataUrl.split(',');
-  const mime = header?.match(/:(.*?);/)?.[1] ?? 'image/png';
-  const binary = atob(data ?? '');
-  const arr = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
-  return new Blob([arr], { type: mime });
 }
 
 // ─── Message Listener ─────────────────────────────────────────────────────────
@@ -504,19 +522,55 @@ chrome.runtime.onMessage.addListener(
 function handleOffscreenMessage(message: ExtensionMessage & { target?: string }): void {
   switch (message.type as string) {
     case 'OFFSCREEN_RECORDING_READY': {
-      const { thumbnailDataUrl, duration, blobSize, shareUrl } = message.payload as {
+      const {
+        thumbnailDataUrl,
+        duration,
+        blobSize,
+        shareUrl,
+        recordingId: readyRecordingId,
+        title: readyTitle,
+      } = message.payload as {
         thumbnailDataUrl: string | null;
         duration: number;
         blobSize: number;
         shareUrl: string | null;
+        recordingId?: string;
+        title?: string;
       };
-      // Preserve the thumbnail from the first call when the second call provides the shareUrl
+
+      // Preserve thumbnail from the first call when second call brings shareUrl
       pendingPreview = {
         thumbnailDataUrl: thumbnailDataUrl ?? pendingPreview?.thumbnailDataUrl ?? null,
         duration,
         blobSize,
         shareUrl,
       };
+
+      // Persist editor metadata so the editor window can read it
+      const editorRecordingId = readyRecordingId ?? currentRecordingId ?? 'unknown';
+      void chrome.storage.local.set({
+        [STORAGE_KEYS.EDITOR_DATA]: {
+          recordingId: editorRecordingId,
+          thumbnailDataUrl: pendingPreview.thumbnailDataUrl,
+          duration,
+          blobSize,
+          title: readyTitle ?? `Recording ${new Date().toLocaleString()}`,
+          consoleLogs: [],
+          networkCaptures: [],
+        },
+      });
+
+      // Open the editor as a popup window (only on the first READY call, before shareUrl)
+      if (!shareUrl) {
+        void chrome.windows.create({
+          url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),
+          type: 'popup',
+          width: 960,
+          height: 680,
+          focused: true,
+        });
+      }
+
       void pushPreviewToTab({
         thumbnailDataUrl: pendingPreview.thumbnailDataUrl,
         duration,
@@ -560,16 +614,6 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
       // Persist for popup that may not be open when upload finishes
       void chrome.storage.local.set({
         [STORAGE_KEYS.PENDING_SHARE]: { shareUrl, recordingId: recordingId ?? null },
-      });
-
-      // Show browser notification
-      chrome.notifications.create({
-        type: 'basic',
-        iconUrl: 'icons/icon48.png',
-        title: 'Recording Ready!',
-        message: 'Your recording has been uploaded. Click to view and share.',
-        buttons: [{ title: 'View & Share' }],
-        priority: 2,
       });
 
       // Close offscreen document now that upload is complete
@@ -624,24 +668,6 @@ chrome.commands.onCommand.addListener((command) => {
       void handleTakeScreenshot(() => {});
       break;
     }
-  }
-});
-
-// ─── Notifications ────────────────────────────────────────────────────────────
-
-chrome.notifications.onClicked.addListener(() => {
-  chrome.action.openPopup().catch(() => {});
-});
-
-chrome.notifications.onButtonClicked.addListener((_id, buttonIndex) => {
-  if (buttonIndex === 0) chrome.action.openPopup().catch(() => {});
-});
-
-// ─── Alarms — Token Refresh ───────────────────────────────────────────────────
-
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === AUTH_REFRESH_ALARM) {
-    await authManager.handleRefreshAlarm();
   }
 });
 

@@ -262,6 +262,7 @@ export const STORAGE_KEYS = {
   RECORDING_STATE: 'st_recording_state',
   OFFLINE_QUEUE: 'st_offline_queue',
   PENDING_SHARE: 'st_pending_share',
+  EDITOR_DATA: 'st_editor_data',
 } as const;
 
 /** chrome.alarms name for the token refresh alarm. */

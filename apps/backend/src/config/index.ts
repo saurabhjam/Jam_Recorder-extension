@@ -123,7 +123,7 @@ export const config = {
   },
   upload: {
     maxSize: env.UPLOAD_MAX_SIZE,
-    chunkSize: env.CHUNK_SIZE,
+    chunkSize: 5 * 1024 * 1024,
   },
   smtp: {
     host: env.SMTP_HOST,

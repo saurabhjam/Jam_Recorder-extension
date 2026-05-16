@@ -136,6 +136,8 @@ model Recording {
   allowDownload Boolean         @default(true)
   viewCount     Int             @default(0)
   metadata      Json?
+  consoleLogs   Json?
+  networkLogs   Json?
   chunks        UploadChunk[]
   shareLinks    ShareLink[]
   comments      Comment[]

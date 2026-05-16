@@ -1,3 +1,5 @@
+import https from 'https';
+import http from 'http';
 import { v2 as cloudinary, type UploadApiOptions, type UploadApiResponse } from 'cloudinary';
 import { Readable } from 'stream';
 
@@ -109,7 +111,28 @@ export class CloudinaryStorage implements StorageProvider {
       tags: options.tags,
     };
 
-    const result = await cloudinary.uploader.upload(url, uploadOptions);
+    const response = await fetch(url);
+    const arrayBuffer = await response.arrayBuffer();
+    const finalBuffer = Buffer.from(arrayBuffer);
+    const recordingId = options.publicId ?? `rec_${Date.now()}`;
+
+    const result = await new Promise<UploadApiResponse>((resolve, reject) => {
+      const uploadStream = cloudinary.uploader.upload_stream(
+        {
+          resource_type: 'video',
+          folder: 'snaptrace/recordings',
+          public_id: recordingId,
+          overwrite: true,
+        },
+        (error, result) => {
+          if (error) reject(error);
+          else resolve(result!);
+        },
+      );
+
+      uploadStream.end(finalBuffer);
+    });
+
     return this.mapUploadResult(result);
   }
 

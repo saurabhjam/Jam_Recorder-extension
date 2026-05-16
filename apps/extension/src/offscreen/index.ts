@@ -17,7 +17,7 @@
  */
 
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
-import { QUALITY_PRESETS, STORAGE_KEYS, toBackendRecordingType } from '@/types';
+import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -100,10 +100,8 @@ let recorder: MediaRecorder | null = null;
 let stream: MediaStream | null = null;
 let micStream: MediaStream | null = null;
 let webcamStream: MediaStream | null = null;
-let audioContext: AudioContext | null = null;
 let chunks: Blob[] = [];
 let mimeType = 'video/webm';
-let activeRecordingId: string | null = null;
 let isRecordingActive = false;
 let lastThumbnailDataUrl: string | null = null;
 
@@ -126,107 +124,87 @@ function getSupportedMimeType(): string {
 
 // ─── Stream Building ──────────────────────────────────────────────────────────
 
-async function buildCaptureStream(
+// async function buildCaptureStream(
+//   options: RecordingOptions,
+//   streamId?: string,
+// ): Promise<MediaStream> {
+//   const preset: { width: number; height: number; frameRate: number } =
+//     QUALITY_PRESETS[options.quality];
+
+//   if (options.type === 'screen' || options.type === 'tab') {
+//     if (!streamId) throw new Error('streamId required for screen/tab recording');
+//     const source = options.type === 'screen' ? 'desktop' : 'tab';
+
+//     return navigator.mediaDevices.getUserMedia({
+//       video: {
+//         // @ts-expect-error — Chrome-specific mandatory constraints
+//         mandatory: {
+//           chromeMediaSource: source,
+//           chromeMediaSourceId: streamId,
+//           maxWidth: preset.width,
+//           maxHeight: preset.height,
+//           maxFrameRate: preset.frameRate,
+//         },
+//       },
+//       audio: options.systemAudio
+//         ? {
+//             // @ts-expect-error — Chrome-specific mandatory constraints
+//             mandatory: {
+//               chromeMediaSource: source,
+//               chromeMediaSourceId: streamId,
+//             },
+//           }
+//         : false,
+//     });
+//   }
+
+//   if (options.type === 'webcam') {
+//     return navigator.mediaDevices.getUserMedia({
+//       video: {
+//         width: { ideal: preset.width, max: preset.width },
+//         height: { ideal: preset.height, max: preset.height },
+//         frameRate: { ideal: preset.frameRate },
+//         facingMode: 'user',
+//       },
+//       audio: options.micEnabled
+//         ? { echoCancellation: true, noiseSuppression: true, sampleRate: 48_000 }
+//         : false,
+//     });
+//   }
+
+//   throw new Error(`Unsupported recording type: ${options.type}`);
+// }
+
+async function createRecordingStream(
   options: RecordingOptions,
   streamId?: string,
 ): Promise<MediaStream> {
-  const preset: { width: number; height: number; frameRate: number } =
-    QUALITY_PRESETS[options.quality];
-
-  if (options.type === 'screen' || options.type === 'tab') {
-    if (!streamId) throw new Error('streamId required for screen/tab recording');
-    const source = options.type === 'screen' ? 'desktop' : 'tab';
-
-    return navigator.mediaDevices.getUserMedia({
+  if (options.type === 'screen') {
+    return navigator.mediaDevices.getDisplayMedia({
       video: {
-        // @ts-expect-error — Chrome-specific mandatory constraints
-        mandatory: {
-          chromeMediaSource: source,
-          chromeMediaSourceId: streamId,
-          maxWidth: preset.width,
-          maxHeight: preset.height,
-          maxFrameRate: preset.frameRate,
-        },
+        displaySurface: 'monitor',
+        frameRate: 30,
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
       },
-      audio: options.systemAudio
-        ? {
-            // @ts-expect-error — Chrome-specific mandatory constraints
-            mandatory: {
-              chromeMediaSource: source,
-              chromeMediaSourceId: streamId,
-            },
-          }
-        : false,
-    });
-  }
-
-  if (options.type === 'webcam') {
-    return navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: preset.width, max: preset.width },
-        height: { ideal: preset.height, max: preset.height },
-        frameRate: { ideal: preset.frameRate },
-        facingMode: 'user',
+      audio: {
+        suppressLocalAudioPlayback: false,
       },
-      audio: options.micEnabled
-        ? { echoCancellation: true, noiseSuppression: true, sampleRate: 48_000 }
-        : false,
-    });
+      preferCurrentTab: false,
+      selfBrowserSurface: 'exclude',
+      systemAudio: 'include',
+    } as any);
   }
 
-  throw new Error(`Unsupported recording type: ${options.type}`);
-}
-
-function mergeAudioTracks(tracks: MediaStreamTrack[]): MediaStreamTrack {
-  audioContext = new AudioContext();
-  const dest = audioContext.createMediaStreamDestination();
-  for (const track of tracks) {
-    audioContext.createMediaStreamSource(new MediaStream([track])).connect(dest);
-  }
-  return dest.stream.getAudioTracks()[0]!;
-}
-
-async function buildFinalStream(
-  captureStream: MediaStream,
-  options: RecordingOptions,
-): Promise<MediaStream> {
-  const videoTracks = captureStream.getVideoTracks();
-  const audioTracks: MediaStreamTrack[] = [...captureStream.getAudioTracks()];
-
-  // Add microphone for screen/tab recordings
-  if (options.micEnabled && options.type !== 'webcam') {
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48_000 },
-        video: false,
-      });
-      audioTracks.push(...micStream.getAudioTracks());
-    } catch {
-      console.warn('[Offscreen] Microphone denied, continuing without mic');
-    }
-  }
-
-  // Add webcam overlay track (secondary video; compositor would blend it client-side)
-  if (options.webcamOverlay && options.type !== 'webcam') {
-    try {
-      webcamStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 320, height: 240, facingMode: 'user' },
-        audio: false,
-      });
-    } catch {
-      console.warn('[Offscreen] Webcam overlay denied');
-    }
-  }
-
-  const finalTracks: MediaStreamTrack[] = [...videoTracks];
-
-  if (audioTracks.length > 1) {
-    finalTracks.push(mergeAudioTracks(audioTracks));
-  } else if (audioTracks.length === 1) {
-    finalTracks.push(audioTracks[0]!);
-  }
-
-  return new MediaStream(finalTracks);
+  return navigator.mediaDevices.getUserMedia({
+    audio: options.systemAudio,
+    video: {
+      mandatory: {
+        chromeMediaSource: 'tab',
+        chromeMediaSourceId: streamId,
+      },
+    } as any,
+  });
 }
 
 // ─── Recording Lifecycle ──────────────────────────────────────────────────────
@@ -236,23 +214,18 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
     throw new Error('A recording is already in progress in offscreen');
   }
 
-  const { options, streamId, recordingId } = payload;
+  const { options, streamId } = payload;
 
   chunks = [];
   mimeType = getSupportedMimeType();
-  activeRecordingId = recordingId;
   isRecordingActive = true;
 
-  const captureStream = await buildCaptureStream(options, streamId);
+  const captureStream = await createRecordingStream(options, streamId);
   stream = captureStream;
 
-  const finalStream = await buildFinalStream(captureStream, options);
-  const preset = QUALITY_PRESETS[options.quality];
-
-  recorder = new MediaRecorder(finalStream, {
-    mimeType,
-    videoBitsPerSecond: preset.videoBitrate,
-    audioBitsPerSecond: 128_000,
+  recorder = new MediaRecorder(stream, {
+    mimeType: 'video/webm;codecs=vp9,opus',
+    videoBitsPerSecond: 8_000_000,
   });
 
   recorder.ondataavailable = (e) => {
@@ -364,16 +337,13 @@ function cleanup(): void {
   stream?.getTracks().forEach((t) => t.stop());
   micStream?.getTracks().forEach((t) => t.stop());
   webcamStream?.getTracks().forEach((t) => t.stop());
-  audioContext?.close();
 
   stream = null;
   micStream = null;
   webcamStream = null;
-  audioContext = null;
   recorder = null;
   chunks = [];
   isRecordingActive = false;
-  activeRecordingId = null;
   lastThumbnailDataUrl = null;
 }
 
