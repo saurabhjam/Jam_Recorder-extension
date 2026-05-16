@@ -11,6 +11,7 @@ import { ShareView } from './views/ShareView';
 import { LibraryView } from './views/LibraryView';
 import { BugReportView } from './views/BugReportView';
 import { AnnotationView } from './views/AnnotationView';
+import { SettingsView } from './views/SettingsView';
 
 type View =
   | 'login'
@@ -200,6 +201,20 @@ export default function App() {
             className="flex-1 overflow-hidden"
           >
             <LibraryView onBack={() => navigate('home')} />
+          </motion.div>
+        )}
+
+        {currentView === 'settings' && (
+          <motion.div
+            key="settings"
+            variants={PAGE_VARIANTS}
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            transition={PAGE_TRANSITION}
+            className="flex-1 overflow-hidden"
+          >
+            <SettingsView onBack={() => navigate('home')} />
           </motion.div>
         )}
 

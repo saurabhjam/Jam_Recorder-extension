@@ -8,17 +8,30 @@ const config: Config = {
     extend: {
       colors: {
         jam: {
-          50: '#eef2ff',
-          100: '#e0e7ff',
-          200: '#c7d2fe',
-          300: '#a5b4fc',
-          400: '#818cf8',
-          500: '#6366f1',
-          600: '#4f46e5',
-          700: '#4338ca',
-          800: '#3730a3',
-          900: '#312e81',
-          950: '#1e1b4b',
+          50: '#f5f3ff',
+          100: '#ede9fe',
+          200: '#ddd6fe',
+          300: '#c4b5fd',
+          400: '#a78bfa',
+          500: '#7C3AED',
+          600: '#6d28d9',
+          700: '#5b21b6',
+          800: '#4c1d95',
+          900: '#3b1577',
+          950: '#1e0b4b',
+        },
+        violet: {
+          50: '#f5f3ff',
+          100: '#ede9fe',
+          200: '#ddd6fe',
+          300: '#c4b5fd',
+          400: '#a78bfa',
+          500: '#7C3AED',
+          600: '#6d28d9',
+          700: '#5b21b6',
+          800: '#4c1d95',
+          900: '#3b1577',
+          950: '#1e0b4b',
         },
         dark: {
           50: '#f8fafc',
@@ -31,7 +44,7 @@ const config: Config = {
           700: '#334155',
           800: '#1e293b',
           900: '#0f172a',
-          950: '#020617',
+          950: '#060816',
         },
       },
       fontFamily: {
@@ -93,10 +106,10 @@ const config: Config = {
         },
         glowPulse: {
           '0%, 100%': {
-            boxShadow: '0 0 10px rgba(99, 102, 241, 0.4)',
+            boxShadow: '0 0 10px rgba(124, 58, 237, 0.4)',
           },
           '50%': {
-            boxShadow: '0 0 30px rgba(99, 102, 241, 0.8)',
+            boxShadow: '0 0 30px rgba(124, 58, 237, 0.8)',
           },
         },
         shimmer: {
@@ -105,8 +118,8 @@ const config: Config = {
         },
       },
       backgroundImage: {
-        'jam-gradient': 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
-        'jam-gradient-dark': 'linear-gradient(135deg, #4338ca 0%, #7c3aed 100%)',
+        'jam-gradient': 'linear-gradient(135deg, #7C3AED 0%, #a78bfa 100%)',
+        'jam-gradient-dark': 'linear-gradient(135deg, #5b21b6 0%, #7C3AED 100%)',
         'glass-gradient':
           'linear-gradient(135deg, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0.05) 100%)',
         'recording-gradient': 'linear-gradient(90deg, #ef4444, #f97316)',
@@ -119,8 +132,8 @@ const config: Config = {
       boxShadow: {
         glass: '0 8px 32px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255,255,255,0.1)',
         'glass-lg': '0 16px 64px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255,255,255,0.1)',
-        jam: '0 4px 24px rgba(99, 102, 241, 0.4)',
-        'jam-lg': '0 8px 48px rgba(99, 102, 241, 0.6)',
+        jam: '0 4px 24px rgba(124, 58, 237, 0.4)',
+        'jam-lg': '0 8px 48px rgba(124, 58, 237, 0.6)',
         recording: '0 4px 24px rgba(239, 68, 68, 0.4)',
       },
     },
@@ -141,15 +154,15 @@ const config: Config = {
           border: '1px solid rgba(255, 255, 255,  0.06)',
         },
         '.glass-card': {
-          background: 'rgba(15, 23, 42, 0.9)',
+          background: 'rgba(6, 8, 22, 0.9)',
           backdropFilter: 'blur(20px)',
           WebkitBackdropFilter: 'blur(20px)',
-          border: '1px solid rgba(99, 102, 241, 0.2)',
+          border: '1px solid rgba(124, 58, 237, 0.2)',
           boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255,255,255,0.05)',
         },
         '.scrollbar-thin': {
           scrollbarWidth: 'thin',
-          scrollbarColor: 'rgba(99, 102, 241, 0.4) transparent',
+          scrollbarColor: 'rgba(124, 58, 237, 0.4) transparent',
         },
         '.scrollbar-none': {
           scrollbarWidth: 'none',
@@ -167,7 +180,7 @@ const config: Config = {
 
       addComponents({
         '.btn-primary': {
-          background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
+          background: 'linear-gradient(135deg, #7C3AED 0%, #a78bfa 100%)',
           color: 'white',
           fontWeight: '600',
           borderRadius: '0.75rem',
@@ -176,8 +189,8 @@ const config: Config = {
           border: 'none',
           cursor: 'pointer',
           '&:hover': {
-            background: 'linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%)',
-            boxShadow: '0 4px 24px rgba(99, 102, 241, 0.5)',
+            background: 'linear-gradient(135deg, #5b21b6 0%, #7C3AED 100%)',
+            boxShadow: '0 4px 24px rgba(124, 58, 237, 0.5)',
             transform: 'translateY(-1px)',
           },
           '&:active': {
@@ -190,16 +203,16 @@ const config: Config = {
           },
         },
         '.input-dark': {
-          background: 'rgba(15, 23, 42, 0.8)',
-          border: '1px solid rgba(99, 102, 241, 0.2)',
+          background: 'rgba(6, 8, 22, 0.8)',
+          border: '1px solid rgba(124, 58, 237, 0.2)',
           borderRadius: '0.75rem',
           color: 'white',
           padding: '0.625rem 1rem',
           transition: 'all 0.2s ease',
           '&:focus': {
             outline: 'none',
-            borderColor: 'rgba(99, 102, 241, 0.6)',
-            boxShadow: '0 0 0 3px rgba(99, 102, 241, 0.15)',
+            borderColor: 'rgba(124, 58, 237, 0.6)',
+            boxShadow: '0 0 0 3px rgba(124, 58, 237, 0.15)',
           },
           '&::placeholder': {
             color: 'rgba(148, 163, 184, 0.6)',
