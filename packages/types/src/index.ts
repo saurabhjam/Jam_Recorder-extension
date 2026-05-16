@@ -166,7 +166,7 @@ export interface RecordingState {
   isPaused: boolean;
   recordingType: RecordingType;
   duration: number;
-  stream?: MediaStream;
+  stream?: unknown; // MediaStream — browser-only, typed as unknown for Node.js compatibility
   chunks: Blob[];
   recordingId?: string;
   startTime?: number;

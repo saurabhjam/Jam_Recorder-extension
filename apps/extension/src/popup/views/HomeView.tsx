@@ -101,7 +101,7 @@ const SCREENSHOT_TYPES: Array<{
 ];
 
 export function HomeView({ onNavigate }: HomeViewProps) {
-  const { user, logout } = useAuthStore();
+  const { user, logout, isAuthenticated } = useAuthStore();
   const { recordings, startRecording, takeScreenshot, fetchRecordings } = useRecordingStore();
   const { settings, toggleMic, toggleWebcam, setQuality } = useSettingsStore();
 
@@ -121,9 +121,12 @@ export function HomeView({ onNavigate }: HomeViewProps) {
 
   const recentRecordings = recordings.slice(0, 4);
 
+  // Only fetch recordings when the user is actually authenticated
   useEffect(() => {
-    void fetchRecordings();
-  }, [fetchRecordings]);
+    if (isAuthenticated) {
+      void fetchRecordings();
+    }
+  }, [isAuthenticated, fetchRecordings]);
 
   // Close menus when clicking outside
   useEffect(() => {

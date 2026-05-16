@@ -9,6 +9,7 @@
     },
     "types": ["node"],
     "strict": true,
+    "noImplicitAny": false,
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "experimentalDecorators": true,

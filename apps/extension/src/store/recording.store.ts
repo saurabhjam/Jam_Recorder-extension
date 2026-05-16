@@ -199,12 +199,23 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   },
 
   fetchRecordings: async () => {
+    // Guard: only fetch if we have a stored access token
+    try {
+      const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
+      const tokens = stored[STORAGE_KEYS.AUTH_TOKENS] as { accessToken?: string } | undefined;
+      if (!tokens?.accessToken) return;
+    } catch {
+      return;
+    }
     try {
       const { recordingsApi } = await import('@/services/api');
       const result = await recordingsApi.list(1, 20);
       set({ recordings: result.data });
     } catch (err) {
-      console.error('[RecordingStore] fetchRecordings error:', err);
+      // Silently ignore network errors — backend may not be reachable yet
+      if ((err as { code?: string })?.code !== 'ERR_NETWORK') {
+        console.error('[RecordingStore] fetchRecordings error:', err);
+      }
     }
   },
 
