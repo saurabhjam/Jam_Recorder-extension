@@ -38,7 +38,7 @@ export class RecordingService {
         mimeType: data.mimeType ?? 'video/webm',
         status: 'UPLOADING',
         isPublic: true,
-        metadata: data.metadata as Prisma.InputJsonValue,
+        metadata: (data.metadata ?? null) as Prisma.InputJsonValue,
       },
       include: {
         user: {
@@ -84,6 +84,7 @@ export class RecordingService {
     const cached = await cacheGet(cacheKey);
     if (cached) {
       const rec = cached as Awaited<ReturnType<typeof this.fetchRecordingById>>;
+      if (!rec) throw new AppError('Recording not found', 404, 'NOT_FOUND');
       this.assertAccess(rec, userId);
       return rec;
     }
@@ -180,8 +181,8 @@ export class RecordingService {
       return cached;
     }
 
-    const recording = await prisma.recording.findUnique({
-      where: { shareId, isPublic: true, status: 'READY' },
+    const recording = await prisma.recording.findFirst({
+      where: { shareId, isPublic: true, status: { in: ['PROCESSING', 'READY'] } },
       include: {
         user: { select: { id: true, name: true, avatar: true } },
         _count: { select: { comments: true } },
@@ -192,7 +193,10 @@ export class RecordingService {
       throw new AppError('Recording not found or not public', 404, 'NOT_FOUND');
     }
 
-    await cacheSet(cacheKey, recording, CACHE_TTL.RECORDING);
+    // Only cache READY recordings; PROCESSING ones should refresh on next request
+    if (recording.status === 'READY') {
+      await cacheSet(cacheKey, recording, CACHE_TTL.RECORDING);
+    }
     return recording;
   }
 

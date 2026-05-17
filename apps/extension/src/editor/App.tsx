@@ -1,6 +1,17 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Copy, Check, Play, Pause, Maximize2, RotateCcw, Link2, Lock, LogIn } from 'lucide-react';
+import {
+  Copy,
+  Check,
+  Play,
+  Pause,
+  Maximize2,
+  RotateCcw,
+  Link2,
+  Lock,
+  LogIn,
+  Scissors,
+} from 'lucide-react';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -10,38 +21,89 @@ interface EditorData {
   duration: number;
   blobSize: number;
   title: string;
+  recordingType?: string;
   consoleLogs: ConsoleLog[];
   networkCaptures: NetworkCapture[];
 }
 
 interface ConsoleLog {
-  level: 'log' | 'info' | 'warn' | 'error';
+  level: 'log' | 'info' | 'warn' | 'error' | 'debug';
   message: string;
   timestamp: number;
   url: string;
+  source?: 'cdp' | 'injected';
 }
 
 interface NetworkCapture {
+  id?: string;
   url: string;
   method: string;
   status: number;
+  statusText?: string;
   duration: number;
   timestamp: number;
   size: number;
+  mimeType?: string;
+  failed?: boolean;
+  errorText?: string;
+  source?: 'cdp' | 'injected';
 }
 
 type LogTab = 'console' | 'network' | 'info' | 'actions';
 
-// ─── Storage key (mirrors types/index.ts) ────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 const EDITOR_DATA_KEY = 'st_editor_data';
 const PENDING_SHARE_KEY = 'st_pending_share';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
+const IDB_NAME = 'snaptrace-blobs';
+const IDB_STORE = 'recordings';
+const API_BASE = 'http://localhost:3000/api';
+const DASHBOARD_URL = 'http://localhost:3001';
+const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
+
+// ─── Upload helpers ───────────────────────────────────────────────────────────
+
+function splitBlob(blob: Blob): Blob[] {
+  const parts: Blob[] = [];
+  for (let offset = 0; offset < blob.size; offset += CHUNK_SIZE) {
+    parts.push(blob.slice(offset, offset + CHUNK_SIZE));
+  }
+  return parts;
+}
+
+// ─── IDB helpers ─────────────────────────────────────────────────────────────
+
+function openRecordingIDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function loadBlobFromIDB(id: string): Promise<Blob | null> {
+  try {
+    const db = await openRecordingIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(id);
+      req.onsuccess = () => resolve((req.result as Blob | undefined) ?? null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function formatDur(secs: number): string {
+  if (!isFinite(secs) || isNaN(secs) || secs < 0) return '00:00';
   const m = Math.floor(secs / 60);
-  const s = secs % 60;
+  const s = Math.floor(secs % 60);
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
@@ -66,14 +128,20 @@ export function EditorApp() {
   const [description, setDescription] = useState('');
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [uploadPercent, setUploadPercent] = useState(0);
-  const [isUploading, setIsUploading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<LogTab>('console');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(1); // 0–1 fractions of total duration
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  // ── Load editor data from storage ──────────────────────────────────────────
+  // ── Load editor data + blob from IDB ───────────────────────────────────────
   useEffect(() => {
     const load = async () => {
       const result = await chrome.storage.local.get([
@@ -93,7 +161,6 @@ export function EditorApp() {
         | undefined;
       if (pending?.shareUrl && (!recordingId || pending.recordingId === recordingId)) {
         setShareUrl(pending.shareUrl);
-        setIsUploading(false);
         setUploadPercent(100);
       }
 
@@ -103,45 +170,51 @@ export function EditorApp() {
     void load();
   }, [recordingId]);
 
-  // ── Listen for upload progress / completion ─────────────────────────────────
+  // ── Poll storage for data (editor opens before storage write in some cases) ─
   useEffect(() => {
-    const listener = (message: { type: string; payload?: unknown }) => {
-      if (message.type === 'UPLOAD_PROGRESS') {
-        const p = message.payload as { percentComplete: number };
-        setUploadPercent(p.percentComplete ?? 0);
-        setIsUploading(true);
+    if (data) return;
+    const id = setInterval(async () => {
+      const result = await chrome.storage.local.get([EDITOR_DATA_KEY]);
+      const stored = result[EDITOR_DATA_KEY] as EditorData | undefined;
+      if (stored) {
+        setData(stored);
+        setTitle(stored.title);
+        clearInterval(id);
       }
-      if (message.type === 'UPLOAD_COMPLETE') {
-        const p = message.payload as { shareUrl: string };
-        setShareUrl(p.shareUrl);
-        setIsUploading(false);
-        setUploadPercent(100);
+    }, 500);
+    return () => clearInterval(id);
+  }, [data]);
+
+  // ── Load video blob from IDB ───────────────────────────────────────────────
+  useEffect(() => {
+    if (!recordingId || recordingId === 'unknown') return;
+    let objectUrl: string | null = null;
+    const tryLoad = async () => {
+      const blob = await loadBlobFromIDB(recordingId);
+      if (blob) {
+        objectUrl = URL.createObjectURL(blob);
+        setVideoUrl(objectUrl);
       }
-      if (message.type === 'OAUTH_LOGIN_COMPLETE') {
-        setIsAuthenticated(true);
-      }
+    };
+    void tryLoad();
+    // Retry a few times in case the blob is still being written
+    const retryTimer = setTimeout(() => {
+      void tryLoad();
+    }, 1500);
+    return () => {
+      clearTimeout(retryTimer);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [recordingId]);
+
+  // ── Listen for auth changes ────────────────────────────────────────────────
+  useEffect(() => {
+    const listener = (message: { type: string }) => {
+      if (message.type === 'OAUTH_LOGIN_COMPLETE') setIsAuthenticated(true);
     };
     chrome.runtime.onMessage.addListener(listener);
     return () => chrome.runtime.onMessage.removeListener(listener);
   }, []);
-
-  // ── Poll for share URL if not yet received ──────────────────────────────────
-  useEffect(() => {
-    if (shareUrl) return;
-    const id = setInterval(async () => {
-      const result = await chrome.storage.local.get([PENDING_SHARE_KEY]);
-      const pending = result[PENDING_SHARE_KEY] as
-        | { shareUrl: string; recordingId: string }
-        | undefined;
-      if (pending?.shareUrl) {
-        setShareUrl(pending.shareUrl);
-        setIsUploading(false);
-        setUploadPercent(100);
-        clearInterval(id);
-      }
-    }, 1500);
-    return () => clearInterval(id);
-  }, [shareUrl]);
 
   const handleCopyLink = async () => {
     if (!shareUrl) return;
@@ -150,21 +223,136 @@ export function EditorApp() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleOpenSignIn = () => {
-    chrome.runtime.sendMessage({ type: 'OPEN_POPUP' });
-  };
+  const handleOpenSignIn = () => chrome.runtime.sendMessage({ type: 'OPEN_POPUP' });
 
-  const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (isPlaying) {
-      videoRef.current.pause();
-    } else {
-      void videoRef.current.play();
+  const handleSave = useCallback(async () => {
+    if (!data || !recordingId || isSaving || shareUrl) return;
+    setIsSaving(true);
+    setUploadPercent(0);
+    setUploadError(null);
+    try {
+      const tokenResult = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
+      const token = (tokenResult[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)
+        ?.accessToken;
+      if (!token) {
+        setUploadError('Not authenticated — please sign in.');
+        return;
+      }
+
+      const blob = await loadBlobFromIDB(recordingId);
+      if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
+
+      const blobChunks = splitBlob(blob);
+      const totalChunks = blobChunks.length;
+      const totalBytes = blob.size;
+      const mime = blob.type || 'video/webm';
+      const recType = (data.recordingType ?? 'screen').toUpperCase();
+
+      // 1. Create recording + initiate
+      const createRes = await fetch(`${API_BASE}/recordings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          title: title || data.title,
+          type: recType,
+          totalChunks,
+          mimeType: mime,
+          metadata: {
+            consoleLogs: data.consoleLogs,
+            networkLogs: data.networkCaptures,
+          },
+        }),
+      });
+      if (!createRes.ok) {
+        const e = (await createRes.json().catch(() => ({}))) as {
+          message?: string;
+          details?: unknown;
+        };
+        const detail = e.details ? ` (${JSON.stringify(e.details)})` : '';
+        throw new Error(`${e.message ?? `Create recording failed (${createRes.status})`}${detail}`);
+      }
+      const createBody = (await createRes.json()) as { data: { id: string; shareId: string } };
+      const backendId = createBody.data.id;
+      const shareId = createBody.data.shareId ?? backendId;
+
+      const initRes = await fetch(`${API_BASE}/uploads/initiate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ recordingId: backendId, totalChunks }),
+      });
+      if (!initRes.ok) {
+        const e = (await initRes.json().catch(() => ({}))) as { message?: string };
+        throw new Error(e.message ?? `Upload initiation failed (${initRes.status})`);
+      }
+
+      // 2. Upload chunks
+      let uploadedBytes = 0;
+      for (let i = 0; i < blobChunks.length; i++) {
+        const chunk = blobChunks[i]!;
+        const formData = new FormData();
+        formData.append('chunk', chunk, `chunk-${i}`);
+        const url = `${API_BASE}/uploads/chunk?recordingId=${encodeURIComponent(backendId)}&chunkIndex=${i}&totalChunks=${totalChunks}`;
+        await new Promise<void>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', url);
+          xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable)
+              setUploadPercent(Math.round(((uploadedBytes + e.loaded) / totalBytes) * 100));
+          };
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              uploadedBytes += chunk.size;
+              setUploadPercent(Math.round((uploadedBytes / totalBytes) * 100));
+              resolve();
+            } else reject(new Error(`Chunk ${i} failed (${xhr.status})`));
+          };
+          xhr.onerror = () => reject(new Error('Network error during upload'));
+          xhr.send(formData);
+        });
+      }
+
+      // 3. Finalize
+      const finalRes = await fetch(`${API_BASE}/uploads/complete/${backendId}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!finalRes.ok) {
+        const e = (await finalRes.json().catch(() => ({}))) as { message?: string };
+        throw new Error(e.message ?? `Finalize failed (${finalRes.status})`);
+      }
+
+      const newShareUrl = `${DASHBOARD_URL}/share/${shareId}`;
+      setShareUrl(newShareUrl);
+      setUploadPercent(100);
+      await chrome.storage.local.set({
+        [PENDING_SHARE_KEY]: { shareUrl: newShareUrl, recordingId: backendId },
+      });
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setIsSaving(false);
     }
-    setIsPlaying((p) => !p);
-  };
+  }, [data, recordingId, title, isSaving, shareUrl]);
 
-  const canCopy = !!shareUrl && isAuthenticated;
+  const togglePlay = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) {
+      void v.play();
+    } else {
+      v.pause();
+    }
+  }, []);
+
+  const handleSeek = useCallback((fraction: number) => {
+    const v = videoRef.current;
+    if (!v || !v.duration) return;
+    v.currentTime = fraction * v.duration;
+  }, []);
+
+  const canCopy = !!shareUrl;
+  const totalDur = videoDuration || (data?.duration ?? 0);
 
   return (
     <div
@@ -191,7 +379,6 @@ export function EditorApp() {
           zIndex: 10,
         }}
       >
-        {/* Logo */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <div
             style={{
@@ -211,8 +398,6 @@ export function EditorApp() {
           </div>
           <span style={{ fontSize: '15px', fontWeight: 700, color: 'white' }}>SnapTrace</span>
         </div>
-
-        {/* Save & Copy Link */}
         <motion.button
           whileTap={{ scale: 0.96 }}
           onClick={() => void handleCopyLink()}
@@ -254,81 +439,40 @@ export function EditorApp() {
           boxSizing: 'border-box',
         }}
       >
-        {/* ── Left: Player + Fields ── */}
+        {/* ── Left: Player + Trim + Fields ── */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          {/* Video / Thumbnail */}
+          {/* Video player */}
           <div
             style={{
               position: 'relative',
-              background: '#0d0d14',
+              background: '#000',
               borderRadius: '16px',
               overflow: 'hidden',
               border: '1px solid rgba(255,255,255,0.08)',
               aspectRatio: '16/9',
             }}
           >
-            {data?.thumbnailDataUrl ? (
-              <>
-                <img
-                  src={data.thumbnailDataUrl}
-                  alt="Recording thumbnail"
-                  style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-                />
-                {/* Play overlay */}
-                <div
-                  onClick={togglePlay}
-                  style={{
-                    position: 'absolute',
-                    inset: 0,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    cursor: 'pointer',
-                    background: 'rgba(0,0,0,0.3)',
-                    transition: 'background 0.2s',
-                  }}
-                  onMouseEnter={(e) => {
-                    (e.currentTarget as HTMLDivElement).style.background = 'rgba(0,0,0,0.45)';
-                  }}
-                  onMouseLeave={(e) => {
-                    (e.currentTarget as HTMLDivElement).style.background = 'rgba(0,0,0,0.3)';
-                  }}
-                >
-                  <div
-                    style={{
-                      width: '52px',
-                      height: '52px',
-                      borderRadius: '50%',
-                      background: 'rgba(139,92,246,0.9)',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      boxShadow: '0 4px 20px rgba(139,92,246,0.5)',
-                    }}
-                  >
-                    <Play size={22} fill="white" style={{ marginLeft: '2px' }} />
-                  </div>
-                </div>
-
-                {/* Duration badge */}
-                <div
-                  style={{
-                    position: 'absolute',
-                    bottom: '10px',
-                    right: '10px',
-                    background: 'rgba(0,0,0,0.75)',
-                    backdropFilter: 'blur(8px)',
-                    borderRadius: '8px',
-                    padding: '3px 8px',
-                    fontSize: '13px',
-                    fontWeight: 700,
-                    color: 'white',
-                    fontVariantNumeric: 'tabular-nums',
-                  }}
-                >
-                  {formatDur(data?.duration ?? 0)}
-                </div>
-              </>
+            {videoUrl ? (
+              <video
+                ref={videoRef}
+                src={videoUrl}
+                style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+                onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
+                onDurationChange={() => {
+                  const d = videoRef.current?.duration ?? 0;
+                  if (isFinite(d) && d > 0) setVideoDuration(d);
+                }}
+                onPlay={() => setIsPlaying(true)}
+                onPause={() => setIsPlaying(false)}
+                onEnded={() => setIsPlaying(false)}
+                onClick={togglePlay}
+              />
+            ) : data?.thumbnailDataUrl ? (
+              <img
+                src={data.thumbnailDataUrl}
+                alt="thumbnail"
+                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+              />
             ) : (
               <div
                 style={{
@@ -343,50 +487,87 @@ export function EditorApp() {
                     'radial-gradient(ellipse at center, rgba(139,92,246,0.15) 0%, transparent 70%)',
                 }}
               >
-                <div style={{ position: 'relative' }}>
-                  <motion.div
-                    style={{
-                      width: '56px',
-                      height: '56px',
-                      borderRadius: '50%',
-                      border: '2px solid rgba(239,68,68,0.5)',
-                      position: 'absolute',
-                      top: '-6px',
-                      left: '-6px',
-                    }}
-                    animate={{ scale: [1, 1.3, 1], opacity: [0.5, 0, 0.5] }}
-                    transition={{ duration: 2, repeat: Infinity }}
-                  />
+                <motion.div
+                  style={{
+                    width: '44px',
+                    height: '44px',
+                    borderRadius: '50%',
+                    background: 'rgba(239,68,68,0.15)',
+                    border: '2px solid rgba(239,68,68,0.6)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                  animate={{ scale: [1, 1.08, 1] }}
+                  transition={{ duration: 2, repeat: Infinity }}
+                >
                   <div
                     style={{
-                      width: '44px',
-                      height: '44px',
+                      width: '16px',
+                      height: '16px',
                       borderRadius: '50%',
-                      background: 'rgba(239,68,68,0.15)',
-                      border: '2px solid rgba(239,68,68,0.6)',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
+                      background: '#ef4444',
                     }}
-                  >
-                    <div
-                      style={{
-                        width: '16px',
-                        height: '16px',
-                        borderRadius: '50%',
-                        background: '#ef4444',
-                      }}
-                    />
-                  </div>
-                </div>
+                  />
+                </motion.div>
                 <p style={{ color: 'rgba(148,163,184,0.7)', fontSize: '13px' }}>
                   Processing recording…
                 </p>
               </div>
             )}
+
+            {/* Play overlay (when video loaded but paused) */}
+            {videoUrl && !isPlaying && (
+              <div
+                onClick={togglePlay}
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  background: 'rgba(0,0,0,0.25)',
+                }}
+              >
+                <div
+                  style={{
+                    width: '52px',
+                    height: '52px',
+                    borderRadius: '50%',
+                    background: 'rgba(139,92,246,0.9)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    boxShadow: '0 4px 20px rgba(139,92,246,0.5)',
+                  }}
+                >
+                  <Play size={22} fill="white" style={{ marginLeft: '2px' }} />
+                </div>
+              </div>
+            )}
+
+            {/* Duration badge */}
+            <div
+              style={{
+                position: 'absolute',
+                bottom: '10px',
+                right: '10px',
+                background: 'rgba(0,0,0,0.75)',
+                backdropFilter: 'blur(8px)',
+                borderRadius: '8px',
+                padding: '3px 8px',
+                fontSize: '13px',
+                fontWeight: 700,
+                color: 'white',
+                fontVariantNumeric: 'tabular-nums',
+              }}
+            >
+              {formatDur(totalDur)}
+            </div>
           </div>
 
-          {/* Timeline placeholder */}
+          {/* Playback controls bar */}
           <div
             style={{
               height: '36px',
@@ -405,10 +586,11 @@ export function EditorApp() {
                 background: 'none',
                 border: 'none',
                 color: 'rgba(148,163,184,0.8)',
-                cursor: 'pointer',
+                cursor: videoUrl ? 'pointer' : 'not-allowed',
                 display: 'flex',
                 alignItems: 'center',
                 padding: '2px',
+                opacity: videoUrl ? 1 : 0.4,
               }}
             >
               {isPlaying ? <Pause size={14} /> : <Play size={14} />}
@@ -418,36 +600,21 @@ export function EditorApp() {
                 fontSize: '12px',
                 color: 'rgba(148,163,184,0.6)',
                 fontVariantNumeric: 'tabular-nums',
+                whiteSpace: 'nowrap',
               }}
             >
-              00:00 / {formatDur(data?.duration ?? 0)}
+              {formatDur(currentTime)} / {formatDur(totalDur)}
             </span>
-            <div
-              style={{
-                flex: 1,
-                height: '3px',
-                background: 'rgba(255,255,255,0.08)',
-                borderRadius: '2px',
-                overflow: 'hidden',
-              }}
-            >
-              <div
-                style={{ height: '100%', width: '0%', background: '#8b5cf6', borderRadius: '2px' }}
-              />
-            </div>
+            {/* Seekbar */}
+            <SeekBar
+              current={videoDuration > 0 ? currentTime / videoDuration : 0}
+              onSeek={handleSeek}
+              disabled={!videoUrl}
+            />
             <button
-              style={{
-                background: 'none',
-                border: 'none',
-                color: 'rgba(148,163,184,0.6)',
-                cursor: 'pointer',
-                fontSize: '11px',
-                fontWeight: 600,
+              onClick={() => {
+                if (videoRef.current) videoRef.current.currentTime = 0;
               }}
-            >
-              1×
-            </button>
-            <button
               style={{
                 background: 'none',
                 border: 'none',
@@ -460,6 +627,7 @@ export function EditorApp() {
               <RotateCcw size={12} />
             </button>
             <button
+              onClick={() => videoRef.current?.requestFullscreen()}
               style={{
                 background: 'none',
                 border: 'none',
@@ -473,10 +641,27 @@ export function EditorApp() {
             </button>
           </div>
 
+          {/* Trim bar */}
+          <TrimBar
+            duration={totalDur}
+            trimStart={trimStart}
+            trimEnd={trimEnd}
+            playhead={videoDuration > 0 ? currentTime / videoDuration : 0}
+            onTrimChange={(start, end) => {
+              setTrimStart(start);
+              setTrimEnd(end);
+            }}
+            onSeek={handleSeek}
+          />
+
           {/* Meta badges */}
           <div style={{ display: 'flex', gap: '8px' }}>
-            <Chip>{formatDur(data?.duration ?? 0)}</Chip>
+            <Chip>{formatDur(totalDur)}</Chip>
             <Chip>{formatBytes(data?.blobSize ?? 0)}</Chip>
+            {data?.consoleLogs?.length ? <Chip>{data.consoleLogs.length} logs</Chip> : null}
+            {data?.networkCaptures?.length ? (
+              <Chip>{data.networkCaptures.length} requests</Chip>
+            ) : null}
           </div>
 
           {/* Title */}
@@ -558,28 +743,55 @@ export function EditorApp() {
               padding: '0 4px',
             }}
           >
-            {(['console', 'network', 'info', 'actions'] as LogTab[]).map((tab) => (
-              <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
-                style={{
-                  flex: 1,
-                  height: '40px',
-                  background: 'none',
-                  border: 'none',
-                  borderBottom: activeTab === tab ? '2px solid #8b5cf6' : '2px solid transparent',
-                  color: activeTab === tab ? '#a78bfa' : 'rgba(148,163,184,0.6)',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  textTransform: 'capitalize',
-                  transition: 'color 0.15s',
-                  fontFamily: 'inherit',
-                }}
-              >
-                {tab.charAt(0).toUpperCase() + tab.slice(1)}
-              </button>
-            ))}
+            {(['console', 'network', 'info', 'actions'] as LogTab[]).map((tab) => {
+              const count =
+                tab === 'console'
+                  ? (data?.consoleLogs?.length ?? 0)
+                  : tab === 'network'
+                    ? (data?.networkCaptures?.length ?? 0)
+                    : 0;
+              return (
+                <button
+                  key={tab}
+                  onClick={() => setActiveTab(tab)}
+                  style={{
+                    flex: 1,
+                    height: '40px',
+                    background: 'none',
+                    border: 'none',
+                    borderBottom: activeTab === tab ? '2px solid #8b5cf6' : '2px solid transparent',
+                    color: activeTab === tab ? '#a78bfa' : 'rgba(148,163,184,0.6)',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    textTransform: 'capitalize',
+                    transition: 'color 0.15s',
+                    fontFamily: 'inherit',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '4px',
+                  }}
+                >
+                  {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                  {count > 0 && (
+                    <span
+                      style={{
+                        fontSize: '10px',
+                        fontWeight: 700,
+                        padding: '1px 5px',
+                        borderRadius: '10px',
+                        background:
+                          activeTab === tab ? 'rgba(139,92,246,0.25)' : 'rgba(255,255,255,0.08)',
+                        color: activeTab === tab ? '#a78bfa' : 'rgba(148,163,184,0.5)',
+                      }}
+                    >
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
 
           {/* Log entries */}
@@ -607,7 +819,6 @@ export function EditorApp() {
                   )}
                 </motion.div>
               )}
-
               {activeTab === 'network' && (
                 <motion.div
                   key="network"
@@ -623,7 +834,6 @@ export function EditorApp() {
                   )}
                 </motion.div>
               )}
-
               {activeTab === 'info' && (
                 <motion.div
                   key="info"
@@ -638,16 +848,26 @@ export function EditorApp() {
                     gap: '8px',
                   }}
                 >
-                  <InfoRow label="Duration" value={formatDur(data?.duration ?? 0)} />
+                  <InfoRow label="Duration" value={formatDur(totalDur)} />
                   <InfoRow label="File size" value={formatBytes(data?.blobSize ?? 0)} />
                   <InfoRow label="Recorded at" value={new Date().toLocaleString()} />
                   <InfoRow
                     label="Status"
-                    value={isUploading ? `Uploading (${uploadPercent}%)` : 'Ready'}
+                    value={
+                      shareUrl
+                        ? 'Uploaded'
+                        : isSaving
+                          ? `Uploading (${uploadPercent}%)`
+                          : 'Ready to save'
+                    }
+                  />
+                  <InfoRow label="Console logs" value={String(data?.consoleLogs?.length ?? 0)} />
+                  <InfoRow
+                    label="Network requests"
+                    value={String(data?.networkCaptures?.length ?? 0)}
                   />
                 </motion.div>
               )}
-
               {activeTab === 'actions' && (
                 <motion.div
                   key="actions"
@@ -662,7 +882,7 @@ export function EditorApp() {
             </AnimatePresence>
           </div>
 
-          {/* Sign in to upload banner */}
+          {/* Auth banner */}
           <AnimatePresence>
             {!isAuthenticated && (
               <motion.div
@@ -722,8 +942,8 @@ export function EditorApp() {
             )}
           </AnimatePresence>
 
-          {/* Upload progress */}
-          {isAuthenticated && isUploading && (
+          {/* Upload progress bar (visible while saving) */}
+          {isSaving && (
             <div style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
               <div
                 style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}
@@ -756,43 +976,507 @@ export function EditorApp() {
             </div>
           )}
 
-          {/* Save & Copy Link CTA */}
-          <div style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-            <motion.button
-              whileTap={{ scale: 0.97 }}
-              onClick={() => void handleCopyLink()}
-              disabled={!canCopy}
+          {/* Upload error */}
+          {uploadError && (
+            <div
               style={{
-                width: '100%',
-                padding: '12px',
-                borderRadius: '12px',
-                background: canCopy
-                  ? 'linear-gradient(135deg,#8b5cf6,#7c3aed)'
-                  : 'rgba(139,92,246,0.15)',
-                border: canCopy ? 'none' : '1px solid rgba(139,92,246,0.3)',
-                color: canCopy ? 'white' : 'rgba(139,92,246,0.5)',
-                fontSize: '14px',
-                fontWeight: 700,
-                cursor: canCopy ? 'pointer' : 'not-allowed',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px',
-                boxShadow: canCopy ? '0 4px 20px rgba(139,92,246,0.3)' : 'none',
-                transition: 'all 0.2s',
-                fontFamily: 'inherit',
+                margin: '0 12px 0',
+                padding: '10px 14px',
+                borderRadius: '10px',
+                background: 'rgba(239,68,68,0.1)',
+                border: '1px solid rgba(239,68,68,0.25)',
+                fontSize: '12px',
+                color: '#f87171',
+                lineHeight: 1.4,
               }}
             >
-              {copied ? <Check size={16} /> : <Copy size={16} />}
-              {!canCopy && isUploading
-                ? `Uploading ${uploadPercent}%…`
-                : copied
-                  ? 'Copied!'
-                  : 'Save & Copy Link'}
-            </motion.button>
+              {uploadError}
+            </div>
+          )}
+
+          {/* Action button: Save → Uploading → Copy Link */}
+          <div style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+            {shareUrl ? (
+              /* ── Upload done: copy link ── */
+              <motion.button
+                whileTap={{ scale: 0.97 }}
+                onClick={() => void handleCopyLink()}
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  borderRadius: '12px',
+                  background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
+                  border: 'none',
+                  color: 'white',
+                  fontSize: '14px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  boxShadow: '0 4px 20px rgba(139,92,246,0.3)',
+                  transition: 'all 0.2s',
+                  fontFamily: 'inherit',
+                }}
+              >
+                {copied ? <Check size={16} /> : <Copy size={16} />}
+                {copied ? 'Copied!' : 'Copy Link'}
+              </motion.button>
+            ) : isSaving ? (
+              /* ── Uploading in progress ── */
+              <div
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  borderRadius: '12px',
+                  background: 'rgba(139,92,246,0.15)',
+                  border: '1px solid rgba(139,92,246,0.3)',
+                  color: 'rgba(139,92,246,0.6)',
+                  fontSize: '14px',
+                  fontWeight: 700,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                }}
+              >
+                <motion.div
+                  style={{
+                    width: '14px',
+                    height: '14px',
+                    borderRadius: '50%',
+                    border: '2px solid rgba(139,92,246,0.4)',
+                    borderTopColor: '#8b5cf6',
+                  }}
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
+                />
+                Uploading {uploadPercent}%…
+              </div>
+            ) : isAuthenticated ? (
+              /* ── Ready to save ── */
+              <motion.button
+                whileTap={{ scale: 0.97 }}
+                onClick={() => void handleSave()}
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  borderRadius: '12px',
+                  background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
+                  border: 'none',
+                  color: 'white',
+                  fontSize: '14px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  boxShadow: '0 4px 20px rgba(139,92,246,0.3)',
+                  transition: 'all 0.2s',
+                  fontFamily: 'inherit',
+                }}
+              >
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                >
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+                  <polyline points="17 21 17 13 7 13 7 21" />
+                  <polyline points="7 3 7 8 15 8" />
+                </svg>
+                Save Recording
+              </motion.button>
+            ) : (
+              /* ── Not signed in ── */
+              <div
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  borderRadius: '12px',
+                  background: 'rgba(139,92,246,0.08)',
+                  border: '1px solid rgba(139,92,246,0.2)',
+                  color: 'rgba(139,92,246,0.4)',
+                  fontSize: '14px',
+                  fontWeight: 700,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  cursor: 'not-allowed',
+                }}
+              >
+                <Lock size={14} /> Sign in to Save
+              </div>
+            )}
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── SeekBar ──────────────────────────────────────────────────────────────────
+
+function SeekBar({
+  current,
+  onSeek,
+  disabled,
+}: {
+  current: number;
+  onSeek: (f: number) => void;
+  disabled: boolean;
+}) {
+  const barRef = useRef<HTMLDivElement>(null);
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (disabled || !barRef.current) return;
+    const rect = barRef.current.getBoundingClientRect();
+    const f = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    onSeek(f);
+  };
+  return (
+    <div
+      ref={barRef}
+      onClick={handleClick}
+      style={{
+        flex: 1,
+        height: '4px',
+        background: 'rgba(255,255,255,0.1)',
+        borderRadius: '2px',
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        position: 'relative',
+        opacity: disabled ? 0.4 : 1,
+      }}
+    >
+      <div
+        style={{
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          height: '100%',
+          width: `${current * 100}%`,
+          background: '#8b5cf6',
+          borderRadius: '2px',
+          transition: 'width 0.1s linear',
+        }}
+      />
+      {!disabled && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '50%',
+            left: `${current * 100}%`,
+            transform: 'translate(-50%, -50%)',
+            width: '10px',
+            height: '10px',
+            borderRadius: '50%',
+            background: '#8b5cf6',
+            boxShadow: '0 0 0 2px rgba(139,92,246,0.4)',
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── TrimBar ──────────────────────────────────────────────────────────────────
+
+function TrimBar({
+  duration,
+  trimStart,
+  trimEnd,
+  playhead,
+  onTrimChange,
+  onSeek,
+}: {
+  duration: number;
+  trimStart: number;
+  trimEnd: number;
+  playhead: number;
+  onTrimChange: (start: number, end: number) => void;
+  onSeek: (fraction: number) => void;
+}) {
+  const barRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef<'start' | 'end' | 'seek' | null>(null);
+
+  const clamp = (v: number) => Math.max(0, Math.min(1, v));
+
+  const getFraction = (clientX: number) => {
+    if (!barRef.current) return 0;
+    const rect = barRef.current.getBoundingClientRect();
+    return clamp((clientX - rect.left) / rect.width);
+  };
+
+  const onMouseDown = (handle: 'start' | 'end' | 'seek') => (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragging.current = handle;
+  };
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!dragging.current) return;
+      const f = getFraction(e.clientX);
+      if (dragging.current === 'start') {
+        onTrimChange(Math.min(f, trimEnd - 0.02), trimEnd);
+      } else if (dragging.current === 'end') {
+        onTrimChange(trimStart, Math.max(f, trimStart + 0.02));
+      } else if (dragging.current === 'seek') {
+        onSeek(f);
+      }
+    };
+    const onUp = () => {
+      dragging.current = null;
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [trimStart, trimEnd, onTrimChange, onSeek]);
+
+  const formatMs = (frac: number) => formatDur(frac * duration);
+
+  return (
+    <div
+      style={{
+        background: '#0d0d14',
+        borderRadius: '12px',
+        border: '1px solid rgba(255,255,255,0.07)',
+        padding: '12px 14px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '10px',
+      }}
+    >
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <Scissors size={12} style={{ color: '#a78bfa' }} />
+          <span
+            style={{
+              fontSize: '11px',
+              fontWeight: 700,
+              color: 'rgba(148,163,184,0.7)',
+              letterSpacing: '0.6px',
+            }}
+          >
+            TRIM
+          </span>
+        </div>
+        <div style={{ display: 'flex', gap: '12px' }}>
+          <span
+            style={{
+              fontSize: '11px',
+              color: 'rgba(148,163,184,0.5)',
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {formatMs(trimStart)} – {formatMs(trimEnd)}
+          </span>
+          <span
+            style={{
+              fontSize: '11px',
+              color: '#a78bfa',
+              fontWeight: 600,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {formatMs(trimEnd - trimStart)} selected
+          </span>
+        </div>
+      </div>
+
+      {/* Track */}
+      <div
+        ref={barRef}
+        onMouseDown={onMouseDown('seek')}
+        style={{
+          position: 'relative',
+          height: '32px',
+          borderRadius: '6px',
+          background: 'rgba(255,255,255,0.05)',
+          cursor: 'crosshair',
+          userSelect: 'none',
+        }}
+      >
+        {/* Full timeline ticks */}
+        {[0.25, 0.5, 0.75].map((f) => (
+          <div
+            key={f}
+            style={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              left: `${f * 100}%`,
+              width: '1px',
+              background: 'rgba(255,255,255,0.06)',
+            }}
+          />
+        ))}
+
+        {/* Dimmed regions outside trim */}
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            left: 0,
+            width: `${trimStart * 100}%`,
+            background: 'rgba(0,0,0,0.5)',
+            borderRadius: '6px 0 0 6px',
+          }}
+        />
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            right: 0,
+            width: `${(1 - trimEnd) * 100}%`,
+            background: 'rgba(0,0,0,0.5)',
+            borderRadius: '0 6px 6px 0',
+          }}
+        />
+
+        {/* Active region */}
+        <div
+          style={{
+            position: 'absolute',
+            top: '4px',
+            bottom: '4px',
+            left: `${trimStart * 100}%`,
+            width: `${(trimEnd - trimStart) * 100}%`,
+            background: 'rgba(139,92,246,0.2)',
+            border: '1px solid rgba(139,92,246,0.5)',
+            borderRadius: '3px',
+          }}
+        />
+
+        {/* Start handle */}
+        <div
+          onMouseDown={(e) => {
+            e.stopPropagation();
+            onMouseDown('start')(e);
+          }}
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            left: `${trimStart * 100}%`,
+            width: '10px',
+            transform: 'translateX(-50%)',
+            cursor: 'ew-resize',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 2,
+          }}
+        >
+          <div
+            style={{
+              width: '6px',
+              height: '28px',
+              background: '#8b5cf6',
+              borderRadius: '3px',
+              boxShadow: '0 0 0 2px rgba(139,92,246,0.4)',
+            }}
+          />
+        </div>
+
+        {/* End handle */}
+        <div
+          onMouseDown={(e) => {
+            e.stopPropagation();
+            onMouseDown('end')(e);
+          }}
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            left: `${trimEnd * 100}%`,
+            width: '10px',
+            transform: 'translateX(-50%)',
+            cursor: 'ew-resize',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 2,
+          }}
+        >
+          <div
+            style={{
+              width: '6px',
+              height: '28px',
+              background: '#8b5cf6',
+              borderRadius: '3px',
+              boxShadow: '0 0 0 2px rgba(139,92,246,0.4)',
+            }}
+          />
+        </div>
+
+        {/* Playhead */}
+        <div
+          style={{
+            position: 'absolute',
+            top: '-4px',
+            bottom: '-4px',
+            left: `${playhead * 100}%`,
+            width: '2px',
+            background: '#ef4444',
+            borderRadius: '1px',
+            pointerEvents: 'none',
+            zIndex: 3,
+          }}
+        >
+          <div
+            style={{
+              position: 'absolute',
+              top: '4px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              width: '8px',
+              height: '8px',
+              background: '#ef4444',
+              borderRadius: '50%',
+            }}
+          />
+        </div>
+
+        {/* Time labels */}
+        <div
+          style={{
+            position: 'absolute',
+            bottom: '-18px',
+            left: 0,
+            right: 0,
+            display: 'flex',
+            justifyContent: 'space-between',
+            pointerEvents: 'none',
+          }}
+        >
+          {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+            <span
+              key={f}
+              style={{
+                fontSize: '9px',
+                color: 'rgba(148,163,184,0.35)',
+                fontVariantNumeric: 'tabular-nums',
+              }}
+            >
+              {formatMs(f)}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* Spacer for time labels */}
+      <div style={{ height: '8px' }} />
     </div>
   );
 }
@@ -840,10 +1524,11 @@ const LEVEL_STYLES: Record<string, { bg: string; color: string; label: string }>
   info: { bg: 'rgba(59,130,246,0.15)', color: '#60a5fa', label: 'INFO' },
   warn: { bg: 'rgba(245,158,11,0.15)', color: '#fbbf24', label: 'WARN' },
   error: { bg: 'rgba(239,68,68,0.15)', color: '#f87171', label: 'ERROR' },
+  debug: { bg: 'rgba(148,163,184,0.12)', color: 'rgba(148,163,184,0.7)', label: 'DBG' },
 };
 
 function LogRow({ time, level, message }: { time: string; level: string; message: string }) {
-  const style = LEVEL_STYLES[level] ?? LEVEL_STYLES.log;
+  const style = LEVEL_STYLES[level] ?? LEVEL_STYLES.log!;
   return (
     <div
       style={{
@@ -894,18 +1579,19 @@ function LogRow({ time, level, message }: { time: string; level: string; message
 }
 
 function NetworkRow({ req }: { req: NetworkCapture }) {
-  const statusColor =
-    req.status >= 500
+  const isFailed = req.failed || req.status === 0;
+  const statusColor = isFailed
+    ? '#f87171'
+    : req.status >= 500
       ? '#f87171'
       : req.status >= 400
         ? '#fbbf24'
         : req.status >= 200
           ? '#4ade80'
           : 'rgba(148,163,184,0.6)';
-
-  const shortUrl =
-    req.url.replace(/^https?:\/\/[^/]+/, '').slice(0, 40) + (req.url.length > 60 ? '…' : '');
-
+  const path = req.url.replace(/^https?:\/\/[^/]+/, '') || req.url;
+  const shortUrl = path.length > 45 ? path.slice(0, 45) + '…' : path;
+  const statusLabel = isFailed && req.status === 0 ? 'ERR' : req.status || '—';
   return (
     <div
       style={{
@@ -915,6 +1601,7 @@ function NetworkRow({ req }: { req: NetworkCapture }) {
         fontSize: '12px',
         borderBottom: '1px solid rgba(255,255,255,0.04)',
         alignItems: 'center',
+        background: isFailed ? 'rgba(239,68,68,0.04)' : 'transparent',
       }}
     >
       <span
@@ -939,8 +1626,8 @@ function NetworkRow({ req }: { req: NetworkCapture }) {
       >
         {req.method}
       </span>
-      <span style={{ color: statusColor, fontWeight: 700, flexShrink: 0 }}>
-        {req.status || '—'}
+      <span style={{ color: statusColor, fontWeight: 700, flexShrink: 0, minWidth: '28px' }}>
+        {statusLabel}
       </span>
       <span
         style={{
@@ -950,10 +1637,18 @@ function NetworkRow({ req }: { req: NetworkCapture }) {
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
         }}
+        title={req.url}
       >
         {shortUrl}
       </span>
-      <span style={{ color: 'rgba(148,163,184,0.4)', flexShrink: 0 }}>{req.duration}ms</span>
+      {req.mimeType && (
+        <span style={{ color: 'rgba(148,163,184,0.35)', flexShrink: 0, fontSize: '10px' }}>
+          {req.mimeType.split(';')[0]}
+        </span>
+      )}
+      <span style={{ color: 'rgba(148,163,184,0.4)', flexShrink: 0 }}>
+        {req.duration > 0 ? `${req.duration}ms` : '—'}
+      </span>
     </div>
   );
 }
@@ -961,8 +1656,8 @@ function NetworkRow({ req }: { req: NetworkCapture }) {
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-      <span style={{ fontSize: '12px', color: 'rgba(148,163,184,0.6)' }}>{label}</span>
-      <span style={{ fontSize: '12px', fontWeight: 600, color: 'rgba(203,213,225,0.9)' }}>
+      <span style={{ fontSize: '12px', color: 'rgba(148,163,184,0.5)' }}>{label}</span>
+      <span style={{ fontSize: '12px', color: 'rgba(203,213,225,0.85)', fontWeight: 600 }}>
         {value}
       </span>
     </div>
@@ -974,23 +1669,17 @@ function EmptyLogs({ label }: { label: string }) {
     <div
       style={{
         display: 'flex',
+        flexDirection: 'column',
         alignItems: 'center',
         justifyContent: 'center',
-        padding: '40px 16px',
-        color: 'rgba(148,163,184,0.4)',
-        fontSize: '12px',
+        padding: '40px 20px',
+        gap: '8px',
       }}
     >
-      {label}
+      <span style={{ fontSize: '28px', opacity: 0.3 }}>—</span>
+      <span style={{ fontSize: '12px', color: 'rgba(148,163,184,0.4)', textAlign: 'center' }}>
+        {label}
+      </span>
     </div>
   );
-}
-
-interface NetworkCapture {
-  url: string;
-  method: string;
-  status: number;
-  duration: number;
-  timestamp: number;
-  size: number;
 }

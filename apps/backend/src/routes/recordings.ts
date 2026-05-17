@@ -7,11 +7,10 @@ import {
   createRecordingSchema,
   updateRecordingSchema,
   recordingQuerySchema,
-  recordingIdSchema,
-  shareIdSchema,
 } from '../schemas/recording.schema';
-import { queueAnalyticsEvent } from '../queues';
+import { queueAnalyticsEvent, videoProcessingQueue, queueVideoProcessing } from '../queues';
 import { generateVisitorId } from '../utils/crypto';
+import { prisma } from '../lib/prisma';
 
 const router = Router();
 
@@ -61,39 +60,49 @@ router.post(
 );
 
 // ============================================================
-// GET /recordings/public/:shareId — Get public recording
+// Shared handler for public recording by shareId
+// Used by both /public/:shareId (legacy) and /share/:shareId (dashboard)
 // ============================================================
-router.get(
-  '/public/:shareId',
-  optionalAuth,
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const { shareId } = req.params;
-      const recording = await recordingService.getPublicRecording(shareId!);
+async function servePublicRecording(
+  shareId: string,
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const recording = await recordingService.getPublicRecording(shareId);
 
-      // Track analytics event (fire and forget)
-      const visitorId = generateVisitorId(
-        req.ip ?? 'unknown',
-        req.get('User-Agent') ?? 'unknown',
-        shareId!,
-      );
+    const visitorId = generateVisitorId(
+      req.ip ?? 'unknown',
+      req.get('User-Agent') ?? 'unknown',
+      shareId,
+    );
 
-      queueAnalyticsEvent({
-        event: 'view',
-        recordingId: recording.id,
-        userId: req.user?.id,
-        visitorId,
-        ip: req.ip,
-        userAgent: req.get('User-Agent'),
-        referer: req.get('Referer'),
-      }).catch((err) => console.error('Failed to queue analytics:', err));
+    queueAnalyticsEvent({
+      event: 'view',
+      recordingId: recording.id,
+      userId: req.user?.id,
+      visitorId,
+      ip: req.ip,
+      userAgent: req.get('User-Agent'),
+      referer: req.get('Referer'),
+    }).catch((err) => console.error('Failed to queue analytics:', err));
 
-      res.json({ success: true, data: recording });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
+    res.json({ success: true, data: recording });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// GET /recordings/share/:shareId — used by dashboard
+router.get('/share/:shareId', optionalAuth, (req, res, next) => {
+  void servePublicRecording(req.params['shareId']!, req, res, next);
+});
+
+// GET /recordings/public/:shareId — legacy / direct API access
+router.get('/public/:shareId', optionalAuth, (req, res, next) => {
+  void servePublicRecording(req.params['shareId']!, req, res, next);
+});
 
 // ============================================================
 // GET /recordings/:id — Get a single recording
@@ -184,6 +193,69 @@ router.get(
         req.user!.id,
       );
       res.json({ success: true, data: analytics });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// ============================================================
+// POST /recordings/:id/reprocess — Re-queue a stuck recording
+// ============================================================
+router.post(
+  '/:id/reprocess',
+  requireAuth,
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const recordingId = req.params['id']!;
+      const userId = (req.user as { id: string }).id;
+
+      const recording = await prisma.recording.findUnique({
+        where: { id: recordingId },
+        select: { id: true, userId: true, status: true, mimeType: true },
+      });
+
+      if (!recording) {
+        res.status(404).json({ success: false, message: 'Recording not found' });
+        return;
+      }
+      if (recording.userId !== userId) {
+        res.status(403).json({ success: false, message: 'Forbidden' });
+        return;
+      }
+      if (!['PROCESSING', 'FAILED'].includes(recording.status)) {
+        res.status(400).json({
+          success: false,
+          message: `Cannot reprocess a recording in ${recording.status} state`,
+        });
+        return;
+      }
+
+      const totalChunks = await prisma.uploadChunk.count({ where: { recordingId } });
+
+      // Try to retry the existing failed job; fall back to adding a fresh one
+      const existingJob = await videoProcessingQueue.getJob(`video-${recordingId}`);
+      if (existingJob) {
+        const state = await existingJob.getState();
+        if (state === 'failed') {
+          await existingJob.retry();
+        }
+      } else {
+        await queueVideoProcessing({
+          recordingId,
+          userId,
+          mimeType: recording.mimeType ?? 'video/webm',
+          totalChunks,
+        });
+      }
+
+      // Ensure DB status is PROCESSING
+      await prisma.recording.update({
+        where: { id: recordingId },
+        data: { status: 'PROCESSING' },
+      });
+
+      res.json({ success: true, message: 'Reprocessing started' });
     } catch (error) {
       next(error);
     }

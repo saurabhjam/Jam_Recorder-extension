@@ -81,7 +81,7 @@ async function enqueueNotification(
 
 /** Process a single video job */
 async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> {
-  const { recordingId, userId, mimeType, totalChunks } = job.data;
+  const { recordingId, userId, mimeType: _mimeType, totalChunks } = job.data;
   const log = createChildLogger({ recordingId, userId, jobId: job.id });
   const workDir = path.join(TEMP_DIR, `rec_${recordingId}_${Date.now()}`);
 
@@ -128,7 +128,50 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
       log.debug(`Downloaded chunk ${i + 1}/${chunks.length}`);
     }
 
-    // ── 5. Merge chunks ────────────────────────────────────────────────
+    // ── 5. Check ffmpeg and fall back to direct concat if unavailable ──
+    const ffmpegAvailable = await checkFfmpegAvailable();
+
+    if (!ffmpegAvailable) {
+      log.warn('FFmpeg not available — concatenating chunks directly (no re-encode)');
+
+      const fallbackPath = path.join(workDir, 'recording.webm');
+      const parts = await Promise.all(chunkPaths.map((p) => fs.readFile(p)));
+      await fs.writeFile(fallbackPath, Buffer.concat(parts));
+      await job.updateProgress(60);
+
+      log.info('Uploading concatenated recording to Cloudinary...');
+      const uploadResult = await uploadFile(fallbackPath, {
+        folder: `jam-recordings/${userId}`,
+        publicId: `rec_${recordingId}`,
+        resourceType: 'video',
+        tags: ['recording', `user_${userId}`],
+        metadata: { recordingId, userId },
+      });
+
+      await job.updateProgress(95);
+      log.info('Upload complete (no-ffmpeg fallback)', { url: uploadResult.secureUrl });
+
+      await updateRecordingStatus(recordingId, 'READY', {
+        url: uploadResult.secureUrl,
+        size: BigInt(uploadResult.size),
+        duration: uploadResult.duration ?? null,
+        mimeType: 'video/webm',
+      });
+
+      await enqueueNotification(
+        userId,
+        'RECORDING_READY',
+        'Recording ready',
+        'Your recording is ready to share.',
+        { recordingId },
+      );
+
+      await job.updateProgress(100);
+      log.info('Video processing complete (no-ffmpeg fallback)');
+      return;
+    }
+
+    // ── 6. Merge chunks ────────────────────────────────────────────────
     log.info('Merging video chunks...');
     const mergedPath = path.join(workDir, 'merged.webm');
 

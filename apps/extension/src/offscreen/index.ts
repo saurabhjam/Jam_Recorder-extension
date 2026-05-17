@@ -254,6 +254,7 @@ function resumeRecording(): void {
 }
 
 async function stopRecording(metadata: {
+  recordingId: string;
   title: string;
   type: string;
   duration: number;
@@ -283,19 +284,25 @@ async function stopRecording(metadata: {
 
   // Generate thumbnail and open the panel immediately so the user sees something
   const thumbnailDataUrl = await generateThumbnail(finalBlob);
-  lastThumbnailDataUrl = thumbnailDataUrl; // keep for offline queue retry
+  lastThumbnailDataUrl = thumbnailDataUrl;
+
+  // Save blob to IDB so the editor window can load it for playback
+  try {
+    await saveBlobToIDB(metadata.recordingId, finalBlob);
+  } catch (err) {
+    console.warn('[Offscreen] Could not save blob to IDB:', err);
+  }
+
   sendToBackground('OFFSCREEN_RECORDING_READY', {
+    recordingId: metadata.recordingId,
+    title: metadata.title,
     thumbnailDataUrl,
     duration: metadata.duration,
     blobSize: finalBlob.size,
-    shareUrl: null, // shareUrl will follow once the recording row is created
+    shareUrl: null,
+    recordingType: metadata.type,
   });
-
-  await uploadBlob(finalBlob, {
-    ...metadata,
-    type: metadata.type as RecordingOptions['type'],
-    mimeType,
-  });
+  // Upload is now triggered explicitly by the editor — offscreen is done here.
 }
 
 async function generateThumbnail(blob: Blob): Promise<string | null> {
@@ -410,6 +417,34 @@ async function takeScreenshot(streamId: string): Promise<void> {
 // ─── Upload (runs entirely in offscreen — no blob transfer needed) ─────────────
 
 const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
+
+// ─── IndexedDB Blob Storage ────────────────────────────────────────────────────
+// Stores the raw recording blob so the editor window can load it for playback.
+// All extension pages share the same IDB origin.
+
+const IDB_NAME = 'snaptrace-blobs';
+const IDB_STORE = 'recordings';
+
+function openRecordingIDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveBlobToIDB(id: string, blob: Blob): Promise<void> {
+  const db = await openRecordingIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(blob, id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
 
 interface UploadMetadata {
   title: string;
@@ -734,6 +769,7 @@ chrome.runtime.onMessage.addListener((message: OffscreenIncomingMessage, _sender
 
     case 'OFFSCREEN_STOP_RECORDING': {
       const meta = message.payload as {
+        recordingId: string;
         title: string;
         type: string;
         duration: number;

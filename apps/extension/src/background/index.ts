@@ -16,7 +16,13 @@
  */
 
 import { authManager } from './auth.manager';
-import type { ExtensionMessage, RecordingOptions } from '@/types';
+import type {
+  ExtensionMessage,
+  RecordingOptions,
+  CaptureConsoleLog,
+  CaptureNetworkEntry,
+  CaptureData,
+} from '@/types';
 import { STORAGE_KEYS } from '@/types';
 import { generateId } from '@/utils';
 
@@ -81,47 +87,185 @@ function sendToOffscreen(type: string, payload?: unknown): Promise<unknown> {
 
 let currentRecordingId: string | null = null;
 let currentRecordingOptions: RecordingOptions | null = null;
+let currentRecordingTabId: number | null = null;
 let elapsedSeconds = 0;
 let timerInterval: ReturnType<typeof setInterval> | null = null;
 let isRecordingActive = false;
 let isPaused = false;
 
-interface PreviewState {
-  thumbnailDataUrl: string | null;
-  duration: number;
-  blobSize: number;
-  shareUrl: string | null;
-}
-let pendingPreview: PreviewState | null = null;
+// ─── State Restore (after SW termination) ────────────────────────────────────
 
-async function pushPreviewToTab(payload: {
-  thumbnailDataUrl: string | null;
-  duration: number;
-  blobSize: number;
-  shareUrl: string | null;
-  uploadProgress: number;
-  errorMessage?: string | null;
-}): Promise<void> {
+async function restoreStateFromStorage(): Promise<void> {
+  if (isRecordingActive) return;
+  const stored = await chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]);
+  const state = stored[STORAGE_KEYS.RECORDING_STATE] as
+    | {
+        isRecording: boolean;
+        recordingId: string;
+        options: RecordingOptions;
+        startedAt: number;
+        tabId?: number;
+      }
+    | undefined;
+  if (!state?.isRecording) return;
+  isRecordingActive = true;
+  currentRecordingId = state.recordingId;
+  currentRecordingOptions = state.options;
+  currentRecordingTabId = state.tabId ?? null;
+  elapsedSeconds = Math.floor((Date.now() - state.startedAt) / 1000);
+  if (!timerInterval) startTimer();
+}
+
+// ─── CDP Capture State ────────────────────────────────────────────────────────
+
+let cdpTabId: number | null = null;
+let cdpConsoleLogs: CaptureConsoleLog[] = [];
+// requestId → partial entry (finalised on loadingFinished/loadingFailed)
+const cdpNetworkMap = new Map<string, Partial<CaptureNetworkEntry> & { startedAt: number }>();
+let cdpNetworkEntries: CaptureNetworkEntry[] = [];
+// Holds merged capture data between stopRecording and OFFSCREEN_RECORDING_READY
+let pendingCaptureData: CaptureData | null = null;
+
+async function attachDebugger(tabId: number): Promise<void> {
+  cdpTabId = tabId;
+  cdpConsoleLogs = [];
+  cdpNetworkMap.clear();
+  cdpNetworkEntries = [];
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      await chrome.tabs
-        .sendMessage(tab.id, {
-          type: 'SHOW_PREVIEW',
-          payload,
-        })
-        .catch(() => {
-          // Content script not injected yet — inject then retry
-          // chrome.scripting
-          //   .executeScript({ target: { tabId: tab.id! }, files: ['src/content/index.js'] })
-          //   .then(() => chrome.tabs.sendMessage(tab.id!, { type: 'SHOW_PREVIEW', payload }))
-          //   .catch(() => { });
-        });
-    }
-  } catch {
-    /* ignore */
+    await chrome.debugger.attach({ tabId }, '1.3');
+    await Promise.all([
+      chrome.debugger.sendCommand({ tabId }, 'Network.enable', {}),
+      chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {}),
+      chrome.debugger.sendCommand({ tabId }, 'Log.enable', {}),
+    ]);
+  } catch (err) {
+    console.warn('[Background] CDP attach failed (non-fatal):', err);
+    cdpTabId = null; // fall back to content-script capture only
   }
 }
+
+async function detachDebugger(): Promise<void> {
+  if (cdpTabId === null) return;
+  const tabId = cdpTabId;
+  cdpTabId = null;
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {
+    // Already detached (e.g. tab closed)
+  }
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (source.tabId !== cdpTabId) return;
+  const p = params as Record<string, unknown>;
+
+  switch (method) {
+    case 'Network.requestWillBeSent': {
+      const req = p['request'] as { url: string; method: string } | undefined;
+      const init = p['initiator'] as { type?: string } | undefined;
+      if (!req) break;
+      cdpNetworkMap.set(p['requestId'] as string, {
+        id: p['requestId'] as string,
+        url: req.url,
+        method: req.method.toUpperCase(),
+        status: 0,
+        statusText: '',
+        duration: 0,
+        timestamp: Date.now(),
+        startedAt: Date.now(),
+        size: 0,
+        initiator: init?.type,
+        source: 'cdp',
+      });
+      break;
+    }
+
+    case 'Network.responseReceived': {
+      const res = p['response'] as
+        | { status: number; statusText: string; mimeType: string }
+        | undefined;
+      const entry = cdpNetworkMap.get(p['requestId'] as string);
+      if (entry && res) {
+        entry.status = res.status;
+        entry.statusText = res.statusText;
+        entry.mimeType = res.mimeType;
+      }
+      break;
+    }
+
+    case 'Network.loadingFinished': {
+      const entry = cdpNetworkMap.get(p['requestId'] as string);
+      if (entry) {
+        entry.size = (p['encodedDataLength'] as number | undefined) ?? 0;
+        entry.duration = Date.now() - entry.startedAt;
+        cdpNetworkEntries.push(entry as CaptureNetworkEntry);
+        cdpNetworkMap.delete(p['requestId'] as string);
+      }
+      break;
+    }
+
+    case 'Network.loadingFailed': {
+      const entry = cdpNetworkMap.get(p['requestId'] as string);
+      if (entry) {
+        entry.failed = true;
+        entry.errorText = (p['errorText'] as string | undefined) ?? 'Network error';
+        entry.duration = Date.now() - entry.startedAt;
+        cdpNetworkEntries.push(entry as CaptureNetworkEntry);
+        cdpNetworkMap.delete(p['requestId'] as string);
+      }
+      break;
+    }
+
+    case 'Runtime.consoleAPICalled': {
+      const args =
+        (p['args'] as Array<{ value?: unknown; description?: string }> | undefined) ?? [];
+      const message = args
+        .map((a) => {
+          const v = a.value ?? a.description ?? '';
+          return typeof v === 'object' ? JSON.stringify(v) : String(v);
+        })
+        .join(' ');
+      cdpConsoleLogs.push({
+        level: ((p['type'] as string | undefined) ?? 'log') as CaptureConsoleLog['level'],
+        message,
+        timestamp: Date.now(),
+        url: '',
+        source: 'cdp',
+      });
+      break;
+    }
+
+    case 'Runtime.exceptionThrown': {
+      const details = p['exceptionDetails'] as
+        | { text: string; url?: string; exception?: { description?: string } }
+        | undefined;
+      if (details) {
+        cdpConsoleLogs.push({
+          level: 'error',
+          message: details.exception?.description ?? details.text,
+          timestamp: Date.now(),
+          url: details.url ?? '',
+          source: 'cdp',
+        });
+      }
+      break;
+    }
+
+    case 'Log.entryAdded': {
+      const entry = p['entry'] as { level: string; text: string; url?: string } | undefined;
+      if (entry) {
+        cdpConsoleLogs.push({
+          level: (entry.level as CaptureConsoleLog['level']) ?? 'log',
+          message: entry.text,
+          timestamp: Date.now(),
+          url: entry.url ?? '',
+          source: 'cdp',
+        });
+      }
+      break;
+    }
+  }
+});
 
 // ─── Badge ────────────────────────────────────────────────────────────────────
 
@@ -165,9 +309,13 @@ function broadcastToAll(message: ExtensionMessage): void {
 
 // ─── Floating Toolbar ─────────────────────────────────────────────────────────
 
-async function injectFloatingToolbar(): Promise<void> {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) return;
+async function injectFloatingToolbar(targetTabId?: number): Promise<void> {
+  let tabId = targetTabId;
+  if (!tabId) {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tab?.id;
+  }
+  if (!tabId) return;
 
   const showMsg = {
     type: 'SHOW_TOOLBAR' as const,
@@ -176,7 +324,7 @@ async function injectFloatingToolbar(): Promise<void> {
 
   // Try messaging first (content script already running)
   try {
-    await chrome.tabs.sendMessage(tab.id, showMsg);
+    await chrome.tabs.sendMessage(tabId, showMsg);
     return;
   } catch {
     // Content script not ready — inject it programmatically then retry
@@ -184,25 +332,46 @@ async function injectFloatingToolbar(): Promise<void> {
 
   try {
     await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId },
       files: ['src/content/index.js'],
     });
-    // Give the script a moment to initialise its message listener
-    await new Promise<void>((r) => setTimeout(r, 250));
-    await chrome.tabs.sendMessage(tab.id, showMsg);
+    await new Promise<void>((r) => setTimeout(r, 150));
+    await chrome.tabs.sendMessage(tabId, showMsg);
   } catch (err) {
-    console.error('[Background] Could not inject toolbar:', err);
+    console.error('[Background] Could not inject toolbar into tab', tabId, err);
   }
 }
 
+// Re-inject toolbar after navigation (page reload, SPA route change, etc.)
+async function reinjectToolbarIntoTab(tabId: number): Promise<void> {
+  if (!isRecordingActive) {
+    await restoreStateFromStorage();
+    if (!isRecordingActive) return;
+  }
+  // For tab/webcam: only the recording tab gets the toolbar.
+  // For screen: any tab the user navigates in gets it (screen capture is global).
+  if (
+    currentRecordingOptions?.type !== 'screen' &&
+    currentRecordingTabId !== null &&
+    currentRecordingTabId !== tabId
+  )
+    return;
+  await injectFloatingToolbar(tabId);
+}
+
 async function hideFloatingToolbar(): Promise<void> {
+  const tabId = currentRecordingTabId;
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      await chrome.tabs.sendMessage(tab.id, { type: 'HIDE_TOOLBAR' } satisfies ExtensionMessage);
+    if (tabId) {
+      await chrome.tabs.sendMessage(tabId, { type: 'HIDE_TOOLBAR' } satisfies ExtensionMessage);
+    } else {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        await chrome.tabs.sendMessage(tab.id, { type: 'HIDE_TOOLBAR' } satisfies ExtensionMessage);
+      }
     }
   } catch {
-    /* ignore */
+    /* ignore — tab may already be closed */
   }
 }
 
@@ -279,9 +448,16 @@ async function handleStartRecording(
     isRecordingActive = true;
     isPaused = false;
 
+    // Determine the active tab so we can attach CDP and show the toolbar
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    currentRecordingTabId = activeTab?.id ?? null;
+
     setBadge('REC', '#ef4444');
     await injectFloatingToolbar();
     startTimer();
+
+    // Attach Chrome Debugger to capture network + console (best-effort)
+    if (currentRecordingTabId) void attachDebugger(currentRecordingTabId);
 
     await chrome.storage.local.set({
       [STORAGE_KEYS.RECORDING_STATE]: {
@@ -289,6 +465,7 @@ async function handleStartRecording(
         recordingId: currentRecordingId,
         startedAt: Date.now(),
         options,
+        tabId: currentRecordingTabId,
       },
     });
 
@@ -329,6 +506,40 @@ async function handleStopRecording(
     currentRecordingOptions = state.options;
   }
 
+  // ── Flush content-script captures before hiding toolbar ──────────────────
+  const flushTabId = currentRecordingTabId ?? cdpTabId;
+  let contentCaptures: CaptureData = { consoleLogs: [], networkCaptures: [] };
+  if (flushTabId) {
+    try {
+      const flushed = (await chrome.tabs.sendMessage(flushTabId, { type: 'CAPTURE_FLUSH' })) as
+        | { consoleLogs: CaptureConsoleLog[]; networkCaptures: CaptureNetworkEntry[] }
+        | undefined;
+      if (flushed) {
+        contentCaptures = {
+          consoleLogs: flushed.consoleLogs,
+          networkCaptures: flushed.networkCaptures,
+        };
+      }
+    } catch {
+      // Content script may be unresponsive; proceed with CDP data only
+    }
+  }
+
+  // ── Detach CDP debugger and merge all capture data ────────────────────────
+  await detachDebugger();
+
+  // CDP is the authoritative source. Fall back to content-script only if CDP captured nothing.
+  pendingCaptureData = {
+    consoleLogs:
+      cdpConsoleLogs.length > 0
+        ? [...cdpConsoleLogs].sort((a, b) => a.timestamp - b.timestamp)
+        : [...contentCaptures.consoleLogs].sort((a, b) => a.timestamp - b.timestamp),
+    networkCaptures:
+      cdpNetworkEntries.length > 0
+        ? [...cdpNetworkEntries].sort((a, b) => a.timestamp - b.timestamp)
+        : [...contentCaptures.networkCaptures].sort((a, b) => a.timestamp - b.timestamp),
+  };
+
   stopTimer();
   clearBadge();
   await hideFloatingToolbar();
@@ -360,6 +571,7 @@ async function handleStopRecording(
 
   currentRecordingId = null;
   currentRecordingOptions = null;
+  currentRecordingTabId = null;
   elapsedSeconds = 0;
 
   // Instruct offscreen to finalize blob into IndexedDB then upload
@@ -481,13 +693,16 @@ chrome.runtime.onMessage.addListener(
       }
 
       case 'GET_STATE': {
-        sendResponse({
-          isRecording: isRecordingActive,
-          isPaused,
-          elapsedSeconds,
-          recordingId: currentRecordingId,
-        });
-        return false;
+        void (async () => {
+          if (!isRecordingActive) await restoreStateFromStorage();
+          sendResponse({
+            isRecording: isRecordingActive,
+            isPaused,
+            elapsedSeconds,
+            recordingId: currentRecordingId,
+          });
+        })();
+        return true;
       }
 
       case 'TOKEN_REFRESHED': {
@@ -529,6 +744,7 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         shareUrl,
         recordingId: readyRecordingId,
         title: readyTitle,
+        recordingType: readyRecordingType,
       } = message.payload as {
         thumbnailDataUrl: string | null;
         duration: number;
@@ -536,61 +752,45 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         shareUrl: string | null;
         recordingId?: string;
         title?: string;
+        recordingType?: string;
       };
 
-      // Preserve thumbnail from the first call when second call brings shareUrl
-      pendingPreview = {
-        thumbnailDataUrl: thumbnailDataUrl ?? pendingPreview?.thumbnailDataUrl ?? null,
-        duration,
-        blobSize,
-        shareUrl,
-      };
+      const editorRecordingId = readyRecordingId ?? 'unknown';
 
-      // Persist editor metadata so the editor window can read it
-      const editorRecordingId = readyRecordingId ?? currentRecordingId ?? 'unknown';
-      void chrome.storage.local.set({
-        [STORAGE_KEYS.EDITOR_DATA]: {
-          recordingId: editorRecordingId,
-          thumbnailDataUrl: pendingPreview.thumbnailDataUrl,
-          duration,
-          blobSize,
-          title: readyTitle ?? `Recording ${new Date().toLocaleString()}`,
-          consoleLogs: [],
-          networkCaptures: [],
-        },
-      });
-
-      // Open the editor as a popup window (only on the first READY call, before shareUrl)
-      if (!shareUrl) {
-        void chrome.windows.create({
-          url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),
-          type: 'popup',
-          width: 960,
-          height: 680,
-          focused: true,
-        });
-      }
-
-      void pushPreviewToTab({
-        thumbnailDataUrl: pendingPreview.thumbnailDataUrl,
-        duration,
-        blobSize,
-        shareUrl,
-        uploadProgress: 0,
-      });
+      // Use an async IIFE so we can await the storage write before opening the editor window.
+      void (async () => {
+        if (!shareUrl) {
+          // Persist capture data + thumbnail, then open editor
+          const capture = pendingCaptureData ?? { consoleLogs: [], networkCaptures: [] };
+          pendingCaptureData = null;
+          await chrome.storage.local.set({
+            [STORAGE_KEYS.EDITOR_DATA]: {
+              recordingId: editorRecordingId,
+              thumbnailDataUrl: thumbnailDataUrl ?? null,
+              duration,
+              blobSize,
+              title: readyTitle ?? `Recording ${new Date().toLocaleString()}`,
+              recordingType: readyRecordingType ?? currentRecordingOptions?.type ?? 'screen',
+              consoleLogs: capture.consoleLogs,
+              networkCaptures: capture.networkCaptures,
+            },
+          });
+          await chrome.windows.create({
+            url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),
+            type: 'popup',
+            width: 960,
+            height: 680,
+            focused: true,
+          });
+          // Upload is now editor-triggered — offscreen has no more work to do
+          void closeOffscreenDocument();
+        }
+      })();
       break;
     }
 
     case 'OFFSCREEN_UPLOAD_PROGRESS': {
       broadcastToAll({ type: 'UPLOAD_PROGRESS', payload: message.payload });
-      const prog = message.payload as { percentComplete: number };
-      void pushPreviewToTab({
-        thumbnailDataUrl: pendingPreview?.thumbnailDataUrl ?? null,
-        duration: pendingPreview?.duration ?? 0,
-        blobSize: pendingPreview?.blobSize ?? 0,
-        shareUrl: pendingPreview?.shareUrl ?? null,
-        uploadProgress: prog.percentComplete ?? 0,
-      });
       break;
     }
 
@@ -600,16 +800,6 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         recordingId?: string;
       };
       broadcastToAll({ type: 'UPLOAD_COMPLETE', payload: { shareUrl, recordingId } });
-
-      // Push the share URL to the content script preview panel
-      void pushPreviewToTab({
-        thumbnailDataUrl: pendingPreview?.thumbnailDataUrl ?? null,
-        duration: pendingPreview?.duration ?? 0,
-        blobSize: pendingPreview?.blobSize ?? 0,
-        shareUrl,
-        uploadProgress: 100,
-      });
-      pendingPreview = null;
 
       // Persist for popup that may not be open when upload finishes
       void chrome.storage.local.set({
@@ -624,15 +814,6 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
     case 'OFFSCREEN_ERROR': {
       const { error } = message.payload as { error: string };
       broadcastToAll({ type: 'RECORDING_ERROR', error });
-      void pushPreviewToTab({
-        thumbnailDataUrl: pendingPreview?.thumbnailDataUrl ?? null,
-        duration: pendingPreview?.duration ?? 0,
-        blobSize: pendingPreview?.blobSize ?? 0,
-        shareUrl: pendingPreview?.shareUrl ?? null,
-        uploadProgress: -1,
-        errorMessage: error, // pass specific error so panel shows it
-      });
-      pendingPreview = null;
       void closeOffscreenDocument();
       break;
     }
@@ -669,6 +850,21 @@ chrome.commands.onCommand.addListener((command) => {
       break;
     }
   }
+});
+
+// ─── Navigation — Toolbar Re-injection ───────────────────────────────────────
+// These fire whenever the user navigates (full reload or SPA history change)
+// within a tab that has an active recording. The toolbar is re-injected
+// automatically so it always stays visible during recording.
+
+chrome.webNavigation.onCompleted.addListener(({ tabId, frameId }) => {
+  if (frameId !== 0) return; // top-level frame only — ignore iframes
+  void reinjectToolbarIntoTab(tabId);
+});
+
+chrome.webNavigation.onHistoryStateUpdated.addListener(({ tabId, frameId }) => {
+  if (frameId !== 0) return;
+  void reinjectToolbarIntoTab(tabId);
 });
 
 // ─── Startup / Install ────────────────────────────────────────────────────────

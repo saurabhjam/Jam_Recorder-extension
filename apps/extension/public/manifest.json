@@ -12,7 +12,9 @@
     "offscreen",
     "activeTab",
     "downloads",
-    "windows"
+    "windows",
+    "debugger",
+    "webNavigation"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

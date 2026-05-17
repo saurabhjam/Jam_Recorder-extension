@@ -30,12 +30,14 @@ export function useRecording(id: string) {
   });
 }
 
-/** Fetch a public recording by shareId */
+/** Fetch a public recording by shareId, polling every 2s while PROCESSING */
 export function useSharedRecording(shareId: string) {
   return useQuery({
     queryKey: recordingKeys.share(shareId),
     queryFn: () => api.getRecordingByShareId(shareId),
     enabled: !!shareId,
+    refetchInterval: (query) => (query.state.data?.status === 'PROCESSING' ? 2000 : false),
+    staleTime: 0,
   });
 }
 

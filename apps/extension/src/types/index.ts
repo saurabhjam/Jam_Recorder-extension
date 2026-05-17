@@ -140,8 +140,40 @@ export type MessageType =
   | 'AUTH_STATE_CHANGED'
   | 'TOKEN_REFRESHED'
   | 'OAUTH_LOGIN_COMPLETE'
-  | 'SHOW_PREVIEW'
-  | 'UPDATE_PREVIEW';
+  | 'CAPTURE_FLUSH';
+
+// ─── Capture Types ─────────────────────────────────────────────────────────────
+
+export type CaptureLevel = 'log' | 'info' | 'warn' | 'error' | 'debug';
+
+export interface CaptureConsoleLog {
+  level: CaptureLevel;
+  message: string;
+  timestamp: number;
+  url: string;
+  source: 'cdp' | 'injected';
+}
+
+export interface CaptureNetworkEntry {
+  id: string;
+  url: string;
+  method: string;
+  status: number;
+  statusText: string;
+  duration: number;
+  timestamp: number;
+  size: number;
+  mimeType?: string;
+  initiator?: string;
+  failed?: boolean;
+  errorText?: string;
+  source: 'cdp' | 'injected';
+}
+
+export interface CaptureData {
+  consoleLogs: CaptureConsoleLog[];
+  networkCaptures: CaptureNetworkEntry[];
+}
 
 export type OffscreenMessageType =
   | 'OFFSCREEN_START_RECORDING'

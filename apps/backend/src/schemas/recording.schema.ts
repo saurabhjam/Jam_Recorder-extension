@@ -39,6 +39,35 @@ export const createRecordingSchema = z.object({
           model: z.string().max(100).optional(),
         })
         .optional(),
+      consoleLogs: z
+        .array(
+          z.object({
+            level: z.enum(['log', 'info', 'warn', 'error', 'debug']),
+            message: z.string(),
+            timestamp: z.number(),
+            url: z.string().optional(),
+            source: z.enum(['cdp', 'injected']).optional(),
+          }),
+        )
+        .optional(),
+      networkLogs: z
+        .array(
+          z.object({
+            id: z.string().optional(),
+            url: z.string(),
+            method: z.string(),
+            status: z.number(),
+            statusText: z.string().optional(),
+            duration: z.number(),
+            timestamp: z.number(),
+            size: z.number(),
+            mimeType: z.string().optional(),
+            failed: z.boolean().optional(),
+            errorText: z.string().optional(),
+            source: z.enum(['cdp', 'injected']).optional(),
+          }),
+        )
+        .optional(),
     })
     .optional(),
 });
