@@ -30,13 +30,26 @@ export function useRecording(id: string) {
   });
 }
 
-/** Fetch a public recording by shareId, polling every 2s while PROCESSING */
+/** Fetch a public recording by shareId, polling every 2s while PROCESSING/UPLOADING or on 404 */
 export function useSharedRecording(shareId: string) {
   return useQuery({
     queryKey: recordingKeys.share(shareId),
     queryFn: () => api.getRecordingByShareId(shareId),
     enabled: !!shareId,
-    refetchInterval: (query) => (query.state.data?.status === 'PROCESSING' ? 2000 : false),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status === 'PROCESSING' || status === 'UPLOADING') return 2000;
+      // Poll on 404 — recording may still be mid-upload when the share page opens
+      if (query.state.error) return 3000;
+      return false;
+    },
+    // Retry 404s: recording might not be visible yet while chunks are uploading
+    retry: (failureCount, error: unknown) => {
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 404) return failureCount < 15;
+      return false;
+    },
+    retryDelay: 2000,
     staleTime: 0,
   });
 }

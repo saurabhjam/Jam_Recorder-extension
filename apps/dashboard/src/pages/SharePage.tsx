@@ -573,7 +573,7 @@ const TAB_CONFIG: TabConfig[] = [
 
 export default function SharePage() {
   const { token } = useParams<{ token: string }>();
-  const { data: recording, isLoading, error } = useSharedRecording(token ?? '');
+  const { data: recording, isLoading, isFetching, error } = useSharedRecording(token ?? '');
   const { data: comments } = useComments(recording?.id ?? '');
   const { mutate: createComment, isPending: commenting } = useCreateComment(recording?.id ?? '');
 
@@ -629,9 +629,10 @@ export default function SharePage() {
   const consoleLogs = recording?.metadata?.consoleLogs ?? [];
   const networkLogs = recording?.metadata?.networkLogs ?? [];
 
-  // ── Loading ──────────────────────────────────────────────────────────────
+  // ── Loading / retrying ───────────────────────────────────────────────────
+  // Show spinner when: initial load OR when retrying a 404 (recording still uploading)
 
-  if (isLoading) {
+  if (isLoading || (error && isFetching)) {
     return (
       <div className="min-h-screen bg-[#060816] flex items-center justify-center">
         <div className="flex flex-col items-center gap-4">

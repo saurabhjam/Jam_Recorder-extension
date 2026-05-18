@@ -32,7 +32,6 @@ let currentDuration = 0;
 let isToolbarVisible = false;
 let networkCaptures: CaptureNetworkEntry[] = [];
 let consoleLogs: CaptureConsoleLog[] = [];
-let isCapturing = false;
 
 // ─── Toolbar Management ───────────────────────────────────────────────────────
 
@@ -161,99 +160,16 @@ function startCapture(): void {
 
   window.__snaptraceCaptureInitialized = true;
 
-  isCapturing = true;
   networkCaptures = [];
   consoleLogs = [];
 
-  // Inject interceptor into the page's own JS context (bypasses content-script isolation)
-  const script = document.createElement('script');
-  script.textContent = `
-(function() {
-  if (window.__stCapture) return;
-  window.__stCapture = true;
-
-  function post(data) { window.postMessage(Object.assign({ __st: true }, data), '*'); }
-
-  // ── XHR interception ──────────────────────────────────────────────────────
-  var _XHR = window.XMLHttpRequest;
-  function PatchedXHR() {
-    var xhr = new _XHR();
-    var meta = { url: '', method: 'GET', start: 0 };
-    var origOpen = xhr.open.bind(xhr);
-    xhr.open = function(method, url) {
-      meta.method = String(method).toUpperCase();
-      meta.url = typeof url === 'string' ? url : String(url);
-      return origOpen.apply(xhr, arguments);
-    };
-    var origSend = xhr.send.bind(xhr);
-    xhr.send = function() {
-      meta.start = Date.now();
-      xhr.addEventListener('loadend', function() {
-        post({ kind:'network', url:meta.url, method:meta.method, status:xhr.status,
-               statusText:xhr.statusText, duration:Date.now()-meta.start,
-               size:parseInt(xhr.getResponseHeader('content-length')||'0')||0,
-               timestamp:meta.start, failed:xhr.status===0 });
-      });
-      return origSend.apply(xhr, arguments);
-    };
-    return xhr;
-  }
-  PatchedXHR.prototype = _XHR.prototype;
-  window.XMLHttpRequest = PatchedXHR;
-
-  // ── fetch interception ────────────────────────────────────────────────────
-  var _fetch = window.fetch;
-  window.fetch = function(input, init) {
-    var url = typeof input==='string' ? input : (input&&input.url) ? input.url : String(input);
-    var method = ((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
-    var start = Date.now();
-    return _fetch(input, init).then(function(response) {
-      var clone = response.clone();
-      clone.arrayBuffer().catch(function(){return new ArrayBuffer(0);}).then(function(buf) {
-        post({ kind:'network', url:url, method:method, status:response.status,
-               statusText:response.statusText, duration:Date.now()-start,
-               size:buf.byteLength, timestamp:start, failed:false });
-      });
-      return response;
-    }, function(err) {
-      post({ kind:'network', url:url, method:method, status:0, statusText:'',
-             duration:Date.now()-start, size:0, timestamp:start, failed:true,
-             errorText: err && err.message ? err.message : String(err) });
-      throw err;
-    });
-  };
-
-  // ── console interception ──────────────────────────────────────────────────
-  var _con = {};
-  ['log','info','warn','error','debug'].forEach(function(lvl) {
-    _con[lvl] = console[lvl].bind(console);
-    console[lvl] = function() {
-      _con[lvl].apply(console, arguments);
-      var msg = Array.prototype.slice.call(arguments).map(function(a) {
-        try { return typeof a==='object' ? JSON.stringify(a) : String(a); } catch(e) { return String(a); }
-      }).join(' ');
-      post({ kind:'console', level:lvl, message:msg, timestamp:Date.now(), url:window.location.href });
-    };
-  });
-
-  // ── uncaught errors ───────────────────────────────────────────────────────
-  window.addEventListener('error', function(ev) {
-    post({ kind:'console', level:'error', message:ev.message||String(ev), timestamp:Date.now(), url:window.location.href });
-  });
-  window.addEventListener('unhandledrejection', function(ev) {
-    var msg = ev.reason && ev.reason.message ? ev.reason.message : String(ev.reason);
-    post({ kind:'console', level:'error', message:'Unhandled rejection: '+msg, timestamp:Date.now(), url:window.location.href });
-  });
-})();
-  `;
-  document.head.appendChild(script);
-  script.remove();
-
+  // The main-world XHR/fetch/console patching is injected by the background
+  // service worker via chrome.scripting.executeScript({ world: 'MAIN' }),
+  // which bypasses page CSP. We only need to listen for the postMessages here.
   window.addEventListener('message', handlePageMessage);
 }
 
 function stopCapture(): void {
-  isCapturing = false;
   window.removeEventListener('message', handlePageMessage);
 }
 

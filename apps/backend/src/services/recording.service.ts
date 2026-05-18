@@ -182,7 +182,7 @@ export class RecordingService {
     }
 
     const recording = await prisma.recording.findFirst({
-      where: { shareId, isPublic: true, status: { in: ['PROCESSING', 'READY'] } },
+      where: { shareId, isPublic: true, status: { in: ['UPLOADING', 'PROCESSING', 'READY'] } },
       include: {
         user: { select: { id: true, name: true, avatar: true } },
         _count: { select: { comments: true } },
@@ -193,7 +193,7 @@ export class RecordingService {
       throw new AppError('Recording not found or not public', 404, 'NOT_FOUND');
     }
 
-    // Only cache READY recordings; PROCESSING ones should refresh on next request
+    // Only cache READY recordings; UPLOADING/PROCESSING ones must refresh each request
     if (recording.status === 'READY') {
       await cacheSet(cacheKey, recording, CACHE_TTL.RECORDING);
     }

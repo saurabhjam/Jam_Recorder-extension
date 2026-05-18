@@ -155,6 +155,31 @@ async function detachDebugger(): Promise<void> {
   }
 }
 
+// Re-attach after navigation without clearing accumulated captures.
+async function reattachDebugger(tabId: number): Promise<void> {
+  const prevTabId = cdpTabId;
+  cdpTabId = null;
+  if (prevTabId !== null) {
+    try {
+      await chrome.debugger.detach({ tabId: prevTabId });
+    } catch {
+      // May have already auto-detached on cross-origin navigation
+    }
+  }
+  cdpTabId = tabId;
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+    await Promise.all([
+      chrome.debugger.sendCommand({ tabId }, 'Network.enable', {}),
+      chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {}),
+      chrome.debugger.sendCommand({ tabId }, 'Log.enable', {}),
+    ]);
+  } catch (err) {
+    console.warn('[Background] CDP re-attach after navigation failed (non-fatal):', err);
+    cdpTabId = null;
+  }
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (source.tabId !== cdpTabId) return;
   const p = params as Record<string, unknown>;
@@ -307,6 +332,161 @@ function broadcastToAll(message: ExtensionMessage): void {
   });
 }
 
+// ─── Main-World Capture Script ────────────────────────────────────────────────
+// Injected via chrome.scripting.executeScript (world: MAIN) so it runs in the
+// page's JS context and bypasses any Content Security Policy restrictions.
+// Must be a self-contained function — no references to outer closure variables.
+
+function captureScriptMain(): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const w = window as any;
+  if (w.__stCapture) return;
+  w.__stCapture = true;
+
+  const _post = (data: object): void => window.postMessage({ __st: true, ...data }, '*');
+
+  // ── XHR ──────────────────────────────────────────────────────────────────
+  const _OrigXHR = w.XMLHttpRequest as typeof XMLHttpRequest;
+  w.XMLHttpRequest = function (): XMLHttpRequest {
+    const xhr = new _OrigXHR();
+    const meta = { url: '', method: 'GET', start: 0 };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const _origOpen = (xhr.open as any).bind(xhr) as (...a: unknown[]) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (xhr as any).open = (...args: unknown[]): void => {
+      meta.method = String(args[0] ?? 'GET').toUpperCase();
+      meta.url = String(args[1] ?? '');
+      _origOpen(...args);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const _origSend = (xhr.send as any).bind(xhr) as (...a: unknown[]) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (xhr as any).send = (...args: unknown[]): void => {
+      meta.start = Date.now();
+      xhr.addEventListener('loadend', () => {
+        _post({
+          kind: 'network',
+          url: meta.url,
+          method: meta.method,
+          status: xhr.status,
+          statusText: xhr.statusText,
+          duration: Date.now() - meta.start,
+          size: parseInt(xhr.getResponseHeader('content-length') ?? '0') || 0,
+          timestamp: meta.start,
+          failed: xhr.status === 0,
+        });
+      });
+      _origSend(...args);
+    };
+    return xhr;
+  };
+  w.XMLHttpRequest.prototype = _OrigXHR.prototype;
+
+  // ── fetch ─────────────────────────────────────────────────────────────────
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = input instanceof Request ? input.url : String(input);
+    const method = (
+      init?.method ?? (input instanceof Request ? input.method : 'GET')
+    ).toUpperCase();
+    const t = Date.now();
+    return _origFetch(input, init).then(
+      (r: Response): Response => {
+        void r
+          .clone()
+          .arrayBuffer()
+          .catch((): ArrayBuffer => new ArrayBuffer(0))
+          .then((buf: ArrayBuffer): void => {
+            _post({
+              kind: 'network',
+              url,
+              method,
+              status: r.status,
+              statusText: r.statusText,
+              duration: Date.now() - t,
+              size: buf.byteLength,
+              timestamp: t,
+              failed: false,
+            });
+          });
+        return r;
+      },
+      (e: unknown): never => {
+        _post({
+          kind: 'network',
+          url,
+          method,
+          status: 0,
+          statusText: '',
+          duration: Date.now() - t,
+          size: 0,
+          timestamp: t,
+          failed: true,
+          errorText: e instanceof Error ? e.message : String(e),
+        });
+        throw e;
+      },
+    );
+  };
+
+  // ── console ───────────────────────────────────────────────────────────────
+  (['log', 'info', 'warn', 'error', 'debug'] as const).forEach((lvl) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const _orig = (console as any)[lvl].bind(console) as (...a: unknown[]) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (console as any)[lvl] = (...args: unknown[]): void => {
+      _orig(...args);
+      _post({
+        kind: 'console',
+        level: lvl,
+        message: args
+          .map((a): string => {
+            try {
+              return typeof a === 'object' ? JSON.stringify(a) : String(a);
+            } catch {
+              return String(a);
+            }
+          })
+          .join(' '),
+        timestamp: Date.now(),
+        url: location.href,
+      });
+    };
+  });
+
+  window.addEventListener('error', (ev: ErrorEvent): void => {
+    _post({
+      kind: 'console',
+      level: 'error',
+      message: ev.message || String(ev),
+      timestamp: Date.now(),
+      url: location.href,
+    });
+  });
+  window.addEventListener('unhandledrejection', (ev: PromiseRejectionEvent): void => {
+    const msg = (ev.reason as Error | undefined)?.message ?? String(ev.reason);
+    _post({
+      kind: 'console',
+      level: 'error',
+      message: `Unhandled rejection: ${msg}`,
+      timestamp: Date.now(),
+      url: location.href,
+    });
+  });
+}
+
+async function injectMainWorldCaptureScript(tabId: number): Promise<void> {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: captureScriptMain,
+    });
+  } catch (err) {
+    console.warn('[Background] Main-world capture injection failed (non-fatal):', err);
+  }
+}
+
 // ─── Floating Toolbar ─────────────────────────────────────────────────────────
 
 async function injectFloatingToolbar(targetTabId?: number): Promise<void> {
@@ -356,7 +536,11 @@ async function reinjectToolbarIntoTab(tabId: number): Promise<void> {
     currentRecordingTabId !== tabId
   )
     return;
+  // CDP auto-detaches on cross-origin navigation — always re-attach so captures
+  // continue uninterrupted after navigations. Accumulated entries are preserved.
+  void reattachDebugger(tabId);
   await injectFloatingToolbar(tabId);
+  void injectMainWorldCaptureScript(tabId);
 }
 
 async function hideFloatingToolbar(): Promise<void> {
@@ -456,8 +640,12 @@ async function handleStartRecording(
     await injectFloatingToolbar();
     startTimer();
 
-    // Attach Chrome Debugger to capture network + console (best-effort)
-    if (currentRecordingTabId) void attachDebugger(currentRecordingTabId);
+    // Attach Chrome Debugger (CDP) + inject main-world capture script for
+    // full coverage: CDP for all traffic, scripting API for CSP-strict pages.
+    if (currentRecordingTabId) {
+      void attachDebugger(currentRecordingTabId);
+      void injectMainWorldCaptureScript(currentRecordingTabId);
+    }
 
     await chrome.storage.local.set({
       [STORAGE_KEYS.RECORDING_STATE]: {
@@ -528,17 +716,30 @@ async function handleStopRecording(
   // ── Detach CDP debugger and merge all capture data ────────────────────────
   await detachDebugger();
 
-  // CDP is the authoritative source. Fall back to content-script only if CDP captured nothing.
-  pendingCaptureData = {
-    consoleLogs:
-      cdpConsoleLogs.length > 0
-        ? [...cdpConsoleLogs].sort((a, b) => a.timestamp - b.timestamp)
-        : [...contentCaptures.consoleLogs].sort((a, b) => a.timestamp - b.timestamp),
-    networkCaptures:
-      cdpNetworkEntries.length > 0
-        ? [...cdpNetworkEntries].sort((a, b) => a.timestamp - b.timestamp)
-        : [...contentCaptures.networkCaptures].sort((a, b) => a.timestamp - b.timestamp),
-  };
+  // Merge CDP + content-script captures. CDP is authoritative; content-script
+  // entries are included only when no CDP entry matches (same url/level+message
+  // within a 500 ms window), catching anything CDP missed during attach gaps.
+  const cdpLogKeys = new Set(
+    cdpConsoleLogs.map((l) => `${l.level}|${l.message}|${Math.floor(l.timestamp / 500)}`),
+  );
+  const mergedLogs = [
+    ...cdpConsoleLogs,
+    ...contentCaptures.consoleLogs.filter(
+      (l) => !cdpLogKeys.has(`${l.level}|${l.message}|${Math.floor(l.timestamp / 500)}`),
+    ),
+  ].sort((a, b) => a.timestamp - b.timestamp);
+
+  const cdpNetKeys = new Set(
+    cdpNetworkEntries.map((e) => `${e.method}|${e.url}|${Math.floor(e.timestamp / 500)}`),
+  );
+  const mergedNet = [
+    ...cdpNetworkEntries,
+    ...contentCaptures.networkCaptures.filter(
+      (e) => !cdpNetKeys.has(`${e.method}|${e.url}|${Math.floor(e.timestamp / 500)}`),
+    ),
+  ].sort((a, b) => a.timestamp - b.timestamp);
+
+  pendingCaptureData = { consoleLogs: mergedLogs, networkCaptures: mergedNet };
 
   stopTimer();
   clearBadge();
