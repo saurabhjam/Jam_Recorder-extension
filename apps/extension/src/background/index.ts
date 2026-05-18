@@ -93,12 +93,21 @@ let timerInterval: ReturnType<typeof setInterval> | null = null;
 let isRecordingActive = false;
 let isPaused = false;
 
+// ─── CDP Session Storage Key ──────────────────────────────────────────────────
+// Declared early — used in both restoreStateFromStorage (below) and the CDP
+// capture state section. Session storage survives SW suspension within a browser
+// session, so captures are preserved even if the SW is killed mid-recording.
+const CDP_SESSION_KEY = 'st_cdp_captures';
+
 // ─── State Restore (after SW termination) ────────────────────────────────────
 
 async function restoreStateFromStorage(): Promise<void> {
   if (isRecordingActive) return;
-  const stored = await chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]);
-  const state = stored[STORAGE_KEYS.RECORDING_STATE] as
+  const [localStored, sessionStored] = await Promise.all([
+    chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]),
+    chrome.storage.session.get([CDP_SESSION_KEY]),
+  ]);
+  const state = localStored[STORAGE_KEYS.RECORDING_STATE] as
     | {
         isRecording: boolean;
         recordingId: string;
@@ -114,6 +123,24 @@ async function restoreStateFromStorage(): Promise<void> {
   currentRecordingTabId = state.tabId ?? null;
   elapsedSeconds = Math.floor((Date.now() - state.startedAt) / 1000);
   if (!timerInterval) startTimer();
+
+  // Restore CDP captures that were flushed to session storage before SW suspended
+  const captures = sessionStored[CDP_SESSION_KEY] as
+    | { consoleLogs: CaptureConsoleLog[]; networkEntries: CaptureNetworkEntry[] }
+    | undefined;
+  if (captures) {
+    cdpConsoleLogs = captures.consoleLogs ?? [];
+    cdpNetworkEntries = captures.networkEntries ?? [];
+    console.log(
+      `[CDP] Restored ${cdpConsoleLogs.length} logs, ${cdpNetworkEntries.length} network entries from session storage after SW restart`,
+    );
+  }
+
+  // Re-attach CDP so captures continue after SW suspension
+  if (currentRecordingTabId) {
+    console.log(`[Background] SW reactivated — re-attaching CDP to tab ${currentRecordingTabId}`);
+    void reattachDebugger(currentRecordingTabId);
+  }
 }
 
 // ─── CDP Capture State ────────────────────────────────────────────────────────
@@ -126,11 +153,40 @@ let cdpNetworkEntries: CaptureNetworkEntry[] = [];
 // Holds merged capture data between stopRecording and OFFSCREEN_RECORDING_READY
 let pendingCaptureData: CaptureData | null = null;
 
+// Debounced flush — writes CDP arrays to session storage at most once per 2s.
+// Preserves captures across SW suspension without hammering storage on every
+// high-frequency network event.
+let _captureFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleCaptureFlush(): void {
+  if (_captureFlushTimer) return;
+  _captureFlushTimer = setTimeout(() => {
+    _captureFlushTimer = null;
+    if (!isRecordingActive) return;
+    void chrome.storage.session
+      .set({
+        [CDP_SESSION_KEY]: {
+          consoleLogs: cdpConsoleLogs.slice(-1000),
+          networkEntries: cdpNetworkEntries.slice(-1000),
+        },
+      })
+      .catch(() => {});
+  }, 2000);
+}
+
 async function attachDebugger(tabId: number): Promise<void> {
+  // Cancel any pending flush and clear stale session captures from a prior recording
+  if (_captureFlushTimer) {
+    clearTimeout(_captureFlushTimer);
+    _captureFlushTimer = null;
+  }
+  void chrome.storage.session.remove([CDP_SESSION_KEY]).catch(() => {});
+
   cdpTabId = tabId;
   cdpConsoleLogs = [];
   cdpNetworkMap.clear();
   cdpNetworkEntries = [];
+  console.log(`[CDP] Attaching to tab ${tabId}`);
   try {
     await chrome.debugger.attach({ tabId }, '1.3');
     await Promise.all([
@@ -138,9 +194,10 @@ async function attachDebugger(tabId: number): Promise<void> {
       chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {}),
       chrome.debugger.sendCommand({ tabId }, 'Log.enable', {}),
     ]);
+    console.log(`[CDP] Attached and domains enabled on tab ${tabId}`);
   } catch (err) {
-    console.warn('[Background] CDP attach failed (non-fatal):', err);
-    cdpTabId = null; // fall back to content-script capture only
+    console.warn('[CDP] Attach failed (non-fatal) — falling back to content-script capture:', err);
+    cdpTabId = null;
   }
 }
 
@@ -225,6 +282,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         entry.duration = Date.now() - entry.startedAt;
         cdpNetworkEntries.push(entry as CaptureNetworkEntry);
         cdpNetworkMap.delete(p['requestId'] as string);
+        scheduleCaptureFlush();
       }
       break;
     }
@@ -237,6 +295,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         entry.duration = Date.now() - entry.startedAt;
         cdpNetworkEntries.push(entry as CaptureNetworkEntry);
         cdpNetworkMap.delete(p['requestId'] as string);
+        scheduleCaptureFlush();
       }
       break;
     }
@@ -257,6 +316,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         url: '',
         source: 'cdp',
       });
+      scheduleCaptureFlush();
       break;
     }
 
@@ -272,6 +332,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           url: details.url ?? '',
           source: 'cdp',
         });
+        scheduleCaptureFlush();
       }
       break;
     }
@@ -286,6 +347,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           url: entry.url ?? '',
           source: 'cdp',
         });
+        scheduleCaptureFlush();
       }
       break;
     }
@@ -715,6 +777,13 @@ async function handleStopRecording(
 
   // ── Detach CDP debugger and merge all capture data ────────────────────────
   await detachDebugger();
+
+  // Clear session storage captures — no longer needed after stop
+  if (_captureFlushTimer) {
+    clearTimeout(_captureFlushTimer);
+    _captureFlushTimer = null;
+  }
+  void chrome.storage.session.remove([CDP_SESSION_KEY]).catch(() => {});
 
   // Merge CDP + content-script captures. CDP is authoritative; content-script
   // entries are included only when no CDP entry matches (same url/level+message
@@ -1182,3 +1251,10 @@ chrome.tabs.onRemoved.addListener(async () => {
     void handleStopRecording(() => {}, false);
   }
 });
+
+// ─── SW Activation Restore ────────────────────────────────────────────────────
+// Runs on every SW activation (first load and after suspension wake-up).
+// Restores in-memory recording state + CDP captures from persistent storage
+// so an active recording survives SW termination transparently.
+
+void restoreStateFromStorage();

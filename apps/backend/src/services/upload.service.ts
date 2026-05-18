@@ -105,12 +105,18 @@ export class UploadService {
     }
 
     // Upload chunk to Cloudinary
+    console.log(
+      `[UPLOAD] chunk ${chunkIndex + 1}/${totalChunks} received — ${buffer.length} bytes — recording ${recordingId}`,
+    );
     const uploadResult = await storage.upload(buffer, {
       folder: CLOUDINARY_FOLDERS.CHUNKS,
       publicId: `${recordingId}_chunk_${chunkIndex}`,
       resourceType: 'raw',
       tags: ['chunk', recordingId],
     });
+    console.log(
+      `[UPLOAD] chunk ${chunkIndex + 1}/${totalChunks} stored to Cloudinary — ${uploadResult.secureUrl}`,
+    );
 
     // Upsert chunk record
     await prisma.uploadChunk.upsert({
@@ -247,6 +253,9 @@ export class UploadService {
     }
 
     // Update recording status to PROCESSING
+    console.log(
+      `[UPLOAD] all ${totalChunks} chunks verified — setting recording ${recordingId} to PROCESSING`,
+    );
     await prisma.recording.update({
       where: { id: recordingId },
       data: { status: 'PROCESSING' },
@@ -259,6 +268,9 @@ export class UploadService {
       mimeType: recording.mimeType ?? 'video/webm',
       totalChunks,
     });
+    console.log(
+      `[QUEUE] video-processing job queued for recording ${recordingId} (${totalChunks} chunks, mimeType: ${recording.mimeType})`,
+    );
 
     // Clean up progress cache
     await cacheDel(cacheKeys.uploadProgress(recordingId));

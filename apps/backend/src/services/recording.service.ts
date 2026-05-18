@@ -190,8 +190,13 @@ export class RecordingService {
     });
 
     if (!recording) {
+      console.log(`[SHARE] recording not found or not public — shareId: ${shareId}`);
       throw new AppError('Recording not found or not public', 404, 'NOT_FOUND');
     }
+
+    console.log(
+      `[SHARE] recording fetched — shareId: ${shareId}, status: ${recording.status}, id: ${recording.id}`,
+    );
 
     // Only cache READY recordings; UPLOADING/PROCESSING ones must refresh each request
     if (recording.status === 'READY') {

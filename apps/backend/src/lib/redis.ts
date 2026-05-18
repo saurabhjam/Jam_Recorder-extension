@@ -76,7 +76,9 @@ export async function cacheGet<T>(key: string): Promise<T | null> {
 
 export async function cacheSet<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
   const client = getRedisClient();
-  const serialized = JSON.stringify(value);
+  // BigInt (e.g. Prisma's BigInt? size field) can't be JSON.stringify'd natively —
+  // convert to string so the value round-trips safely through Redis.
+  const serialized = JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
   if (ttlSeconds) {
     await client.setex(key, ttlSeconds, serialized);
   } else {

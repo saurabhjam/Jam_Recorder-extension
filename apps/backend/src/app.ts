@@ -70,6 +70,12 @@ export function createApp(): Application {
   app.use(cookieParser());
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+  // BigInt serialization — Prisma returns BigInt for size fields; JSON.stringify
+  // crashes without this. Converts BigInt to string so clients receive a number-string.
+  app.set('json replacer', (_key: string, value: unknown) =>
+    typeof value === 'bigint' ? value.toString() : value,
+  );
   app.use(httpLogger);
 
   // Trust proxy (for rate limiting with real IPs behind load balancers)

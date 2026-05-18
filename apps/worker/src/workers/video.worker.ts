@@ -85,27 +85,30 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
   const log = createChildLogger({ recordingId, userId, jobId: job.id });
   const workDir = path.join(TEMP_DIR, `rec_${recordingId}_${Date.now()}`);
 
-  log.info('Video processing started', { totalChunks });
+  log.info('[WORKER] Video processing started', { totalChunks, jobId: job.id });
 
   try {
     // ── 1. Create working directory ────────────────────────────────────
     await fs.mkdir(workDir, { recursive: true });
+    log.info('[WORKER] Work directory ready', { workDir });
 
     // ── 2. Set status to PROCESSING ────────────────────────────────────
+    log.info('[DB] Setting recording status to PROCESSING');
     await updateRecordingStatus(recordingId, 'PROCESSING');
     await job.updateProgress(5);
 
     // ── 3. Fetch chunk URLs from database ──────────────────────────────
+    log.info('[DB] Fetching chunk URLs from database');
     const chunks = await prisma.uploadChunk.findMany({
       where: { recordingId },
       orderBy: { chunkIndex: 'asc' },
     });
 
     if (chunks.length === 0) {
-      throw new Error('No upload chunks found for recording');
+      throw new Error('[WORKER] No upload chunks found for recording');
     }
 
-    log.info(`Found ${chunks.length} chunks, downloading...`);
+    log.info(`[WORKER] Found ${chunks.length} chunks`, { totalChunks, actual: chunks.length });
 
     // ── 4. Download all chunks ─────────────────────────────────────────
     const chunkPaths: string[] = [];
@@ -120,26 +123,28 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
         workDir,
         `chunk_${String(chunk.chunkIndex).padStart(5, '0')}.webm`,
       );
+      log.debug(`[WORKER] Downloading chunk ${i + 1}/${chunks.length}`, { url: chunk.cloudUrl });
       await downloadChunk(chunk.cloudUrl, chunkPath);
       chunkPaths.push(chunkPath);
 
       const progress = 5 + Math.floor(((i + 1) / chunks.length) * 30);
       await job.updateProgress(progress);
-      log.debug(`Downloaded chunk ${i + 1}/${chunks.length}`);
+      log.debug(`[WORKER] Downloaded chunk ${i + 1}/${chunks.length}`);
     }
 
     // ── 5. Check ffmpeg and fall back to direct concat if unavailable ──
     const ffmpegAvailable = await checkFfmpegAvailable();
+    log.info(`[WORKER] FFmpeg available: ${ffmpegAvailable}`);
 
     if (!ffmpegAvailable) {
-      log.warn('FFmpeg not available — concatenating chunks directly (no re-encode)');
+      log.warn('[WORKER] FFmpeg not available — concatenating chunks directly (no re-encode)');
 
       const fallbackPath = path.join(workDir, 'recording.webm');
       const parts = await Promise.all(chunkPaths.map((p) => fs.readFile(p)));
       await fs.writeFile(fallbackPath, Buffer.concat(parts));
       await job.updateProgress(60);
 
-      log.info('Uploading concatenated recording to Cloudinary...');
+      log.info('[CLOUDINARY] Uploading concatenated recording...');
       const uploadResult = await uploadFile(fallbackPath, {
         folder: `jam-recordings/${userId}`,
         publicId: `rec_${recordingId}`,
@@ -149,14 +154,26 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
       });
 
       await job.updateProgress(95);
-      log.info('Upload complete (no-ffmpeg fallback)', { url: uploadResult.secureUrl });
+      log.info('[CLOUDINARY] Upload complete (no-ffmpeg fallback)', {
+        url: uploadResult.secureUrl,
+        size: uploadResult.size,
+        duration: uploadResult.duration,
+      });
 
+      // Prisma schema: duration is Int? (seconds), size is BigInt? — must convert
+      const fallbackDuration =
+        uploadResult.duration != null ? Math.round(uploadResult.duration) : null;
+      log.info('[DB] Updating recording status to READY', {
+        recordingId,
+        duration: fallbackDuration,
+      });
       await updateRecordingStatus(recordingId, 'READY', {
         url: uploadResult.secureUrl,
         size: BigInt(uploadResult.size),
-        duration: uploadResult.duration ?? null,
+        duration: fallbackDuration,
         mimeType: 'video/webm',
       });
+      log.info('[DB] Recording status updated to READY');
 
       await enqueueNotification(
         userId,
@@ -172,7 +189,7 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
     }
 
     // ── 6. Merge chunks ────────────────────────────────────────────────
-    log.info('Merging video chunks...');
+    log.info('[WORKER] Merging video chunks...');
     const mergedPath = path.join(workDir, 'merged.webm');
 
     await mergeVideoChunks(chunkPaths, mergedPath, async (ev: ProgressEvent) => {
@@ -183,7 +200,7 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
     });
 
     await job.updateProgress(50);
-    log.info('Chunks merged successfully');
+    log.info('[WORKER] Chunks merged successfully');
 
     // ── 6. Get video metadata ──────────────────────────────────────────
     const metadata = await getVideoMetadata(mergedPath);
@@ -193,7 +210,7 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
     });
 
     // ── 7. Optimize video ──────────────────────────────────────────────
-    log.info('Optimizing video...');
+    log.info('[WORKER] Optimizing video...');
     const optimizedPath = path.join(workDir, 'optimized.mp4');
 
     const targetHeight = metadata.height > 1080 ? 1080 : metadata.height;
@@ -220,13 +237,18 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
     );
 
     await job.updateProgress(80);
-    log.info('Video optimized successfully');
+    log.info('[WORKER] Video optimized successfully');
 
     // ── 8. Get final metadata ──────────────────────────────────────────
     const finalMeta = await getVideoMetadata(optimizedPath);
+    log.info('[WORKER] Final metadata', {
+      duration: finalMeta.duration,
+      size: finalMeta.size,
+      resolution: `${finalMeta.width}x${finalMeta.height}`,
+    });
 
     // ── 9. Upload to Cloudinary ────────────────────────────────────────
-    log.info('Uploading to Cloudinary...');
+    log.info('[CLOUDINARY] Uploading to Cloudinary...');
     const uploadResult = await uploadFile(optimizedPath, {
       folder: `jam-recordings/${userId}`,
       publicId: `rec_${recordingId}`,
@@ -236,15 +258,27 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
     });
 
     await job.updateProgress(95);
-    log.info('Upload complete', { url: uploadResult.secureUrl });
+    log.info('[CLOUDINARY] Upload complete', {
+      url: uploadResult.secureUrl,
+      size: uploadResult.size,
+    });
 
     // ── 10. Update recording to READY ──────────────────────────────────
+    // Prisma schema: duration is Int? (seconds, integer), size is BigInt?
+    // getVideoMetadata returns duration as float (parseFloat) and size as number (parseInt)
+    const readyDuration = finalMeta.duration ? Math.round(finalMeta.duration) : null;
+    log.info('[DB] Updating recording status to READY', {
+      recordingId,
+      duration: readyDuration,
+      size: finalMeta.size,
+    });
     await updateRecordingStatus(recordingId, 'READY', {
       url: uploadResult.secureUrl,
-      size: finalMeta.size,
-      duration: finalMeta.duration,
+      size: BigInt(finalMeta.size),
+      duration: readyDuration,
       mimeType: 'video/mp4',
     });
+    log.info('[DB] Recording status updated to READY');
 
     // ── 11. Trigger thumbnail generation ──────────────────────────────
     await enqueueThumbnailJob(recordingId, uploadResult.secureUrl);
@@ -259,9 +293,9 @@ async function processVideoJob(job: Job<VideoProcessingJobData>): Promise<void> 
     );
 
     await job.updateProgress(100);
-    log.info('Video processing complete');
+    log.info('[WORKER] Video processing complete');
   } catch (error) {
-    log.error('Video processing failed', {
+    log.error('[WORKER] Video processing failed', {
       error: error instanceof Error ? error.message : String(error),
       stack: error instanceof Error ? error.stack : undefined,
     });
