@@ -1,20 +1,91 @@
-import { cacheKeys, cacheSet, cacheDel } from '../lib/redis';
-import { prisma } from '../lib/prisma';
-import { storage } from '../lib/storage';
-import { AppError } from '../middleware/errorHandler';
-import { queueVideoProcessing } from '../queues';
-import { calculateChecksum, generateId } from '../utils/crypto';
-import { CLOUDINARY_FOLDERS } from '@snaptrace/config';
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
 
-// ============================================================
-// Upload Service
-// ============================================================
+import { prisma } from '../lib/prisma';
+import { cacheKeys, cacheSet, cacheGet, cacheDel } from '../lib/redis';
+import { externalApi } from '../lib/external-api';
+import { AppError } from '../middleware/errorHandler';
+import { calculateChecksum, generateId } from '../utils/crypto';
+import { config } from '../config';
+
+// ─── Temp chunk storage ───────────────────────────────────────────────────────
+
+function chunkDir(recordingId: string): string {
+  return path.join(os.tmpdir(), 'snaptrace-uploads', recordingId);
+}
+
+function chunkPath(recordingId: string, chunkIndex: number): string {
+  return path.join(chunkDir(recordingId), `chunk_${chunkIndex}`);
+}
+
+async function ensureChunkDir(recordingId: string): Promise<void> {
+  await fs.mkdir(chunkDir(recordingId), { recursive: true });
+}
+
+async function deleteChunkDir(recordingId: string): Promise<void> {
+  try {
+    await fs.rm(chunkDir(recordingId), { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+// ─── Log formatters ───────────────────────────────────────────────────────────
+
+interface ConsoleLogEntry {
+  level?: string;
+  message?: string;
+  timestamp?: number;
+  url?: string;
+}
+
+interface NetworkEntry {
+  method?: string;
+  url?: string;
+  status?: number;
+  statusText?: string;
+  duration?: number;
+  size?: number;
+  failed?: boolean;
+}
+
+function formatConsoleLogs(logs: ConsoleLogEntry[]): string {
+  if (!logs || logs.length === 0) return '';
+  return logs
+    .map((l) => {
+      const level = (l.level ?? 'log').toUpperCase();
+      const ts = l.timestamp ? new Date(l.timestamp).toISOString() : '';
+      return `[${level}]${ts ? ` ${ts}` : ''} ${l.message ?? ''}`;
+    })
+    .join('\n');
+}
+
+function formatNetworkLogs(entries: NetworkEntry[]): string {
+  if (!entries || entries.length === 0) return '';
+  return entries
+    .map((e) => {
+      const status = e.failed ? 'FAILED' : (e.status ?? 0);
+      const duration = e.duration != null ? `${e.duration}ms` : '';
+      const size = e.size != null ? `${e.size}B` : '';
+      const extra = [duration, size].filter(Boolean).join(', ');
+      return `${e.method ?? 'GET'} ${e.url ?? ''} ${status}${extra ? ` (${extra})` : ''}`;
+    })
+    .join('\n');
+}
+
+// ─── Upload Session (Redis) ───────────────────────────────────────────────────
+
+interface UploadSession {
+  uploadId: string;
+  totalChunks: number;
+  uploadedChunks: number;
+  status: 'UPLOADING' | 'DONE';
+}
+
+// ─── UploadService ────────────────────────────────────────────────────────────
 
 export class UploadService {
-  /**
-   * Initiate a chunked upload session.
-   * Validates the recording exists and belongs to the user.
-   */
   async initiateUpload(
     recordingId: string,
     userId: string,
@@ -25,40 +96,26 @@ export class UploadService {
       select: { id: true, userId: true, status: true },
     });
 
-    if (!recording) {
-      throw new AppError('Recording not found', 404, 'NOT_FOUND');
-    }
-
-    if (recording.userId !== userId) {
-      throw new AppError('Unauthorized', 403, 'FORBIDDEN');
-    }
-
+    if (!recording) throw new AppError('Recording not found', 404, 'NOT_FOUND');
+    if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
     if (recording.status !== 'UPLOADING') {
-      throw new AppError(
-        'Recording is not in UPLOADING state. Cannot re-initiate upload.',
-        400,
-        'INVALID_STATE',
-      );
+      throw new AppError('Recording is not in UPLOADING state', 400, 'INVALID_STATE');
     }
 
-    // Delete any previously uploaded chunks (for retry scenarios)
-    await prisma.uploadChunk.deleteMany({ where: { recordingId } });
+    // Clean up any leftover chunks from a previous attempt
+    await deleteChunkDir(recordingId);
+    await ensureChunkDir(recordingId);
 
     const uploadId = generateId(24);
-
-    // Store upload session metadata in cache
-    await cacheSet(
+    await cacheSet<UploadSession>(
       cacheKeys.uploadProgress(recordingId),
       { uploadId, totalChunks, uploadedChunks: 0, status: 'UPLOADING' },
-      3600, // 1 hour TTL
+      3600,
     );
 
     return { uploadId, recordingId, totalChunks };
   }
 
-  /**
-   * Upload a single chunk.
-   */
   async uploadChunk(
     recordingId: string,
     userId: string,
@@ -67,87 +124,42 @@ export class UploadService {
     buffer: Buffer,
     providedChecksum?: string,
   ): Promise<{ chunkIndex: number; uploaded: boolean }> {
-    // Verify recording ownership
     const recording = await prisma.recording.findUnique({
       where: { id: recordingId },
       select: { id: true, userId: true, status: true },
     });
 
-    if (!recording) {
-      throw new AppError('Recording not found', 404, 'NOT_FOUND');
-    }
-
-    if (recording.userId !== userId) {
-      throw new AppError('Unauthorized', 403, 'FORBIDDEN');
-    }
-
+    if (!recording) throw new AppError('Recording not found', 404, 'NOT_FOUND');
+    if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
     if (recording.status !== 'UPLOADING') {
       throw new AppError('Recording is not accepting chunks', 400, 'INVALID_STATE');
     }
 
     // Validate checksum if provided
-    const computedChecksum = calculateChecksum(buffer);
-    if (providedChecksum && computedChecksum !== providedChecksum) {
-      throw new AppError(
-        `Chunk ${chunkIndex} integrity check failed. Expected ${providedChecksum}, got ${computedChecksum}`,
-        400,
-        'CHECKSUM_MISMATCH',
-      );
+    if (providedChecksum) {
+      const computed = calculateChecksum(buffer);
+      if (computed !== providedChecksum) {
+        throw new AppError(`Chunk ${chunkIndex} integrity check failed`, 400, 'CHECKSUM_MISMATCH');
+      }
     }
 
-    // Check if chunk already uploaded (for idempotency)
-    const existingChunk = await prisma.uploadChunk.findUnique({
-      where: { recordingId_chunkIndex: { recordingId, chunkIndex } },
-    });
+    // Write chunk to temp disk (idempotent — overwrite if re-uploaded)
+    await ensureChunkDir(recordingId);
+    await fs.writeFile(chunkPath(recordingId, chunkIndex), buffer);
 
-    if (existingChunk?.cloudUrl) {
-      return { chunkIndex, uploaded: true }; // Already uploaded, idempotent
-    }
-
-    // Upload chunk to Cloudinary
     console.log(
-      `[UPLOAD] chunk ${chunkIndex + 1}/${totalChunks} received — ${buffer.length} bytes — recording ${recordingId}`,
-    );
-    const uploadResult = await storage.upload(buffer, {
-      folder: CLOUDINARY_FOLDERS.CHUNKS,
-      publicId: `${recordingId}_chunk_${chunkIndex}`,
-      resourceType: 'raw',
-      tags: ['chunk', recordingId],
-    });
-    console.log(
-      `[UPLOAD] chunk ${chunkIndex + 1}/${totalChunks} stored to Cloudinary — ${uploadResult.secureUrl}`,
+      `[UPLOAD] chunk ${chunkIndex + 1}/${totalChunks} saved to disk — ${buffer.length} bytes — recording ${recordingId}`,
     );
 
-    // Upsert chunk record
-    await prisma.uploadChunk.upsert({
-      where: { recordingId_chunkIndex: { recordingId, chunkIndex } },
-      create: {
-        recordingId,
-        chunkIndex,
-        totalChunks,
-        size: buffer.length,
-        checksum: computedChecksum,
-        cloudUrl: uploadResult.secureUrl,
-      },
-      update: {
-        cloudUrl: uploadResult.secureUrl,
-        checksum: computedChecksum,
-        size: buffer.length,
-        uploadedAt: new Date(),
-      },
-    });
-
-    // Update progress in cache
-    const uploadedCount = await prisma.uploadChunk.count({
-      where: { recordingId, cloudUrl: { not: null } },
-    });
-
-    await cacheSet(
+    // Update Redis progress counter
+    const session = await cacheGet<UploadSession>(cacheKeys.uploadProgress(recordingId));
+    const uploadedChunks = session ? session.uploadedChunks + 1 : 1;
+    await cacheSet<UploadSession>(
       cacheKeys.uploadProgress(recordingId),
       {
+        uploadId: session?.uploadId ?? generateId(24),
         totalChunks,
-        uploadedChunks: uploadedCount,
-        progress: Math.round((uploadedCount / totalChunks) * 100),
+        uploadedChunks,
         status: 'UPLOADING',
       },
       3600,
@@ -156,48 +168,23 @@ export class UploadService {
     return { chunkIndex, uploaded: true };
   }
 
-  /**
-   * Get the progress of an upload.
-   */
   async getUploadProgress(recordingId: string, userId: string) {
     const recording = await prisma.recording.findUnique({
       where: { id: recordingId },
       select: { id: true, userId: true, status: true },
     });
 
-    if (!recording) {
-      throw new AppError('Recording not found', 404, 'NOT_FOUND');
-    }
+    if (!recording) throw new AppError('Recording not found', 404, 'NOT_FOUND');
+    if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
 
-    if (recording.userId !== userId) {
-      throw new AppError('Unauthorized', 403, 'FORBIDDEN');
-    }
-
-    const [uploadedChunks, totalChunksRecord] = await Promise.all([
-      prisma.uploadChunk.count({
-        where: { recordingId, cloudUrl: { not: null } },
-      }),
-      prisma.uploadChunk.findFirst({
-        where: { recordingId },
-        select: { totalChunks: true },
-      }),
-    ]);
-
-    const totalChunks = totalChunksRecord?.totalChunks ?? 0;
+    const session = await cacheGet<UploadSession>(cacheKeys.uploadProgress(recordingId));
+    const totalChunks = session?.totalChunks ?? 0;
+    const uploadedChunks = session?.uploadedChunks ?? 0;
     const progress = totalChunks > 0 ? Math.round((uploadedChunks / totalChunks) * 100) : 0;
 
-    return {
-      recordingId,
-      uploadedChunks,
-      totalChunks,
-      progress,
-      status: recording.status,
-    };
+    return { recordingId, uploadedChunks, totalChunks, progress, status: recording.status };
   }
 
-  /**
-   * Finalize the upload — verify all chunks received, queue processing.
-   */
   async finalizeUpload(recordingId: string, userId: string) {
     const recording = await prisma.recording.findUnique({
       where: { id: recordingId },
@@ -207,144 +194,161 @@ export class UploadService {
         status: true,
         mimeType: true,
         shareId: true,
+        title: true,
+        description: true,
+        isPublic: true,
+        allowDownload: true,
+        viewCount: true,
+        duration: true,
+        metadata: true,
+        consoleLogs: true,
+        networkLogs: true,
+        createdAt: true,
+        updatedAt: true,
+        user: { select: { id: true, email: true, name: true } },
       },
     });
 
-    if (!recording) {
-      throw new AppError('Recording not found', 404, 'NOT_FOUND');
-    }
-
-    if (recording.userId !== userId) {
-      throw new AppError('Unauthorized', 403, 'FORBIDDEN');
-    }
-
+    if (!recording) throw new AppError('Recording not found', 404, 'NOT_FOUND');
+    if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
     if (recording.status !== 'UPLOADING') {
       throw new AppError('Recording is not in UPLOADING state', 400, 'INVALID_STATE');
     }
 
-    // Verify all chunks are uploaded
-    const chunks = await prisma.uploadChunk.findMany({
-      where: { recordingId },
-      orderBy: { chunkIndex: 'asc' },
-    });
+    // Retrieve upload session from Redis to know totalChunks
+    const session = await cacheGet<UploadSession>(cacheKeys.uploadProgress(recordingId));
+    if (!session) throw new AppError('Upload session not found or expired', 400, 'SESSION_EXPIRED');
 
-    if (chunks.length === 0) {
-      throw new AppError('No chunks found for this recording', 400, 'NO_CHUNKS');
+    const { totalChunks } = session;
+
+    // Verify all chunk files exist on disk
+    const missingChunks: number[] = [];
+    for (let i = 0; i < totalChunks; i++) {
+      try {
+        await fs.access(chunkPath(recordingId, i));
+      } catch {
+        missingChunks.push(i);
+      }
     }
-
-    const totalChunks = chunks[0]?.totalChunks ?? 0;
-    const uploadedChunks = chunks.filter((c) => c.cloudUrl !== null).length;
-
-    if (uploadedChunks < totalChunks) {
+    if (missingChunks.length > 0) {
       throw new AppError(
-        `Upload incomplete: ${uploadedChunks}/${totalChunks} chunks uploaded`,
+        `Missing chunks: [${missingChunks.join(', ')}]`,
         400,
         'INCOMPLETE_UPLOAD',
-        { uploadedChunks, totalChunks },
+        { missingChunks, totalChunks },
       );
     }
 
-    // Verify chunk continuity (no gaps)
-    const chunkIndices = chunks.map((c) => c.chunkIndex).sort((a, b) => a - b);
-    for (let i = 0; i < chunkIndices.length; i++) {
-      if (chunkIndices[i] !== i) {
-        throw new AppError(`Missing chunk at index ${i}`, 400, 'MISSING_CHUNK');
-      }
+    // Merge all chunks into a single buffer
+    console.log(`[UPLOAD] merging ${totalChunks} chunks for recording ${recordingId}`);
+    const chunkBuffers = await Promise.all(
+      Array.from({ length: totalChunks }, (_, i) => fs.readFile(chunkPath(recordingId, i))),
+    );
+    const merged = Buffer.concat(chunkBuffers);
+    console.log(`[UPLOAD] merged size: ${merged.length} bytes`);
+
+    // Upload the merged file to the external files API
+    const mimeType = recording.mimeType ?? 'video/webm';
+    const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const filename = `${recordingId}.${ext}`;
+
+    let fileUrl: string;
+    try {
+      fileUrl = await externalApi.uploadFile(merged, filename, mimeType);
+      console.log(`[UPLOAD] file uploaded to external API: ${fileUrl}`);
+    } catch (err) {
+      console.error('[UPLOAD] external file upload failed:', err);
+      throw new AppError(
+        `File upload to external API failed: ${err instanceof Error ? err.message : String(err)}`,
+        502,
+        'EXTERNAL_UPLOAD_FAILED',
+      );
     }
 
-    // Update recording status to PROCESSING
-    console.log(
-      `[UPLOAD] all ${totalChunks} chunks verified — setting recording ${recordingId} to PROCESSING`,
-    );
+    // Build console/network log strings from recording metadata
+    const meta = recording.metadata as Record<string, unknown> | null;
+    const consoleArr = (recording.consoleLogs ?? meta?.consoleLogs ?? []) as ConsoleLogEntry[];
+    const networkArr = (recording.networkLogs ?? meta?.networkLogs ?? []) as NetworkEntry[];
+    const consoleLogsStr = formatConsoleLogs(consoleArr);
+    const networkLogsStr = formatNetworkLogs(networkArr);
+
+    // Register the record in the external portal
+    let shareUrl: string;
+    let externalId: string;
+    try {
+      const result = await externalApi.createRecord({
+        id: recordingId,
+        title: recording.title,
+        description: recording.description ?? '',
+        userId: recording.user?.email ?? recording.userId,
+        projectId: config.externalApi.projectId,
+        status: 'completed',
+        type: mimeType.startsWith('image/') ? 'screenshot' : 'video',
+        url: fileUrl,
+        thumbnailUrl: '',
+        duration: recording.duration ?? 0,
+        size: merged.length,
+        mimeType,
+        shareId: recording.shareId,
+        isPublic: recording.isPublic,
+        allowDownload: recording.allowDownload,
+        viewCount: recording.viewCount,
+        metadata: JSON.stringify(meta ?? {}),
+        createdAt: recording.createdAt.toISOString(),
+        updatedAt: new Date().toISOString(),
+        consoleLogs: consoleLogsStr,
+        networkLogs: networkLogsStr,
+      });
+      shareUrl = result.shareUrl;
+      externalId = result.id;
+      console.log(`[UPLOAD] record created in external portal: ${shareUrl}`);
+    } catch (err) {
+      console.error('[UPLOAD] external record creation failed:', err);
+      throw new AppError(
+        `Record creation in external portal failed: ${err instanceof Error ? err.message : String(err)}`,
+        502,
+        'EXTERNAL_RECORD_FAILED',
+      );
+    }
+
+    // Update local Prisma recording to READY with the file URL
     await prisma.recording.update({
       where: { id: recordingId },
-      data: { status: 'PROCESSING' },
+      data: {
+        status: 'READY',
+        url: fileUrl,
+        size: BigInt(merged.length),
+      },
     });
 
-    // Queue video processing job
-    await queueVideoProcessing({
-      recordingId,
-      userId,
-      mimeType: recording.mimeType ?? 'video/webm',
-      totalChunks,
-    });
-    console.log(
-      `[QUEUE] video-processing job queued for recording ${recordingId} (${totalChunks} chunks, mimeType: ${recording.mimeType})`,
-    );
-
-    // Clean up progress cache
+    // Clean up temp files and Redis session
+    await deleteChunkDir(recordingId);
     await cacheDel(cacheKeys.uploadProgress(recordingId));
 
     return {
       recordingId,
-      shareId: recording.shareId,
-      status: 'PROCESSING',
-      message: 'Upload complete. Processing started.',
+      shareId: externalId,
+      shareUrl,
+      status: 'READY',
+      message: 'Upload complete. Recording saved to external portal.',
     };
   }
 
-  /**
-   * Abort an upload and clean up chunks.
-   */
   async abortUpload(recordingId: string, userId: string): Promise<void> {
     const recording = await prisma.recording.findUnique({
       where: { id: recordingId },
       select: { id: true, userId: true, status: true },
     });
 
-    if (!recording) {
-      throw new AppError('Recording not found', 404, 'NOT_FOUND');
-    }
+    if (!recording) throw new AppError('Recording not found', 404, 'NOT_FOUND');
+    if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
 
-    if (recording.userId !== userId) {
-      throw new AppError('Unauthorized', 403, 'FORBIDDEN');
-    }
-
-    // Queue cleanup job (deletion from Cloudinary)
-    // For now, we'll just delete from DB and let Cloudinary chunks expire
-    await prisma.uploadChunk.deleteMany({ where: { recordingId } });
+    await deleteChunkDir(recordingId);
+    await cacheDel(cacheKeys.uploadProgress(recordingId));
     await prisma.recording.update({
       where: { id: recordingId },
       data: { status: 'FAILED' },
     });
-
-    // Clear cache
-    await cacheDel(cacheKeys.uploadProgress(recordingId));
-  }
-
-  /**
-   * Clean up uploaded chunks from storage (called after video merge).
-   */
-  async cleanupChunks(recordingId: string): Promise<void> {
-    const chunks = await prisma.uploadChunk.findMany({
-      where: { recordingId },
-      select: { cloudUrl: true },
-    });
-
-    // Delete chunks from storage in parallel
-    const deletePromises = chunks
-      .filter((c) => c.cloudUrl)
-      .map(async (chunk) => {
-        try {
-          const publicId = this.extractPublicId(chunk.cloudUrl!);
-          if (publicId) {
-            await storage.delete(publicId);
-          }
-        } catch (err) {
-          console.warn(`Failed to delete chunk ${chunk.cloudUrl}:`, err);
-        }
-      });
-
-    await Promise.allSettled(deletePromises);
-
-    // Remove chunk records from DB
-    await prisma.uploadChunk.deleteMany({ where: { recordingId } });
-  }
-
-  private extractPublicId(url: string): string | null {
-    // Extract Cloudinary public ID from URL
-    const match = url.match(/\/upload\/(?:v\d+\/)?(.+?)(?:\.[^.]+)?$/);
-    return match?.[1] ?? null;
   }
 }
 

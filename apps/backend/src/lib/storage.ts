@@ -6,13 +6,15 @@ import { Readable } from 'stream';
 import { config } from '../config';
 import type { TransformOptions, UploadOptions, UploadResult } from '@snaptrace/types';
 
-// Configure Cloudinary
-cloudinary.config({
-  cloud_name: config.cloudinary.cloudName,
-  api_key: config.cloudinary.apiKey,
-  api_secret: config.cloudinary.apiSecret,
-  secure: true,
-});
+// Configure Cloudinary only when credentials are provided
+if (config.cloudinary.cloudName && config.cloudinary.apiKey && config.cloudinary.apiSecret) {
+  cloudinary.config({
+    cloud_name: config.cloudinary.cloudName,
+    api_key: config.cloudinary.apiKey,
+    api_secret: config.cloudinary.apiSecret,
+    secure: true,
+  });
+}
 
 // ============================================================
 // Storage Provider Interface
@@ -183,9 +185,14 @@ export class LocalStorage implements StorageProvider {
   }
 }
 
-// Export singleton storage instance
-export const storage: StorageProvider = config.server.isTest
-  ? new LocalStorage()
-  : new CloudinaryStorage();
+// Use Cloudinary when credentials are available; fall back to local storage
+const hasCloudinaryConfig = !!(
+  config.cloudinary.cloudName &&
+  config.cloudinary.apiKey &&
+  config.cloudinary.apiSecret
+);
+
+export const storage: StorageProvider =
+  config.server.isTest || !hasCloudinaryConfig ? new LocalStorage() : new CloudinaryStorage();
 
 export default storage;

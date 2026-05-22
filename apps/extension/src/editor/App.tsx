@@ -57,8 +57,12 @@ const PENDING_SHARE_KEY = 'st_pending_share';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const IDB_NAME = 'snaptrace-blobs';
 const IDB_STORE = 'recordings';
-const API_BASE = 'http://localhost:3000/api';
-const DASHBOARD_URL = 'http://localhost:3001';
+const API_BASE: string =
+  (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ??
+  'http://localhost:4000/api';
+const DASHBOARD_URL: string =
+  (import.meta as { env?: Record<string, string> }).env?.['VITE_DASHBOARD_URL'] ??
+  'http://localhost:3001';
 const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
 
 // ─── Upload helpers ───────────────────────────────────────────────────────────
@@ -322,7 +326,10 @@ export function EditorApp() {
         throw new Error(e.message ?? `Finalize failed (${finalRes.status})`);
       }
 
-      const newShareUrl = `${DASHBOARD_URL}/share/${shareId}`;
+      const finalBody = (await finalRes.json().catch(() => ({}))) as {
+        data?: { shareUrl?: string };
+      };
+      const newShareUrl = finalBody.data?.shareUrl ?? `${DASHBOARD_URL}/share/${shareId}`;
       setShareUrl(newShareUrl);
       setUploadPercent(100);
       await chrome.storage.local.set({

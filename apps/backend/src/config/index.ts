@@ -22,10 +22,17 @@ const envSchema = z.object({
   JWT_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
 
-  // Cloudinary
-  CLOUDINARY_CLOUD_NAME: z.string().min(1, 'CLOUDINARY_CLOUD_NAME is required'),
-  CLOUDINARY_API_KEY: z.string().min(1, 'CLOUDINARY_API_KEY is required'),
-  CLOUDINARY_API_SECRET: z.string().min(1, 'CLOUDINARY_API_SECRET is required'),
+  // Cloudinary (legacy — no longer required when using external API)
+  CLOUDINARY_CLOUD_NAME: z.string().optional().default(''),
+  CLOUDINARY_API_KEY: z.string().optional().default(''),
+  CLOUDINARY_API_SECRET: z.string().optional().default(''),
+
+  // External API (ReportPortal-style system for recording storage)
+  EXTERNAL_API_BASE_URL: z.string().default('https://reportsv1.best-quality.in'),
+  EXTERNAL_API_TOKEN: z.string().default(''),
+  EXTERNAL_PROJECT_ID: z.string().default('1'),
+  EXTERNAL_API_USERNAME: z.string().default(''),
+  EXTERNAL_API_PASSWORD: z.string().default(''),
 
   // CORS
   CORS_ORIGIN: z.string().default('http://localhost:3000'),
@@ -110,6 +117,13 @@ export const config = {
     cloudName: env.CLOUDINARY_CLOUD_NAME,
     apiKey: env.CLOUDINARY_API_KEY,
     apiSecret: env.CLOUDINARY_API_SECRET,
+  },
+  externalApi: {
+    baseUrl: env.EXTERNAL_API_BASE_URL,
+    token: env.EXTERNAL_API_TOKEN,
+    projectId: env.EXTERNAL_PROJECT_ID,
+    username: env.EXTERNAL_API_USERNAME,
+    password: env.EXTERNAL_API_PASSWORD,
   },
   cors: {
     origins: env.CORS_ORIGIN.split(',').map((o) => o.trim()),
