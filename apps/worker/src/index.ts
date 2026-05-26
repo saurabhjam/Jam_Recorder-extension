@@ -1,4 +1,13 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import path from 'path';
+// Branch-aware env loading — same convention as backend config/index.ts
+const appEnv = process.env.APP_ENV;
+if (appEnv) {
+  // .env.<env>.local takes highest priority, then .env.<env>
+  dotenv.config({ path: path.resolve(process.cwd(), `.env.${appEnv}.local`) });
+  dotenv.config({ path: path.resolve(process.cwd(), `.env.${appEnv}`) });
+}
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 import http from 'http';
 import { promises as fs } from 'fs';
 import type { Worker } from 'bullmq';

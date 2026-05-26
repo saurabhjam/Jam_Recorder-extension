@@ -2,7 +2,19 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import path from 'path';
 
-// Load .env file
+// ─── Branch-aware env loading ─────────────────────────────────────────────
+// Set APP_ENV to select which local env file to load:
+//   APP_ENV=portal  → .env.portal.local   (portalDB branch)
+//   APP_ENV=test    → .env.test.local
+//   APP_ENV=patient → .env.patient.local
+//   APP_ENV=doctor  → .env.doctor.local
+// Falls back to plain .env for backward compatibility.
+const appEnv = process.env.APP_ENV;
+if (appEnv) {
+  // .env.<env>.local takes highest priority, then .env.<env>
+  dotenv.config({ path: path.resolve(process.cwd(), `.env.${appEnv}.local`) });
+  dotenv.config({ path: path.resolve(process.cwd(), `.env.${appEnv}`) });
+}
 dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 const envSchema = z.object({

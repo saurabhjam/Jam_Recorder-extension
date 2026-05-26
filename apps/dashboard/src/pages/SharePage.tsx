@@ -35,7 +35,13 @@ import toast from 'react-hot-toast';
 import { VideoPlayer } from '@components/VideoPlayer';
 import { Button } from '@components/ui/Button';
 import { Badge } from '@components/ui/Badge';
-import { useSharedRecording, useComments, useCreateComment } from '@hooks/useRecordings';
+import {
+  useSharedRecording,
+  useComments,
+  useCreateComment,
+  useReactions,
+  useToggleReaction,
+} from '@hooks/useRecordings';
 import { api } from '@services/api';
 import {
   formatDate,
@@ -576,9 +582,14 @@ export default function SharePage() {
   const { data: recording, isLoading, isFetching, error } = useSharedRecording(token ?? '');
   const { data: comments } = useComments(recording?.id ?? '');
   const { mutate: createComment, isPending: commenting } = useCreateComment(recording?.id ?? '');
+  const { data: reactionData } = useReactions(recording?.id ?? '');
+  const { mutate: toggleReaction } = useToggleReaction(recording?.id ?? '');
 
   const [commentText, setCommentText] = useState('');
-  const [activeReaction, setActiveReaction] = useState<string | null>(null);
+  const [guestName, setGuestName] = useState(
+    () => localStorage.getItem('snaptrace_guest_name') ?? '',
+  );
+  const isLoggedIn = !!localStorage.getItem('snaptrace_access_token');
   const [currentTime, setCurrentTime] = useState(0);
   const [activeTab, setActiveTab] = useState<RightTab>('info');
 
@@ -608,10 +619,21 @@ export default function SharePage() {
   const handleComment = (e: React.FormEvent) => {
     e.preventDefault();
     if (!commentText.trim()) return;
+    if (!isLoggedIn && !guestName.trim()) return;
+    if (!isLoggedIn) localStorage.setItem('snaptrace_guest_name', guestName.trim());
     createComment(
-      { content: commentText.trim(), timestamp: Math.floor(currentTime) },
+      {
+        content: commentText.trim(),
+        timestamp: Math.floor(currentTime),
+        ...(!isLoggedIn ? { guestName: guestName.trim() } : {}),
+      },
       { onSuccess: () => setCommentText('') },
     );
+  };
+
+  const handleReaction = (emoji: string) => {
+    if (!recording?.id) return;
+    toggleReaction(emoji);
   };
 
   // Seek video from panel tab interactions
@@ -820,21 +842,26 @@ export default function SharePage() {
 
             {/* Reactions */}
             <div className="flex items-center gap-1.5 flex-wrap">
-              {REACTIONS.map((r) => (
-                <button
-                  key={r.emoji}
-                  onClick={() => setActiveReaction(activeReaction === r.emoji ? null : r.emoji)}
-                  className={cn(
-                    'flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-sm transition-all border',
-                    activeReaction === r.emoji
-                      ? 'bg-violet-600/20 border-violet-500/30 text-violet-300'
-                      : 'bg-white/[0.04] border-white/[0.06] text-gray-400 hover:bg-white/[0.08] hover:text-gray-200',
-                  )}
-                  title={r.label}
-                >
-                  {r.emoji}
-                </button>
-              ))}
+              {REACTIONS.map((r) => {
+                const isActive = reactionData?.mine?.includes(r.emoji) ?? false;
+                const count = reactionData?.counts?.[r.emoji] ?? 0;
+                return (
+                  <button
+                    key={r.emoji}
+                    onClick={() => handleReaction(r.emoji)}
+                    className={cn(
+                      'flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-sm transition-all border',
+                      isActive
+                        ? 'bg-violet-600/20 border-violet-500/30 text-violet-300'
+                        : 'bg-white/[0.04] border-white/[0.06] text-gray-400 hover:bg-white/[0.08] hover:text-gray-200',
+                    )}
+                    title={r.label}
+                  >
+                    {r.emoji}
+                    {count > 0 && <span className="text-xs font-semibold ml-0.5">{count}</span>}
+                  </button>
+                );
+              })}
             </div>
 
             {/* Divider */}
@@ -850,22 +877,33 @@ export default function SharePage() {
               </div>
 
               {/* Comment input */}
-              <form onSubmit={handleComment} className="flex gap-2">
-                <input
-                  value={commentText}
-                  onChange={(e) => setCommentText(e.target.value)}
-                  placeholder="Add a comment…"
-                  className="input-base flex-1 text-sm"
-                />
-                <Button
-                  type="submit"
-                  size="md"
-                  disabled={!commentText.trim()}
-                  loading={commenting}
-                  leftIcon={<Send className="h-3.5 w-3.5" />}
-                >
-                  Send
-                </Button>
+              <form onSubmit={handleComment} className="flex flex-col gap-2">
+                {!isLoggedIn && (
+                  <input
+                    value={guestName}
+                    onChange={(e) => setGuestName(e.target.value)}
+                    placeholder="Your name (required)"
+                    className="input-base text-sm"
+                    maxLength={100}
+                  />
+                )}
+                <div className="flex gap-2">
+                  <input
+                    value={commentText}
+                    onChange={(e) => setCommentText(e.target.value)}
+                    placeholder="Add a comment…"
+                    className="input-base flex-1 text-sm"
+                  />
+                  <Button
+                    type="submit"
+                    size="md"
+                    disabled={!commentText.trim() || (!isLoggedIn && !guestName.trim())}
+                    loading={commenting}
+                    leftIcon={<Send className="h-3.5 w-3.5" />}
+                  >
+                    Send
+                  </Button>
+                </div>
               </form>
 
               {/* Comment list */}
@@ -874,12 +912,12 @@ export default function SharePage() {
                   {comments.map((c) => (
                     <div key={c.id} className="flex gap-3">
                       <div className="h-7 w-7 rounded-full bg-gradient-to-br from-violet-600 to-blue-500 flex items-center justify-center text-xs font-semibold text-white flex-shrink-0">
-                        {c.user ? getInitials(c.user.name) : '?'}
+                        {c.user ? getInitials(c.user.name) : getInitials(c.guestName ?? 'G')}
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-0.5 flex-wrap">
                           <p className="text-xs font-medium text-gray-300">
-                            {c.user?.name ?? 'Anonymous'}
+                            {c.user?.name ?? c.guestName ?? 'Guest'}
                           </p>
                           {c.timestamp != null && (
                             <Badge variant="default" size="sm">

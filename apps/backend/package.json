@@ -5,6 +5,11 @@
   "type": "commonjs",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only --exit-child src/index.ts",
+    "dev:portaldb": "APP_ENV=portaldb ts-node-dev --respawn --transpile-only --exit-child src/index.ts",
+    "dev:portal": "APP_ENV=portal ts-node-dev --respawn --transpile-only --exit-child src/index.ts",
+    "dev:test": "APP_ENV=test ts-node-dev --respawn --transpile-only --exit-child src/index.ts",
+    "dev:patient": "APP_ENV=patient ts-node-dev --respawn --transpile-only --exit-child src/index.ts",
+    "dev:doctor": "APP_ENV=doctor ts-node-dev --respawn --transpile-only --exit-child src/index.ts",
     "build": "tsc --project tsconfig.json",
     "start": "node dist/index.js",
     "migrate": "prisma migrate deploy",

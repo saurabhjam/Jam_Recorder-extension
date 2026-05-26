@@ -32,7 +32,6 @@ export class ExternalApiClient {
   private readonly baseUrl: string;
   private readonly username: string;
   private readonly password: string;
-  private readonly projectId: string;
 
   // In-memory token state (survives the process lifetime — refreshed on demand)
   private accessToken: string;
@@ -42,7 +41,6 @@ export class ExternalApiClient {
     this.baseUrl = config.externalApi.baseUrl;
     this.username = config.externalApi.username;
     this.password = config.externalApi.password;
-    this.projectId = config.externalApi.projectId;
     this.accessToken = config.externalApi.token;
     this.tokenExpiresAt = this.parseExpiry(this.accessToken);
   }
@@ -139,6 +137,17 @@ export class ExternalApiClient {
   // ─── Public API ────────────────────────────────────────────────────────────
 
   /**
+   * Fetch a file from the external API with auth — used by the stream proxy.
+   * Forwards Range headers for video seeking support.
+   */
+  async fetchFile(url: string, rangeHeader?: string): Promise<Response> {
+    await this.ensureToken();
+    const headers: Record<string, string> = { ...this.authHeaders() };
+    if (rangeHeader) headers['Range'] = rangeHeader;
+    return this.fetchWithRetry(url, { headers });
+  }
+
+  /**
    * Upload a video/image file and return its accessible URL.
    * POST /api/v1/superadmin_personal/files/upload
    */
@@ -165,15 +174,23 @@ export class ExternalApiClient {
       throw new Error(`File upload failed (${res.status}): ${text}`);
     }
 
-    const data = (await res.json()) as {
-      id?: string;
-      fileId?: string;
-      filename?: string;
-      url?: string;
-    };
-
-    if (data.url) return data.url;
-    const fileRef = data.id ?? data.fileId ?? data.filename ?? filename;
+    const text = await res.text();
+    // API returns either a plain JSON string (the stored filename) or an object
+    let fileRef: string;
+    try {
+      const parsed = JSON.parse(text) as
+        | string
+        | { id?: string; fileId?: string; filename?: string; url?: string };
+      if (typeof parsed === 'string') {
+        fileRef = parsed;
+      } else if (parsed.url) {
+        return parsed.url;
+      } else {
+        fileRef = parsed.id ?? parsed.fileId ?? parsed.filename ?? filename;
+      }
+    } catch {
+      fileRef = text.trim() || filename;
+    }
     return `${this.baseUrl}/api/v1/superadmin_personal/files/${fileRef}`;
   }
 

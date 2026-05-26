@@ -330,7 +330,8 @@ export interface RecordingAnalytics {
 export interface Comment {
   id: string;
   recordingId: string;
-  userId: string;
+  userId: string | null;
+  guestName: string | null;
   content: string;
   timestamp: number | null;
   parentId: string | null;
@@ -344,6 +345,12 @@ export interface CreateCommentRequest {
   content: string;
   timestamp?: number;
   parentId?: string;
+  guestName?: string;
+}
+
+export interface ReactionCounts {
+  counts: Record<string, number>;
+  mine: string[];
 }
 
 export interface UpdateCommentRequest {

@@ -11,6 +11,7 @@ import {
 import { queueAnalyticsEvent, videoProcessingQueue, queueVideoProcessing } from '../queues';
 import { generateVisitorId } from '../utils/crypto';
 import { prisma } from '../lib/prisma';
+import { externalApi } from '../lib/external-api';
 
 const router = Router();
 
@@ -88,11 +89,67 @@ async function servePublicRecording(
       referer: req.get('Referer'),
     }).catch((err) => console.error('Failed to queue analytics:', err));
 
-    res.json({ success: true, data: recording });
+    // Increment view count and bust the public cache so the next viewer sees the updated count
+    recordingService
+      .incrementViewCount(recording.id, shareId)
+      .catch((err) => console.error('Failed to increment view count:', err));
+
+    // Replace external URL with our stream proxy so the browser doesn't need auth
+    const streamUrl = `${req.protocol}://${req.get('host')}/api/recordings/stream/${shareId}`;
+    res.json({
+      success: true,
+      data: { ...recording, url: streamUrl, viewCount: recording.viewCount + 1 },
+    });
   } catch (error) {
     next(error);
   }
 }
+
+// ============================================================
+// GET /recordings/stream/:shareId — Proxy video from external API (no auth required from browser)
+// ============================================================
+router.get(
+  '/stream/:shareId',
+  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const recording = await prisma.recording.findUnique({
+        where: { shareId: req.params['shareId']! },
+        select: { url: true, mimeType: true },
+      });
+
+      if (!recording?.url) {
+        res.status(404).json({ success: false, message: 'Recording not found' });
+        return;
+      }
+
+      const rangeHeader = req.headers['range'];
+      const upstream = await externalApi.fetchFile(recording.url, rangeHeader);
+
+      const baseMimeType = (recording.mimeType ?? 'video/webm').split(';')[0]!.trim();
+      res.setHeader('Content-Type', baseMimeType);
+      res.setHeader('Accept-Ranges', 'bytes');
+
+      const contentLength = upstream.headers.get('content-length');
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+
+      const contentRange = upstream.headers.get('content-range');
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+
+      res.status(upstream.status);
+
+      if (!upstream.body) {
+        res.end();
+        return;
+      }
+
+      // Pipe the upstream response body to the client
+      const { Readable } = await import('stream');
+      Readable.fromWeb(upstream.body as import('stream/web').ReadableStream).pipe(res);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 // GET /recordings/share/:shareId — used by dashboard
 router.get('/share/:shareId', optionalAuth, (req, res, next) => {

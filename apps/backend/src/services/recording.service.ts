@@ -162,13 +162,16 @@ export class RecordingService {
   /**
    * Atomically increment view count.
    */
-  async incrementViewCount(id: string): Promise<void> {
+  async incrementViewCount(id: string, shareId?: string): Promise<void> {
     await prisma.recording.update({
       where: { id },
       data: { viewCount: { increment: 1 } },
     });
-    // Invalidate cache so next read gets fresh data
-    await cacheDel(cacheKeys.recording(id));
+    // Invalidate both private and public cache keys
+    await Promise.all([
+      cacheDel(cacheKeys.recording(id)),
+      shareId ? cacheDel(cacheKeys.recordingPublic(shareId)) : Promise.resolve(),
+    ]);
   }
 
   /**

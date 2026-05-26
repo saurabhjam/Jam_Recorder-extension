@@ -42,7 +42,11 @@ export const createRecordingSchema = z.object({
       consoleLogs: z
         .array(
           z.object({
-            level: z.enum(['log', 'info', 'warn', 'error', 'debug']),
+            level: z.string().transform((v) => {
+              if (v === 'warning') return 'warn';
+              if (['log', 'info', 'warn', 'error', 'debug'].includes(v)) return v;
+              return 'log';
+            }),
             message: z.string(),
             timestamp: z.number(),
             url: z.string().optional(),
@@ -127,6 +131,7 @@ export const createCommentSchema = z.object({
     .trim(),
   timestamp: z.number().min(0).optional().nullable(),
   parentId: z.string().cuid('Invalid parent comment ID').optional().nullable(),
+  guestName: z.string().max(100).trim().optional(),
 });
 
 export const updateCommentSchema = z.object({

@@ -9,10 +9,10 @@ const API_BASE_URL: string = (() => {
   try {
     return (
       (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ??
-      'http://localhost:3000/api'
+      'http://localhost:4000/api'
     );
   } catch {
-    return 'http://localhost:3000/api';
+    return 'http://localhost:4000/api';
   }
 })();
 

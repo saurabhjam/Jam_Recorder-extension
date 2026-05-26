@@ -4,6 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "vite --port 3001",
+    "dev:portaldb": "vite --port 3001 --mode portaldb",
+    "dev:portal": "vite --port 3001 --mode portal",
+    "dev:test": "vite --port 3001 --mode test",
+    "dev:patient": "vite --port 3001 --mode patient",
+    "dev:doctor": "vite --port 3001 --mode doctor",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "lint": "eslint src --ext ts,tsx"

@@ -59,6 +59,7 @@ model User {
   recordings           Recording[]
   sessions             Session[]
   comments             Comment[]
+  reactions            Reaction[]
   notifications        Notification[]
   activityLogs         ActivityLog[]
   passwordResets       PasswordReset[]
@@ -142,6 +143,7 @@ model Recording {
   shareLinks    ShareLink[]
   comments      Comment[]
   analytics     Analytics[]
+  reactions     Reaction[]
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
 
@@ -187,10 +189,11 @@ model Comment {
   id          String    @id @default(cuid())
   recordingId String
   recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
-  userId      String
-  user        User      @relation(fields: [userId], references: [id])
+  userId      String?
+  user        User?     @relation(fields: [userId], references: [id])
+  guestName   String?
   content     String
-  timestamp   Float? // video timestamp in seconds
+  timestamp   Float?
   parentId    String?
   parent      Comment?  @relation("Replies", fields: [parentId], references: [id])
   replies     Comment[] @relation("Replies")
@@ -200,6 +203,21 @@ model Comment {
   @@index([recordingId])
   @@index([userId])
   @@index([parentId])
+}
+
+model Reaction {
+  id          String    @id @default(cuid())
+  recordingId String
+  recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
+  userId      String?
+  user        User?     @relation(fields: [userId], references: [id])
+  visitorId   String?
+  emoji       String
+  createdAt   DateTime  @default(now())
+
+  @@unique([recordingId, userId, emoji])
+  @@unique([recordingId, visitorId, emoji])
+  @@index([recordingId])
 }
 
 model Analytics {

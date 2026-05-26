@@ -299,9 +299,11 @@ export class UploadService {
         consoleLogs: consoleLogsStr,
         networkLogs: networkLogsStr,
       });
-      shareUrl = result.shareUrl;
       externalId = result.id;
-      console.log(`[UPLOAD] record created in external portal: ${shareUrl}`);
+      // Always serve via our own share page — not the external portal's blank UI
+      shareUrl = `${config.server.frontendUrl}/share/${recording.shareId}`;
+      console.log(`[UPLOAD] record created in external portal: ${result.shareUrl}`);
+      console.log(`[UPLOAD] share URL: ${shareUrl}`);
     } catch (err) {
       console.error('[UPLOAD] external record creation failed:', err);
       throw new AppError(

@@ -4,6 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "vite build --watch --mode development",
+    "dev:portaldb": "vite build --watch --mode portaldb",
+    "dev:portal": "vite build --watch --mode portal",
+    "dev:test": "vite build --watch --mode test",
+    "dev:patient": "vite build --watch --mode patient",
+    "dev:doctor": "vite build --watch --mode doctor",
     "build": "vite build",
     "build:prod": "vite build --mode production",
     "type-check": "tsc --noEmit",

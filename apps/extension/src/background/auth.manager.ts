@@ -18,9 +18,9 @@ import { STORAGE_KEYS, AUTH_REFRESH_ALARM } from '@/types';
 const API_BASE_URL: string = (() => {
   try {
     const env = (import.meta as { env?: Record<string, string> }).env;
-    return env?.['VITE_API_BASE_URL'] ?? 'http://localhost:3000/api';
+    return env?.['VITE_API_BASE_URL'] ?? 'http://localhost:4000/api';
   } catch {
-    return 'http://localhost:3000/api';
+    return 'http://localhost:4000/api';
   }
 })();
 

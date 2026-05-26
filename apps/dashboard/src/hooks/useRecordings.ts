@@ -10,6 +10,7 @@ export const recordingKeys = {
   detail: (id: string) => [...recordingKeys.all, 'detail', id] as const,
   share: (shareId: string) => [...recordingKeys.all, 'share', shareId] as const,
   comments: (id: string) => [...recordingKeys.all, 'comments', id] as const,
+  reactions: (id: string) => [...recordingKeys.all, 'reactions', id] as const,
 };
 
 /** Fetch paginated recordings */
@@ -112,6 +113,27 @@ export function useDeleteComment(recordingId: string) {
     mutationFn: (commentId: string) => api.deleteComment(recordingId, commentId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: recordingKeys.comments(recordingId) });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+}
+
+/** Fetch reaction counts + which ones the viewer has active */
+export function useReactions(recordingId: string) {
+  return useQuery({
+    queryKey: recordingKeys.reactions(recordingId),
+    queryFn: () => api.getReactions(recordingId),
+    enabled: !!recordingId,
+  });
+}
+
+/** Toggle a reaction on/off */
+export function useToggleReaction(recordingId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (emoji: string) => api.toggleReaction(recordingId, emoji),
+    onSuccess: (data) => {
+      qc.setQueryData(recordingKeys.reactions(recordingId), data);
     },
     onError: (err: Error) => toast.error(err.message),
   });

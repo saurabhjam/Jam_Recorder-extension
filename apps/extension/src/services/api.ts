@@ -19,14 +19,12 @@ import type {
 import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
 
 // ─── Base URL ─────────────────────────────────────────────────────────────────
-// Backend runs on port 3000.  Override via VITE_API_BASE_URL env var.
-
 const API_BASE_URL: string = (() => {
   try {
     const fromEnv = (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'];
-    return fromEnv ?? 'http://localhost:3000/api';
+    return fromEnv ?? 'http://localhost:4000/api';
   } catch {
-    return 'http://localhost:3000/api';
+    return 'http://localhost:4000/api';
   }
 })();
 

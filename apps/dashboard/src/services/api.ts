@@ -352,6 +352,21 @@ class ApiService {
     await this.delete(`/recordings/${recordingId}/comments/${commentId}`);
   }
 
+  // ─── Reactions ────────────────────────────────────────────────────────────
+
+  async getReactions(
+    recordingId: string,
+  ): Promise<{ counts: Record<string, number>; mine: string[] }> {
+    return this.get(`/recordings/${recordingId}/reactions`);
+  }
+
+  async toggleReaction(
+    recordingId: string,
+    emoji: string,
+  ): Promise<{ counts: Record<string, number>; mine: string[] }> {
+    return this.post(`/recordings/${recordingId}/reactions`, { emoji });
+  }
+
   // ─── Notifications ────────────────────────────────────────────────────────
 
   async getNotifications(): Promise<Notification[]> {

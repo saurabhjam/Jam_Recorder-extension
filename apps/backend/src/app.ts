@@ -18,6 +18,7 @@ import uploadsRoutes from './routes/uploads';
 import sharesRoutes from './routes/shares';
 import teamsRoutes from './routes/teams';
 import commentsRoutes from './routes/comments';
+import reactionsRoutes from './routes/reactions';
 
 const API_PREFIX = '/api';
 
@@ -115,6 +116,7 @@ export function createApp(): Application {
   app.use(`${API_PREFIX}/auth`, authRoutes);
   app.use(`${API_PREFIX}/recordings`, recordingsRoutes);
   app.use(`${API_PREFIX}/recordings/:id/comments`, commentsRoutes);
+  app.use(`${API_PREFIX}/recordings/:id/reactions`, reactionsRoutes);
   app.use(`${API_PREFIX}/uploads`, uploadsRoutes);
   app.use(`${API_PREFIX}/shares`, sharesRoutes);
   app.use(`${API_PREFIX}/teams`, teamsRoutes);

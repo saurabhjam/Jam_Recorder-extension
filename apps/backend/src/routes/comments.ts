@@ -2,10 +2,11 @@ import { Router, type Request, type Response, type NextFunction } from 'express'
 
 import { prisma } from '../lib/prisma';
 import { broadcastNewComment } from '../lib/socket';
-import { requireAuth } from '../middleware/auth';
+import { requireAuth, optionalAuth } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { AppError } from '../middleware/errorHandler';
 import { createCommentSchema, updateCommentSchema } from '../schemas/recording.schema';
+import { generateVisitorId } from '../utils/crypto';
 
 const router = Router({ mergeParams: true });
 
@@ -66,19 +67,20 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
 });
 
 // ============================================================
-// POST /recordings/:id/comments — Create a comment
+// POST /recordings/:id/comments — Create a comment (auth optional — guests allowed)
 // ============================================================
 router.post(
   '/',
-  requireAuth,
+  optionalAuth,
   validate(createCommentSchema),
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const recordingId = req.params['id']!;
-      const { content, timestamp, parentId } = req.body as {
+      const { content, timestamp, parentId, guestName } = req.body as {
         content: string;
         timestamp?: number | null;
         parentId?: string | null;
+        guestName?: string;
       };
 
       // Verify recording exists
@@ -91,9 +93,15 @@ router.post(
         throw new AppError('Recording not found', 404, 'NOT_FOUND');
       }
 
-      // Allow comments from owner or public viewers
-      if (!recording.isPublic && recording.userId !== req.user!.id) {
+      // Private recordings: only the owner can comment
+      const userId = (req.user as { id: string } | undefined)?.id ?? null;
+      if (!recording.isPublic && recording.userId !== userId) {
         throw new AppError('Cannot comment on this recording', 403, 'FORBIDDEN');
+      }
+
+      // Guests on public recordings must provide a name
+      if (!userId && (!guestName || !guestName.trim())) {
+        throw new AppError('Please provide your name to comment', 400, 'GUEST_NAME_REQUIRED');
       }
 
       // Validate parent comment if provided
@@ -111,7 +119,8 @@ router.post(
       const comment = await prisma.comment.create({
         data: {
           recordingId,
-          userId: req.user!.id,
+          userId: userId ?? null,
+          guestName: userId ? null : (guestName?.trim() ?? 'Guest'),
           content,
           timestamp: timestamp ?? null,
           parentId: parentId ?? null,

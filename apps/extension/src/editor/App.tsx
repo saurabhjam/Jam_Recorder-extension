@@ -364,7 +364,8 @@ export function EditorApp() {
   return (
     <div
       style={{
-        minHeight: '100vh',
+        height: '100vh',
+        overflow: 'hidden',
         background: '#0a0a0f',
         fontFamily: "'Inter', -apple-system, sans-serif",
         color: 'white',
@@ -436,6 +437,7 @@ export function EditorApp() {
       <div
         style={{
           flex: 1,
+          minHeight: 0,
           display: 'grid',
           gridTemplateColumns: '1fr 420px',
           gap: '20px',
@@ -444,10 +446,20 @@ export function EditorApp() {
           width: '100%',
           margin: '0 auto',
           boxSizing: 'border-box',
+          overflow: 'hidden',
         }}
       >
         {/* ── Left: Player + Trim + Fields ── */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '16px',
+            overflowY: 'auto',
+            minHeight: 0,
+            paddingRight: '4px',
+          }}
+        >
           {/* Video player */}
           <div
             style={{
@@ -740,6 +752,8 @@ export function EditorApp() {
             borderRadius: '16px',
             border: '1px solid rgba(255,255,255,0.08)',
             overflow: 'hidden',
+            minHeight: 0,
+            height: '100%',
           }}
         >
           {/* Tab bar */}
@@ -802,7 +816,7 @@ export function EditorApp() {
           </div>
 
           {/* Log entries */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
+          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '8px 0' }}>
             <AnimatePresence mode="wait">
               {activeTab === 'console' && (
                 <motion.div

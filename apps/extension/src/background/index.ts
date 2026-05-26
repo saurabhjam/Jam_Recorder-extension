@@ -1048,8 +1048,8 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
           await chrome.windows.create({
             url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),
             type: 'popup',
-            width: 960,
-            height: 680,
+            width: 1200,
+            height: 800,
             focused: true,
           });
           // Upload is now editor-triggered — offscreen has no more work to do
@@ -1184,7 +1184,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Watches for the OAuth callback URL, extracts tokens, fetches the user profile,
 // stores everything in extension storage, and closes the OAuth tab.
 
-const API_BASE_FOR_OAUTH = 'http://localhost:3000/api';
+const API_BASE_FOR_OAUTH = (() => {
+  try {
+    return (
+      (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ??
+      'http://localhost:4000/api'
+    );
+  } catch {
+    return 'http://localhost:4000/api';
+  }
+})();
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!changeInfo.url) return;
