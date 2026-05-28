@@ -283,7 +283,7 @@ function ConsoleTab({ logs, onSeek }: { logs: ConsoleLogs[]; onSeek: (t: number)
       </div>
 
       {/* Log list */}
-      <div className="flex-1 overflow-y-auto font-mono text-xs">
+      <div className="flex-1 min-h-0 overflow-y-auto font-mono text-xs">
         {filtered.length === 0 ? (
           <EmptyState label="No matching logs" />
         ) : (
@@ -353,7 +353,7 @@ function NetworkTab({ logs, onSeek }: { logs: NetworkLog[]; onSeek: (t: number) 
       </div>
 
       {/* Rows */}
-      <div className="flex-1 overflow-y-auto text-xs">
+      <div className="flex-1 min-h-0 overflow-y-auto text-xs">
         {filtered.length === 0 ? (
           <EmptyState label="No matching requests" />
         ) : (
@@ -486,7 +486,7 @@ function ActionsTab({ logs, onSeek }: { logs: ConsoleLogs[]; onSeek: (t: number)
   if (!actions.length) return <EmptyState label="No user actions captured" />;
 
   return (
-    <div className="flex-1 overflow-y-auto p-3 space-y-1">
+    <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-1">
       {actions.map((a, i) => (
         <div
           key={i}
@@ -529,7 +529,7 @@ function BackendTab({ logs, onSeek }: { logs: ConsoleLogs[]; onSeek: (t: number)
   if (!serverLogs.length) return <EmptyState label="No backend logs captured" />;
 
   return (
-    <div className="flex-1 overflow-y-auto font-mono text-xs">
+    <div className="flex-1 min-h-0 overflow-y-auto font-mono text-xs">
       {serverLogs.map((log, i) => (
         <div
           key={i}
