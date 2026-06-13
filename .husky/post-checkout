@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# $3 = 1 means branch checkout (not file checkout)
+if [ "$3" = "1" ]; then
+  sh "$(dirname "$0")/../scripts/switch-env.sh"
+fi

@@ -7,7 +7,7 @@ import { Input } from '@components/ui/Input';
 import { useAuth } from '@hooks/useAuth';
 
 const BACKEND_URL =
-  (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'http://localhost:3000';
+  (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'http://localhost:4000';
 
 function GoogleIcon() {
   return (

@@ -1104,61 +1104,133 @@ Authorization: Bearer <accessToken>
 
 ## Complete Setup Guide — New Laptop / New Device
 
-### Prerequisites — Install These First
-
-| Tool               | Version | Install                                        |
-| ------------------ | ------- | ---------------------------------------------- |
-| **Node.js**        | >= 18   | [nodejs.org](https://nodejs.org)               |
-| **pnpm**           | 8.15.0  | `npm install -g pnpm@8.15.0`                   |
-| **Docker Desktop** | latest  | [docker.com](https://www.docker.com)           |
-| **Git**            | any     | pre-installed on Mac / `brew install git`      |
-| **Google Chrome**  | latest  | [chrome.google.com](https://chrome.google.com) |
+> **Branch this guide targets:** `v2version`
+> Follow every step in order. Do not skip steps.
 
 ---
 
-### Step 1 — Clone the Repo
+### 1. Prerequisites — Install These First
+
+| Tool               | Version | macOS Install Command                                                                                                     |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **Homebrew**       | any     | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`                         |
+| **Git**            | any     | pre-installed on macOS / `brew install git`                                                                               |
+| **Node.js**        | >= 18   | `brew install node@18` then `brew link node@18`                                                                           |
+| **pnpm**           | 8.15.0  | `npm install -g pnpm@8.15.0`                                                                                              |
+| **Docker Desktop** | latest  | Download from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) and run the installer |
+| **Google Chrome**  | latest  | Download from [chrome.google.com](https://www.google.com/chrome/)                                                         |
+
+Verify all tools are installed:
 
 ```bash
-git clone <your-repo-url>
-cd Jam_Recorder-extension
+node --version        # should print v18.x.x or higher
+pnpm --version        # should print 8.15.0
+docker --version      # should print Docker version 24+
+git --version         # should print git version 2.x
 ```
 
 ---
 
-### Step 2 — Create Environment Files
+### 2. Clone the Repository
 
-**`apps/backend/.env`** — create this file with exactly this content:
+```bash
+git clone <your-repo-url>
+cd Jam_Recorder-extension
+git checkout v2version
+```
+
+> After `git checkout v2version`, if husky is already set up from a prior `pnpm install`, the `post-checkout` hook will auto-run `switch-env.sh` and copy the correct `.env` files. On a fresh clone it won't fire yet — you'll do that in Step 4.
+
+---
+
+### 3. Create Branch-Specific Environment Files
+
+`.env.*.local` files are **gitignored** — they are never committed to the repo and must be created manually on every new machine. These files hold all real secrets for the `v2version` branch.
+
+Create each file below exactly as shown.
+
+---
+
+#### `apps/backend/.env.v2version.local`
 
 ```env
+# ============================================================
+# Server Configuration
+# ============================================================
 PORT=4000
 NODE_ENV=development
+
+# ============================================================
+# Database
+# ============================================================
 DATABASE_URL="postgresql://jam:jampassword@localhost:5432/jamdb"
+
+# ============================================================
+# Redis
+# ============================================================
 REDIS_URL="redis://:redis-password@localhost:6379"
 REDIS_PASSWORD="redis-password"
+
+# ============================================================
+# JWT Authentication
+# ============================================================
 JWT_SECRET="Lfh2gxxTi7KioxVBVxg7NzoKluc16_q82LrMpI3m-hmQf6M5f2AjOG4EfbCuUOuU"
 JWT_REFRESH_SECRET="hwDM8GdXBCGyYFyeRtT7ZOsW-HYIBlhJh6I5PPvnTC4DjQOpm84DkIUUfMghKNr6"
 JWT_EXPIRES_IN="30m"
 JWT_REFRESH_EXPIRES_IN="10d"
-EXTERNAL_API_BASE_URL="http://localhost:3000"
+
+# ============================================================
+# External Storage + Task API (ReportPortal — live hosted instance)
+# No local installation needed for v2version.
+# ============================================================
+EXTERNAL_API_BASE_URL="https://reportsv1.best-quality.in"
 EXTERNAL_API_TOKEN=""
 EXTERNAL_API_USERNAME="superadmin"
-EXTERNAL_API_PASSWORD="your-portal-password"
+EXTERNAL_API_PASSWORD="BestQ@2026"
 EXTERNAL_PROJECT_ID=""
 EXTERNAL_TASK_LABEL="Screen Recording"
 EXTERNAL_TASK_PRIORITY="P0"
+
+# ============================================================
+# Cloudinary (legacy — not used in upload flow)
+# ============================================================
 CLOUDINARY_CLOUD_NAME=""
 CLOUDINARY_API_KEY=""
 CLOUDINARY_API_SECRET=""
+
+# ============================================================
+# CORS & Security
+# ============================================================
 CORS_ORIGIN="http://localhost:3000,http://localhost:3001,chrome-extension://ndaeclgbabnjjcmffjdibmbkndiakkne"
 RATE_LIMIT_WINDOW=900000
 RATE_LIMIT_MAX=100
+
+# ============================================================
+# Auth Configuration
+# ============================================================
 BCRYPT_ROUNDS=12
+
+# ============================================================
+# Upload Configuration
+# ============================================================
 UPLOAD_MAX_SIZE=5368709120
 CHUNK_SIZE=5242880
+
+# ============================================================
+# Frontend URL
+# ============================================================
 FRONTEND_URL="http://localhost:3001"
+
+# ============================================================
+# Google OAuth 2.0
+# ============================================================
 GOOGLE_CLIENT_ID="your-google-client-id.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET="your-google-client-secret"
 GOOGLE_CALLBACK_URL="http://localhost:4000/api/auth/google/callback"
+
+# ============================================================
+# Email (SMTP)
+# ============================================================
 SMTP_HOST="smtp.gmail.com"
 SMTP_PORT=587
 SMTP_USER="your-email@gmail.com"
@@ -1166,7 +1238,9 @@ SMTP_PASS="your-gmail-app-password"
 EMAIL_FROM="noreply@snaptrace.app"
 ```
 
-**`apps/extension/.env`** — create this file:
+---
+
+#### `apps/extension/.env.v2version.local`
 
 ```env
 VITE_API_BASE_URL=http://localhost:4000/api
@@ -1176,62 +1250,117 @@ VITE_APP_VERSION=1.0.0
 
 ---
 
-### Step 3 — Install Dependencies
+#### `apps/dashboard/.env.v2version.local`
+
+```env
+VITE_API_BASE_URL=http://localhost:4000/api
+VITE_BACKEND_URL=http://localhost:4000
+```
+
+---
+
+### 4. Switch Env Files to `.env`
+
+The `switch-env` script reads the branch name (`v2version`) and copies each `.env.v2version.local` file to `.env` in every app directory. Run this once from the repo root:
+
+```bash
+pnpm run switch-env
+```
+
+Expected output:
+
+```
+[switch-env] Branch 'v2version' → using .env.v2version.local
+  copied apps/backend/.env.v2version.local → apps/backend/.env
+  copied apps/extension/.env.v2version.local → apps/extension/.env
+  copied apps/dashboard/.env.v2version.local → apps/dashboard/.env
+[switch-env] Done.
+```
+
+> **Automatic on future checkouts:** The `.husky/post-checkout` hook re-runs this script every time you `git checkout v2version`, so you only need to do this manually on the initial clone.
+
+---
+
+### 5. Install Node Modules
+
+Run this once from the repo root. pnpm workspaces installs dependencies for all apps at once:
 
 ```bash
 pnpm install
 ```
 
+This also sets up the Husky git hooks automatically (via the `prepare` script in `package.json`).
+
 ---
 
-### Step 4 — Start Docker (PostgreSQL + Redis)
+### 6. Start PostgreSQL + Redis via Docker
+
+Only the database and cache need to run locally. The video storage (ReportPortal) is a live hosted service — no local setup required.
 
 ```bash
 docker-compose up -d postgres redis
 ```
 
-Wait ~10 seconds for containers to be healthy, then verify:
+Wait ~15 seconds, then verify both containers are healthy:
 
 ```bash
 docker ps
 ```
 
-You should see `jam_postgres` and `jam_redis` both with status `Up`.
+You should see both `jam_postgres` and `jam_redis` with status `Up` and health `healthy`.
+
+To check Redis specifically:
+
+```bash
+docker exec jam_redis redis-cli -a redis-password ping
+# Expected: PONG
+```
+
+To check PostgreSQL:
+
+```bash
+docker exec jam_postgres pg_isready -U jam -d jamdb
+# Expected: /var/run/postgresql:5432 - accepting connections
+```
 
 ---
 
-### Step 5 — Run Database Migrations
+### 7. Run Database Migrations
+
+Apply all pending migrations to create the schema:
 
 ```bash
 cd apps/backend
 pnpm exec prisma migrate deploy
-cd ../..
 ```
 
-Expected output: `2 migrations found... No pending migrations to apply.`
+Expected output ends with: `All migrations have been successfully applied.`
 
 ---
 
-### Step 6 — Generate Prisma Client
+### 8. Generate the Prisma Client
+
+Generate the TypeScript database client from the schema:
 
 ```bash
-cd apps/backend
 pnpm exec prisma generate
 cd ../..
 ```
 
+Expected output ends with: `✔ Generated Prisma Client`.
+
 ---
 
-### Step 7 — Start the Backend
+### 9. Start the Backend (Terminal 1)
 
-Open a **new terminal** and keep it running:
+Open a **dedicated terminal**, leave it running:
 
 ```bash
 cd apps/backend
 pnpm dev
 ```
 
-Wait until you see:
+Wait until you see all three of these lines:
 
 ```
 [Redis] Connected
@@ -1239,58 +1368,198 @@ Wait until you see:
 Server started {"port":4000,"env":"development"}
 ```
 
+Quick health check:
+
+```bash
+curl http://localhost:4000/health
+# Expected: {"status":"ok"}
+```
+
 ---
 
-### Step 8 — Build the Extension
+### 10. Start the Dashboard (Terminal 2)
 
-Open another **new terminal**:
+Open a **second terminal**, leave it running:
+
+```bash
+cd apps/dashboard
+pnpm dev
+```
+
+Wait until you see:
+
+```
+  ➜  Local:   http://localhost:3001/
+```
+
+Open [http://localhost:3001](http://localhost:3001) in Chrome — you should see the login page.
+
+---
+
+### 11. Build the Extension (Terminal 3)
+
+Open a **third terminal**, leave it running (it watches for file changes):
 
 ```bash
 cd apps/extension
 pnpm dev
 ```
 
-Wait until you see: `✓ All steps completed.`
+The first build takes ~30 seconds. Wait until you see output like:
 
----
-
-### Step 9 — Load Extension in Chrome
-
-1. Open Chrome → go to `chrome://extensions`
-2. Toggle **Developer mode** ON (top right)
-3. Click **Load unpacked**
-4. Select this folder:
-   ```
-   <project-root>/apps/extension/dist
-   ```
-5. The **SnapTrace Recorder** icon appears in your toolbar
-
----
-
-### Step 10 — Verify Everything Works
-
-```bash
-# Should return {"success":false,"error":"INVALID_CREDENTIALS"...} — means backend is up
-curl -s -X POST http://localhost:4000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@test.com","password":"test"}'
+```
+✓ built in Xs
 ```
 
-Now open the extension → login with your credentials → it should work.
+The built extension is now in `apps/extension/dist/`.
 
 ---
 
-### What Runs Where
+### 12. Load the Extension into Chrome
 
-| Service              | Command                                                  | Port |
-| -------------------- | -------------------------------------------------------- | ---- |
-| PostgreSQL           | `docker-compose up -d postgres redis`                    | 5432 |
-| Redis                | same as above                                            | 6379 |
-| Backend API          | `cd apps/backend && pnpm dev`                            | 4000 |
-| Extension            | `cd apps/extension && pnpm dev` → load `dist/` in Chrome | —    |
-| Dashboard (optional) | `cd apps/dashboard && pnpm dev`                          | 3001 |
+1. Open Chrome and navigate to `chrome://extensions`
+2. Enable **Developer mode** (toggle in the top-right corner)
+3. Click **Load unpacked**
+4. In the file picker, navigate to and select:
+   ```
+   <repo-root>/apps/extension/dist
+   ```
+5. The **SnapTrace Recorder** icon appears in your Chrome toolbar
 
-> **Important:** Videos are stored in a **ReportPortal** instance at `EXTERNAL_API_BASE_URL` (`http://localhost:3000` by default). That service must also be running for recordings to upload and play back successfully.
+> If you already loaded the extension before and rebuilt it, click the **refresh** icon on the extension card in `chrome://extensions` to reload the latest build.
+
+---
+
+### 13. Verify the Full Setup
+
+**Check the backend is up:**
+
+```bash
+curl -s -X POST http://localhost:4000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@test.com","password":"wrongpassword"}' | python3 -m json.tool
+```
+
+Expected response (means backend + DB are both working):
+
+```json
+{
+  "success": false,
+  "error": "INVALID_CREDENTIALS",
+  "message": "Invalid email or password"
+}
+```
+
+**Check the extension:**
+
+1. Click the SnapTrace icon in Chrome toolbar
+2. The popup should load (not show an error page)
+3. Log in with your account credentials
+4. Try starting a tab recording — it should start without errors
+
+**Check the dashboard:**
+
+1. Open [http://localhost:3001](http://localhost:3001)
+2. Log in — you should see your recordings library
+
+---
+
+### 14. What Runs Where (Quick Reference)
+
+| Service      | How to Start                                             | Port / URL              | Required?                            |
+| ------------ | -------------------------------------------------------- | ----------------------- | ------------------------------------ |
+| PostgreSQL   | `docker-compose up -d postgres redis`                    | `localhost:5432`        | Yes                                  |
+| Redis        | (same command as above)                                  | `localhost:6379`        | Yes                                  |
+| Backend API  | `cd apps/backend && pnpm dev`                            | `http://localhost:4000` | Yes                                  |
+| Dashboard    | `cd apps/dashboard && pnpm dev`                          | `http://localhost:3001` | Yes (share page + recordings viewer) |
+| Extension    | `cd apps/extension && pnpm dev` → load `dist/` in Chrome | Chrome toolbar          | Yes                                  |
+| ReportPortal | **Hosted** at `https://reportsv1.best-quality.in`        | — (no local setup)      | Yes (video upload + playback)        |
+
+---
+
+### 15. Daily Workflow (after first setup)
+
+Every time you start work:
+
+```bash
+# 1. Start Docker services (if not already running)
+docker-compose up -d postgres redis
+
+# 2. Terminal 1 — Backend
+cd apps/backend && pnpm dev
+
+# 3. Terminal 2 — Dashboard
+cd apps/dashboard && pnpm dev
+
+# 4. Terminal 3 — Extension (auto-reloads on file changes)
+cd apps/extension && pnpm dev
+```
+
+Reload the extension in Chrome after any extension rebuild: go to `chrome://extensions` and click the refresh icon on the SnapTrace card.
+
+---
+
+### 16. Troubleshooting
+
+#### `pnpm install` fails with peer dependency errors
+
+```bash
+pnpm install --no-frozen-lockfile
+```
+
+#### Backend starts but immediately crashes
+
+Check that Docker containers are running:
+
+```bash
+docker ps
+```
+
+If `jam_postgres` or `jam_redis` are missing, start them: `docker-compose up -d postgres redis`
+
+Check backend logs for the actual error:
+
+```bash
+cd apps/backend && pnpm dev 2>&1 | head -40
+```
+
+#### `prisma migrate deploy` fails with "connection refused"
+
+PostgreSQL is not yet ready. Wait 15 more seconds and retry. You can also check:
+
+```bash
+docker logs jam_postgres | tail -20
+```
+
+#### Extension loads but popup shows blank / connection error
+
+- Make sure the backend is running on port 4000
+- Open `chrome://extensions`, find SnapTrace, click **Service Worker** → check for errors in the DevTools console
+- Verify `apps/extension/.env` exists and contains `VITE_API_BASE_URL=http://localhost:4000/api`
+
+#### Extension shows "This extension is not from the Chrome Web Store"
+
+This is expected in developer mode. Click **Keep it** or dismiss the warning. It appears every time Chrome restarts.
+
+#### `pnpm run switch-env` prints "No env override for branch"
+
+You are not on the `v2version` branch. Switch first:
+
+```bash
+git checkout v2version
+pnpm run switch-env
+```
+
+#### Recordings upload but video doesn't play on the share page
+
+The external ReportPortal service at `https://reportsv1.best-quality.in` must be reachable. Test from the machine:
+
+```bash
+curl -I https://reportsv1.best-quality.in
+# Expected: HTTP/2 200 or 302
+```
+
+If it times out, the hosted service is down. Contact the team.
 
 ---
 
