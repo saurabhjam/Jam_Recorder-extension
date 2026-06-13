@@ -126,12 +126,12 @@ export function HomeView({ onNavigate }: HomeViewProps) {
     }
   };
 
-  const handleScreenshot = async () => {
-    try {
-      await takeScreenshot();
-    } catch (err) {
-      console.error('Screenshot failed:', err);
-    }
+  const handleScreenshot = () => {
+    takeScreenshot(selectedScreenshotType);
+    // Delay popup close to ensure message is delivered (100ms is safe)
+    setTimeout(() => {
+      window.close();
+    }, 100);
   };
 
   return (

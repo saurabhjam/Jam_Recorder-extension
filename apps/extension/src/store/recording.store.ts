@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type {
   RecordingStatus,
   RecordingType,
+  ScreenshotCaptureType,
   RecordingOptions,
   UploadProgress,
   Recording,
@@ -32,7 +33,7 @@ interface RecordingStore {
   stopRecording: () => Promise<void>;
   pauseRecording: () => void;
   resumeRecording: () => void;
-  takeScreenshot: () => Promise<void>;
+  takeScreenshot: (screenshotType: ScreenshotCaptureType) => void;
   setUploadProgress: (progress: UploadProgress) => void;
   setShareUrl: (url: string) => void;
   setDuration: (duration: number) => void;
@@ -160,18 +161,23 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     set({ status: 'recording' });
   },
 
-  takeScreenshot: async () => {
-    set({ status: 'requesting', recordingType: 'screenshot', error: null });
-    try {
-      const response = await sendMessage<{ shareUrl: string }>({
+  takeScreenshot: (screenshotType: ScreenshotCaptureType) => {
+    // Fire-and-forget: the popup closes after a delay to ensure the message is delivered
+    // The background handles capture and shows the result as a content-script overlay in the page.
+    console.log('[Recording Store] Sending TAKE_SCREENSHOT message', { screenshotType });
+    chrome.runtime.sendMessage(
+      {
         type: 'TAKE_SCREENSHOT',
-      });
-      set({ status: 'done', shareUrl: response.shareUrl });
-    } catch (err) {
-      const error = err instanceof Error ? err.message : 'Failed to take screenshot';
-      set({ status: 'error', error, recordingType: null });
-      throw err;
-    }
+        payload: { screenshotType },
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.error('[Recording Store] Screenshot message error:', chrome.runtime.lastError);
+        } else {
+          console.log('[Recording Store] Screenshot message sent successfully', response);
+        }
+      },
+    );
   },
 
   setUploadProgress: (progress: UploadProgress) => {

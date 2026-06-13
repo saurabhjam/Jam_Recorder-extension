@@ -120,6 +120,8 @@ export interface FinalizeUploadResponse {
 
 // ─── Message Types ─────────────────────────────────────────────────────────────
 
+export type ScreenshotCaptureType = 'full-page' | 'area' | 'visible';
+
 export type MessageType =
   | 'START_RECORDING'
   | 'STOP_RECORDING'
@@ -140,7 +142,14 @@ export type MessageType =
   | 'AUTH_STATE_CHANGED'
   | 'TOKEN_REFRESHED'
   | 'OAUTH_LOGIN_COMPLETE'
-  | 'CAPTURE_FLUSH';
+  | 'CAPTURE_FLUSH'
+  // Screenshot workflow messages (background ↔ content script)
+  | 'SCREENSHOT_GET_DIMENSIONS'
+  | 'SCREENSHOT_SCROLL_TO'
+  | 'SCREENSHOT_RESTORE_SCROLL'
+  | 'SCREENSHOT_SHOW_SELECTOR'
+  | 'SCREENSHOT_SHOW_PREVIEW'
+  | 'SCREENSHOT_AREA_SELECTED';
 
 // ─── Capture Types ─────────────────────────────────────────────────────────────
 

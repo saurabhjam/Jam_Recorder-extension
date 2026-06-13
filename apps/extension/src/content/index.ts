@@ -15,6 +15,8 @@ import type { ExtensionMessage, CaptureConsoleLog, CaptureNetworkEntry } from '@
 import { generateId } from '@/utils';
 import { FloatingToolbar } from './FloatingToolbar';
 import { AnnotationCanvas } from './AnnotationCanvas';
+import { ScreenshotSelector } from './ScreenshotSelector';
+import { ScreenshotPreview } from './ScreenshotPreview';
 
 declare global {
   interface Window {
@@ -28,6 +30,10 @@ let toolbarContainer: HTMLElement | null = null;
 let toolbarRoot: Root | null = null;
 let annotationContainer: HTMLElement | null = null;
 let annotationRoot: Root | null = null;
+let screenshotSelectorContainer: HTMLElement | null = null;
+let screenshotSelectorRoot: Root | null = null;
+let screenshotPreviewContainer: HTMLElement | null = null;
+let screenshotPreviewRoot: Root | null = null;
 let currentDuration = 0;
 let isToolbarVisible = false;
 let networkCaptures: CaptureNetworkEntry[] = [];
@@ -153,6 +159,80 @@ function unmountAnnotationCanvas(): void {
   }
 }
 
+// ─── Screenshot Selector Management ──────────────────────────────────────────
+
+function mountScreenshotSelector(): void {
+  console.log('[Content Script] mountScreenshotSelector called');
+  unmountScreenshotSelector();
+
+  screenshotSelectorContainer = document.createElement('div');
+  screenshotSelectorContainer.id = 'snaptrace-screenshot-selector';
+  screenshotSelectorContainer.setAttribute('data-snaptrace', 'true');
+  document.body.appendChild(screenshotSelectorContainer);
+  console.log('[Content Script] Screenshot selector container created and appended');
+  screenshotSelectorRoot = createRoot(screenshotSelectorContainer);
+
+  screenshotSelectorRoot.render(
+    createElement(ScreenshotSelector, {
+      onSelect: (bounds: { x: number; y: number; width: number; height: number }) => {
+        console.log('[Content Script] Screenshot area selected:', bounds);
+        unmountScreenshotSelector();
+        chrome.runtime.sendMessage({
+          type: 'SCREENSHOT_AREA_SELECTED',
+          payload: { ...bounds, devicePixelRatio: window.devicePixelRatio },
+        } satisfies ExtensionMessage);
+      },
+      onCancel: unmountScreenshotSelector,
+    }),
+  );
+}
+
+function unmountScreenshotSelector(): void {
+  if (screenshotSelectorRoot) {
+    screenshotSelectorRoot.unmount();
+    screenshotSelectorRoot = null;
+  }
+  if (screenshotSelectorContainer) {
+    screenshotSelectorContainer.remove();
+    screenshotSelectorContainer = null;
+  }
+}
+
+// ─── Screenshot Preview Management ───────────────────────────────────────────
+
+function mountScreenshotPreview(dataUrl: string): void {
+  console.log(
+    '[Content Script] mountScreenshotPreview called with dataUrl length:',
+    dataUrl.length,
+  );
+  unmountScreenshotPreview();
+
+  screenshotPreviewContainer = document.createElement('div');
+  screenshotPreviewContainer.id = 'snaptrace-screenshot-preview';
+  screenshotPreviewContainer.setAttribute('data-snaptrace', 'true');
+  document.body.appendChild(screenshotPreviewContainer);
+  console.log('[Content Script] Screenshot preview container created and appended');
+  screenshotPreviewRoot = createRoot(screenshotPreviewContainer);
+
+  screenshotPreviewRoot.render(
+    createElement(ScreenshotPreview, {
+      dataUrl,
+      onClose: unmountScreenshotPreview,
+    }),
+  );
+}
+
+function unmountScreenshotPreview(): void {
+  if (screenshotPreviewRoot) {
+    screenshotPreviewRoot.unmount();
+    screenshotPreviewRoot = null;
+  }
+  if (screenshotPreviewContainer) {
+    screenshotPreviewContainer.remove();
+    screenshotPreviewContainer = null;
+  }
+}
+
 // ─── Network Capture ──────────────────────────────────────────────────────────
 
 function startCapture(): void {
@@ -204,6 +284,8 @@ function handlePageMessage(e: MessageEvent): void {
 // ─── Message Listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
+  console.log('[Content Script] Received message:', message.type);
+
   switch (message.type) {
     case 'SHOW_TOOLBAR': {
       const payload = message.payload as { recordingId: string } | undefined;
@@ -238,6 +320,55 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           renderToolbar(recordingId);
         }
       }
+      break;
+    }
+
+    // ── Screenshot workflow ──────────────────────────────────────────────────
+
+    case 'SCREENSHOT_GET_DIMENSIONS': {
+      sendResponse({
+        scrollWidth: document.documentElement.scrollWidth,
+        scrollHeight: document.documentElement.scrollHeight,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        currentScrollX: window.scrollX,
+        currentScrollY: window.scrollY,
+        devicePixelRatio: window.devicePixelRatio,
+      });
+      break;
+    }
+
+    case 'SCREENSHOT_SCROLL_TO': {
+      const { x, y } = message.payload as { x: number; y: number };
+      window.scrollTo(x, y);
+      // Double rAF ensures the compositor has painted before background captures
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          sendResponse({ actualScrollX: window.scrollX, actualScrollY: window.scrollY });
+        });
+      });
+      return true; // async
+    }
+
+    case 'SCREENSHOT_RESTORE_SCROLL': {
+      const { x, y } = message.payload as { x: number; y: number };
+      window.scrollTo({ left: x, top: y, behavior: 'instant' });
+      sendResponse({ success: true });
+      break;
+    }
+
+    case 'SCREENSHOT_SHOW_SELECTOR': {
+      console.log('[Content Script] Mounting screenshot selector');
+      mountScreenshotSelector();
+      sendResponse({ success: true });
+      break;
+    }
+
+    case 'SCREENSHOT_SHOW_PREVIEW': {
+      const { dataUrl } = message.payload as { dataUrl: string };
+      console.log('[Content Script] Mounting screenshot preview');
+      mountScreenshotPreview(dataUrl);
+      sendResponse({ success: true });
       break;
     }
 

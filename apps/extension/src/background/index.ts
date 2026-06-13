@@ -901,22 +901,173 @@ async function handleResumeRecording(): Promise<void> {
 
 // ─── SCREENSHOT ───────────────────────────────────────────────────────────────
 
-async function handleTakeScreenshot(sendResponse: (r: unknown) => void): Promise<void> {
-  let streamId: string;
-  try {
-    streamId = 'native-display-media';
-  } catch (err) {
-    sendResponse({ error: err instanceof Error ? err.message : 'Screenshot cancelled' });
-    return;
+/** Convert an OffscreenCanvas blob → data URL without FileReader (SW-safe). */
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  const ab = await blob.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...(bytes.subarray(i, i + chunkSize) as unknown as number[]));
   }
+  return `data:${blob.type || 'image/png'};base64,${btoa(binary)}`;
+}
 
+/** Crop a data URL to a CSS-pixel rect accounting for devicePixelRatio. */
+async function cropDataUrl(
+  dataUrl: string,
+  cssX: number,
+  cssY: number,
+  cssWidth: number,
+  cssHeight: number,
+  dpr: number,
+): Promise<string> {
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  const bitmap = await createImageBitmap(blob);
+  const sx = Math.round(cssX * dpr);
+  const sy = Math.round(cssY * dpr);
+  const sw = Math.round(cssWidth * dpr);
+  const sh = Math.round(cssHeight * dpr);
+  const canvas = new OffscreenCanvas(sw, sh);
+  canvas.getContext('2d')!.drawImage(bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
+  bitmap.close();
+  return blobToDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+}
+
+/** Stitch multiple viewport captures into one full-page image. */
+async function stitchCaptures(
+  captures: Array<{ dataUrl: string; drawX: number; drawY: number }>,
+  canvasWidth: number,
+  canvasHeight: number,
+): Promise<string> {
+  const canvas = new OffscreenCanvas(canvasWidth, canvasHeight);
+  const ctx = canvas.getContext('2d')!;
+  for (const cap of captures) {
+    const res = await fetch(cap.dataUrl);
+    const blob = await res.blob();
+    const bitmap = await createImageBitmap(blob);
+    ctx.drawImage(bitmap, cap.drawX, cap.drawY);
+    bitmap.close();
+  }
+  return blobToDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
+}
+
+async function captureFullPage(tabId: number, windowId: number): Promise<string> {
   try {
-    await ensureOffscreenDocument();
-    await sendToOffscreen('OFFSCREEN_TAKE_SCREENSHOT', { streamId });
-    sendResponse({ success: true });
+    // Get page dimensions from content script
+    let dims: any;
+    try {
+      dims = (await chrome.tabs.sendMessage(tabId, {
+        type: 'SCREENSHOT_GET_DIMENSIONS',
+      } as ExtensionMessage)) as {
+        scrollWidth: number;
+        scrollHeight: number;
+        viewportWidth: number;
+        viewportHeight: number;
+        currentScrollX: number;
+        currentScrollY: number;
+        devicePixelRatio: number;
+      };
+    } catch (err) {
+      console.error('[Background] Failed to get screenshot dimensions:', err);
+      // Fallback to visible tab capture if full-page capture fails
+      return await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+    }
+
+    const {
+      scrollHeight,
+      viewportWidth,
+      viewportHeight,
+      currentScrollX,
+      currentScrollY,
+      devicePixelRatio: dpr,
+    } = dims;
+
+    // Build unique vertical scroll positions
+    const MAX_POSITIONS = 30;
+    const positions: number[] = [];
+    for (let y = 0; y < scrollHeight && positions.length < MAX_POSITIONS; y += viewportHeight) {
+      positions.push(y);
+    }
+    const maxScroll = Math.max(0, scrollHeight - viewportHeight);
+    if (positions[positions.length - 1] !== maxScroll) positions.push(maxScroll);
+
+    // Scroll → wait for compositor → capture at each position
+    const captures: Array<{ dataUrl: string; drawX: number; drawY: number }> = [];
+    for (const targetY of positions) {
+      try {
+        const scrolled = (await chrome.tabs.sendMessage(tabId, {
+          type: 'SCREENSHOT_SCROLL_TO',
+          payload: { x: 0, y: targetY },
+        } as ExtensionMessage)) as { actualScrollY: number };
+        await new Promise<void>((r) => setTimeout(r, 120));
+        const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+        captures.push({ dataUrl, drawX: 0, drawY: Math.round(scrolled.actualScrollY * dpr) });
+      } catch (scrollErr) {
+        console.error('[Background] Error during scroll capture:', scrollErr);
+        // Continue with other positions
+      }
+    }
+
+    // Restore original scroll position
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'SCREENSHOT_RESTORE_SCROLL',
+        payload: { x: currentScrollX, y: currentScrollY },
+      } as ExtensionMessage);
+    } catch (restoreErr) {
+      console.error('[Background] Failed to restore scroll position:', restoreErr);
+      // Continue anyway
+    }
+
+    // Stitch all captures into one image
+    const canvasWidth = Math.round(viewportWidth * dpr);
+    const canvasHeight = Math.round(scrollHeight * dpr);
+    return stitchCaptures(captures, canvasWidth, canvasHeight);
   } catch (err) {
-    const error = err instanceof Error ? err.message : 'Screenshot failed';
-    sendResponse({ error });
+    console.error('[Background] Full-page capture error:', err);
+    // Fallback to visible tab capture
+    return await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+  }
+}
+
+async function handleTakeScreenshot(
+  screenshotType: string,
+  tabId: number,
+  windowId: number,
+): Promise<void> {
+  try {
+    let dataUrl: string;
+
+    if (screenshotType === 'visible') {
+      dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+    } else if (screenshotType === 'full-page') {
+      dataUrl = await captureFullPage(tabId, windowId);
+    } else {
+      // area — show the selector overlay; preview fires after SCREENSHOT_AREA_SELECTED
+      try {
+        await chrome.tabs.sendMessage(tabId, {
+          type: 'SCREENSHOT_SHOW_SELECTOR',
+        } as ExtensionMessage);
+      } catch (msgErr) {
+        console.error('[Background] Failed to send SCREENSHOT_SHOW_SELECTOR message:', msgErr);
+        throw msgErr;
+      }
+      return;
+    }
+
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'SCREENSHOT_SHOW_PREVIEW',
+        payload: { dataUrl },
+      } as ExtensionMessage);
+    } catch (msgErr) {
+      console.error('[Background] Failed to send SCREENSHOT_SHOW_PREVIEW message:', msgErr);
+      throw msgErr;
+    }
+  } catch (err) {
+    console.error('[Background] Screenshot error:', err);
   }
 }
 
@@ -958,8 +1109,55 @@ chrome.runtime.onMessage.addListener(
       }
 
       case 'TAKE_SCREENSHOT': {
-        void handleTakeScreenshot(sendResponse);
-        return true;
+        console.log('[Background] Received TAKE_SCREENSHOT message', message.payload);
+        const { screenshotType = 'visible' } =
+          (message.payload as { screenshotType?: string }) ?? {};
+        void (async () => {
+          try {
+            const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+            console.log('[Background] Active tabs:', tabs);
+            const [tab] = tabs;
+            if (tab?.id && tab?.windowId) {
+              console.log('[Background] Taking screenshot:', {
+                tabId: tab.id,
+                windowId: tab.windowId,
+                screenshotType,
+              });
+              await handleTakeScreenshot(screenshotType, tab.id, tab.windowId);
+            } else {
+              console.error('[Background] No active tab found');
+            }
+          } catch (err) {
+            console.error('[Background] Error in TAKE_SCREENSHOT handler:', err);
+          }
+        })();
+        return false; // popup closes immediately; no response needed
+      }
+
+      case 'SCREENSHOT_AREA_SELECTED': {
+        const { x, y, width, height, devicePixelRatio } = message.payload as {
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          devicePixelRatio: number;
+        };
+        const senderTabId = _sender.tab?.id;
+        const senderWindowId = _sender.tab?.windowId;
+        if (!senderTabId || !senderWindowId) return false;
+        void (async () => {
+          try {
+            const raw = await chrome.tabs.captureVisibleTab(senderWindowId, { format: 'png' });
+            const cropped = await cropDataUrl(raw, x, y, width, height, devicePixelRatio);
+            await chrome.tabs.sendMessage(senderTabId, {
+              type: 'SCREENSHOT_SHOW_PREVIEW',
+              payload: { dataUrl: cropped },
+            } as ExtensionMessage);
+          } catch (err) {
+            console.error('[Background] Area screenshot error:', err);
+          }
+        })();
+        return false;
       }
 
       case 'GET_STATE': {
@@ -1116,7 +1314,12 @@ chrome.commands.onCommand.addListener((command) => {
       break;
     }
     case 'take-screenshot': {
-      void handleTakeScreenshot(() => {});
+      void (async () => {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (tab?.id && tab?.windowId) {
+          await handleTakeScreenshot('visible', tab.id, tab.windowId);
+        }
+      })();
       break;
     }
   }
