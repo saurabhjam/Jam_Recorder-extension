@@ -126,12 +126,12 @@ export function HomeView({ onNavigate }: HomeViewProps) {
     }
   };
 
-  const handleScreenshot = () => {
-    takeScreenshot(selectedScreenshotType);
-    // Delay popup close to ensure message is delivered (100ms is safe)
-    setTimeout(() => {
-      window.close();
-    }, 100);
+  const handleScreenshot = async () => {
+    // Await so the tab query inside completes before the popup closes.
+    // The popup must still be open when chrome.tabs.query({currentWindow:true}) runs
+    // so it resolves to the page tab, not the popup's own window.
+    await takeScreenshot(selectedScreenshotType);
+    window.close();
   };
 
   return (

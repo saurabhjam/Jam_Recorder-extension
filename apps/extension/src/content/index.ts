@@ -352,7 +352,45 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
 
     case 'SCREENSHOT_RESTORE_SCROLL': {
       const { x, y } = message.payload as { x: number; y: number };
-      window.scrollTo({ left: x, top: y, behavior: 'instant' });
+      window.scrollTo(x, y);
+      sendResponse({ success: true });
+      break;
+    }
+
+    case 'SCREENSHOT_PREPARE_CAPTURE': {
+      // Tag all position:fixed elements so a single injected CSS rule hides them.
+      // This prevents fixed headers/footers from appearing in every scroll strip.
+      try {
+        document.querySelectorAll('*').forEach((node) => {
+          try {
+            if (window.getComputedStyle(node as HTMLElement).position === 'fixed') {
+              (node as HTMLElement).setAttribute('data-snaptrace-fixed', '1');
+            }
+          } catch {
+            /* skip elements that throw on getComputedStyle */
+          }
+        });
+      } catch {
+        /* ignore on restricted pages */
+      }
+
+      let styleEl = document.getElementById('__snaptrace_cap_style') as HTMLStyleElement | null;
+      if (!styleEl) {
+        styleEl = document.createElement('style');
+        styleEl.id = '__snaptrace_cap_style';
+        (document.head ?? document.documentElement).appendChild(styleEl);
+      }
+      styleEl.textContent =
+        '[data-snaptrace-fixed]{visibility:hidden!important;opacity:0!important;}';
+      sendResponse({ success: true });
+      break;
+    }
+
+    case 'SCREENSHOT_RESTORE_CAPTURE': {
+      document.querySelectorAll('[data-snaptrace-fixed]').forEach((el) => {
+        el.removeAttribute('data-snaptrace-fixed');
+      });
+      document.getElementById('__snaptrace_cap_style')?.remove();
       sendResponse({ success: true });
       break;
     }

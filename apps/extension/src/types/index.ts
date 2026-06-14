@@ -149,7 +149,9 @@ export type MessageType =
   | 'SCREENSHOT_RESTORE_SCROLL'
   | 'SCREENSHOT_SHOW_SELECTOR'
   | 'SCREENSHOT_SHOW_PREVIEW'
-  | 'SCREENSHOT_AREA_SELECTED';
+  | 'SCREENSHOT_AREA_SELECTED'
+  | 'SCREENSHOT_PREPARE_CAPTURE'
+  | 'SCREENSHOT_RESTORE_CAPTURE';
 
 // ─── Capture Types ─────────────────────────────────────────────────────────────
 

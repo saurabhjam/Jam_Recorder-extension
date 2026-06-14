@@ -91,8 +91,8 @@ services:
         condition: service_healthy
     volumes:
       # Development hot-reload mounts (only active in dev target)
-      - ./backend/src:/app/apps/backend/src:ro
-      - ./backend/prisma:/app/apps/backend/prisma:ro
+      - ./apps/backend/src:/app/apps/backend/src:ro
+      - ./apps/backend/prisma:/app/apps/backend/prisma:ro
       # Shared upload temp directory
       - uploads_tmp:/app/uploads
     healthcheck:

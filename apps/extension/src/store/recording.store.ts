@@ -33,7 +33,7 @@ interface RecordingStore {
   stopRecording: () => Promise<void>;
   pauseRecording: () => void;
   resumeRecording: () => void;
-  takeScreenshot: (screenshotType: ScreenshotCaptureType) => void;
+  takeScreenshot: (screenshotType: ScreenshotCaptureType) => Promise<void>;
   setUploadProgress: (progress: UploadProgress) => void;
   setShareUrl: (url: string) => void;
   setDuration: (duration: number) => void;
@@ -161,23 +161,27 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     set({ status: 'recording' });
   },
 
-  takeScreenshot: (screenshotType: ScreenshotCaptureType) => {
-    // Fire-and-forget: the popup closes after a delay to ensure the message is delivered
-    // The background handles capture and shows the result as a content-script overlay in the page.
-    console.log('[Recording Store] Sending TAKE_SCREENSHOT message', { screenshotType });
-    chrome.runtime.sendMessage(
-      {
+  takeScreenshot: async (screenshotType: ScreenshotCaptureType): Promise<void> => {
+    // Query the active tab NOW, while the popup is still open and is the frontmost window.
+    // The background service worker cannot reliably use currentWindow:true (no window context),
+    // so we resolve the tab here and embed it in the payload.
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      chrome.runtime.sendMessage({
+        type: 'TAKE_SCREENSHOT',
+        payload: {
+          screenshotType,
+          tabId: tab?.id,
+          windowId: tab?.windowId,
+        },
+      });
+    } catch {
+      // ignore — background will try lastFocusedWindow as fallback
+      chrome.runtime.sendMessage({
         type: 'TAKE_SCREENSHOT',
         payload: { screenshotType },
-      },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          console.error('[Recording Store] Screenshot message error:', chrome.runtime.lastError);
-        } else {
-          console.log('[Recording Store] Screenshot message sent successfully', response);
-        }
-      },
-    );
+      });
+    }
   },
 
   setUploadProgress: (progress: UploadProgress) => {
