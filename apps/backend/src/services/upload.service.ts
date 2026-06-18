@@ -3,7 +3,6 @@ import path from 'path';
 import os from 'os';
 
 import { prisma } from '../lib/prisma';
-import { cacheKeys, cacheSet, cacheGet, cacheDel } from '../lib/redis';
 import { externalApi } from '../lib/external-api';
 import { AppError } from '../middleware/errorHandler';
 import { calculateChecksum, generateId } from '../utils/crypto';
@@ -74,7 +73,9 @@ function formatNetworkLogs(entries: NetworkEntry[]): string {
     .join('\n');
 }
 
-// ─── Upload Session (Redis) ───────────────────────────────────────────────────
+// ─── Upload Session (in-memory) ───────────────────────────────────────────────
+// Redis removed — sessions live in a process-local Map for the duration of an
+// upload. Uploads are short-lived (minutes), so in-memory is sufficient.
 
 interface UploadSession {
   uploadId: string;
@@ -82,6 +83,8 @@ interface UploadSession {
   uploadedChunks: number;
   status: 'UPLOADING' | 'DONE';
 }
+
+const uploadSessions = new Map<string, UploadSession>();
 
 // ─── UploadService ────────────────────────────────────────────────────────────
 
@@ -107,11 +110,12 @@ export class UploadService {
     await ensureChunkDir(recordingId);
 
     const uploadId = generateId(24);
-    await cacheSet<UploadSession>(
-      cacheKeys.uploadProgress(recordingId),
-      { uploadId, totalChunks, uploadedChunks: 0, status: 'UPLOADING' },
-      3600,
-    );
+    uploadSessions.set(recordingId, {
+      uploadId,
+      totalChunks,
+      uploadedChunks: 0,
+      status: 'UPLOADING',
+    });
 
     return { uploadId, recordingId, totalChunks };
   }
@@ -151,19 +155,15 @@ export class UploadService {
       `[UPLOAD] chunk ${chunkIndex + 1}/${totalChunks} saved to disk — ${buffer.length} bytes — recording ${recordingId}`,
     );
 
-    // Update Redis progress counter
-    const session = await cacheGet<UploadSession>(cacheKeys.uploadProgress(recordingId));
+    // Update in-memory progress counter
+    const session = uploadSessions.get(recordingId);
     const uploadedChunks = session ? session.uploadedChunks + 1 : 1;
-    await cacheSet<UploadSession>(
-      cacheKeys.uploadProgress(recordingId),
-      {
-        uploadId: session?.uploadId ?? generateId(24),
-        totalChunks,
-        uploadedChunks,
-        status: 'UPLOADING',
-      },
-      3600,
-    );
+    uploadSessions.set(recordingId, {
+      uploadId: session?.uploadId ?? generateId(24),
+      totalChunks,
+      uploadedChunks,
+      status: 'UPLOADING',
+    });
 
     return { chunkIndex, uploaded: true };
   }
@@ -177,7 +177,7 @@ export class UploadService {
     if (!recording) throw new AppError('Recording not found', 404, 'NOT_FOUND');
     if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
 
-    const session = await cacheGet<UploadSession>(cacheKeys.uploadProgress(recordingId));
+    const session = uploadSessions.get(recordingId) ?? null;
     const totalChunks = session?.totalChunks ?? 0;
     const uploadedChunks = session?.uploadedChunks ?? 0;
     const progress = totalChunks > 0 ? Math.round((uploadedChunks / totalChunks) * 100) : 0;
@@ -205,7 +205,6 @@ export class UploadService {
         networkLogs: true,
         createdAt: true,
         updatedAt: true,
-        user: { select: { id: true, email: true, name: true } },
       },
     });
 
@@ -215,8 +214,8 @@ export class UploadService {
       throw new AppError('Recording is not in UPLOADING state', 400, 'INVALID_STATE');
     }
 
-    // Retrieve upload session from Redis to know totalChunks
-    const session = await cacheGet<UploadSession>(cacheKeys.uploadProgress(recordingId));
+    // Retrieve upload session to know totalChunks
+    const session = uploadSessions.get(recordingId) ?? null;
     if (!session) throw new AppError('Upload session not found or expired', 400, 'SESSION_EXPIRED');
 
     const { totalChunks } = session;
@@ -280,7 +279,7 @@ export class UploadService {
         id: recordingId,
         title: recording.title,
         description: recording.description ?? '',
-        userId: recording.user?.email ?? recording.userId,
+        userId: recording.userId,
         projectId: config.externalApi.projectId,
         status: 'completed',
         type: mimeType.startsWith('image/') ? 'screenshot' : 'video',
@@ -300,7 +299,6 @@ export class UploadService {
         networkLogs: networkLogsStr,
       });
       externalId = result.id;
-      // Always serve via our own share page — not the external portal's blank UI
       shareUrl = `${config.server.frontendUrl}/share/${recording.shareId}`;
       console.log(`[UPLOAD] record created in external portal: ${result.shareUrl}`);
       console.log(`[UPLOAD] share URL: ${shareUrl}`);
@@ -323,9 +321,9 @@ export class UploadService {
       },
     });
 
-    // Clean up temp files and Redis session
+    // Clean up temp files and session
     await deleteChunkDir(recordingId);
-    await cacheDel(cacheKeys.uploadProgress(recordingId));
+    uploadSessions.delete(recordingId);
 
     return {
       recordingId,
@@ -346,7 +344,7 @@ export class UploadService {
     if (recording.userId !== userId) throw new AppError('Unauthorized', 403, 'FORBIDDEN');
 
     await deleteChunkDir(recordingId);
-    await cacheDel(cacheKeys.uploadProgress(recordingId));
+    uploadSessions.delete(recordingId);
     await prisma.recording.update({
       where: { id: recordingId },
       data: { status: 'FAILED' },

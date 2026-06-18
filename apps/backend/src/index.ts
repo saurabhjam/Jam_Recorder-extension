@@ -3,7 +3,6 @@ import http from 'http';
 import { createApp } from './app';
 import { config } from './config';
 import { connectDatabase, disconnectDatabase } from './lib/prisma';
-import { connectRedis, disconnectRedis } from './lib/redis';
 import { createSocketServer } from './lib/socket';
 import { logger } from './utils/logger';
 
@@ -12,7 +11,6 @@ const PORT = config.server.port;
 async function bootstrap(): Promise<void> {
   // Connect to external services
   await connectDatabase();
-  await connectRedis();
 
   // Create Express app
   const app = createApp();
@@ -48,7 +46,6 @@ async function bootstrap(): Promise<void> {
 
       try {
         await disconnectDatabase();
-        await disconnectRedis();
         logger.info('Graceful shutdown complete');
         process.exit(0);
       } catch (shutdownErr) {

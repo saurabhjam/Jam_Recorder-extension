@@ -101,7 +101,14 @@ apiClient.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
 
-    if (error.response?.status !== 401 || originalRequest._retry) {
+    // Never try to refresh for auth endpoints — propagate the original error
+    const reqUrl = (originalRequest.url ?? '').toLowerCase();
+    const isAuthEndpoint =
+      reqUrl.includes('/auth/login') ||
+      reqUrl.includes('/auth/register') ||
+      reqUrl.includes('/auth/refresh');
+
+    if (error.response?.status !== 401 || originalRequest._retry || isAuthEndpoint) {
       return Promise.reject(error);
     }
 
@@ -161,10 +168,15 @@ apiClient.interceptors.response.use(
 // ─── Auth API ─────────────────────────────────────────────────────────────────
 
 export const authApi = {
-  login: async (email: string, password: string): Promise<LoginResponse> => {
+  /**
+   * Authenticate via the external ReportPortal OAuth endpoint.
+   * The backend calls /uat/sso/oauth/token, upserts the user, and returns
+   * our own session tokens alongside the external bearer token.
+   */
+  login: async (username: string, password: string): Promise<LoginResponse> => {
     try {
-      const response = await apiClient.post<ApiResponse<LoginResponse>>('/auth/login', {
-        email,
+      const response = await apiClient.post<ApiResponse<LoginResponse>>('/auth/external-login', {
+        username,
         password,
       });
       return response.data.data;
@@ -273,11 +285,6 @@ export const uploadApi = {
    * Returns the recordingId to use for subsequent chunk calls.
    */
   initUpload: async (metadata: RecordingMetadata): Promise<InitUploadResponse> => {
-    const chunkSize = 2 * 1024 * 1024; // 2 MB (matches ChunkUploader)
-    const totalChunks = Math.ceil(metadata.duration > 0 ? metadata.duration : 1);
-    // We calculate real totalChunks in ChunkUploader; here we get it from context.
-    // This function is called by ChunkUploader which knows the actual blob size.
-    // We rely on the caller to pass totalChunks in the metadata extension below.
     const payload = metadata as RecordingMetadata & { totalChunks?: number };
     const resolvedChunks = payload.totalChunks ?? 1;
 

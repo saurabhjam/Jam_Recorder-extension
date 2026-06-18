@@ -25,9 +25,6 @@ const envSchema = z.object({
   // Database
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
 
-  // Redis
-  REDIS_URL: z.string().default('redis://localhost:6379'),
-
   // JWT
   JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
@@ -115,9 +112,6 @@ export const config = {
   },
   database: {
     url: env.DATABASE_URL,
-  },
-  redis: {
-    url: env.REDIS_URL,
   },
   jwt: {
     secret: env.JWT_SECRET,

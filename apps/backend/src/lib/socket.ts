@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import { Server, type Socket } from 'socket.io';
 
 import { config } from '../config';
-import { prisma } from './prisma';
+import { getUserById } from './users-table';
 
 interface JwtPayload {
   userId: string;
@@ -46,12 +46,9 @@ export function createSocketServer(httpServer: HTTPServer): Server {
       const decoded = jwt.verify(token, config.jwt.secret) as JwtPayload;
 
       // Verify user still exists and is active
-      const user = await prisma.user.findUnique({
-        where: { id: decoded.userId, isActive: true },
-        select: { id: true, email: true },
-      });
+      const user = await getUserById(decoded.userId);
 
-      if (!user) {
+      if (!user || !user.isActive) {
         return next(new Error('User not found or inactive'));
       }
 

@@ -38,11 +38,7 @@ router.get('/', async (req: Request, res: Response, next: NextFunction): Promise
           parentId: null, // Only top-level comments
         },
         include: {
-          user: { select: { id: true, name: true, avatar: true } },
           replies: {
-            include: {
-              user: { select: { id: true, name: true, avatar: true } },
-            },
             orderBy: { createdAt: 'asc' },
           },
         },
@@ -126,12 +122,7 @@ router.post(
           parentId: parentId ?? null,
         },
         include: {
-          user: { select: { id: true, name: true, avatar: true } },
-          replies: {
-            include: {
-              user: { select: { id: true, name: true, avatar: true } },
-            },
-          },
+          replies: true,
         },
       });
 
@@ -177,9 +168,6 @@ router.put(
       const updated = await prisma.comment.update({
         where: { id: commentId },
         data: { content },
-        include: {
-          user: { select: { id: true, name: true, avatar: true } },
-        },
       });
 
       res.json({

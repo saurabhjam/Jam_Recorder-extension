@@ -21,6 +21,9 @@ export interface AuthTokens {
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
+  /** Bearer token for direct calls to the external ReportPortal API. */
+  externalToken?: string;
+  externalTokenExpiresAt?: number;
 }
 
 export interface LoginResponse {

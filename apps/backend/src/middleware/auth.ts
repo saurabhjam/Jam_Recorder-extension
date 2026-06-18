@@ -3,7 +3,7 @@ import type { NextFunction, Request, Response } from 'express';
 import jwt from 'jsonwebtoken';
 
 import { config } from '../config';
-import { prisma } from '../lib/prisma';
+import { getUserById } from '../lib/users-table';
 import { AppError } from './errorHandler';
 
 export interface JwtPayload {
@@ -13,18 +13,21 @@ export interface JwtPayload {
   exp: number;
 }
 
-// Augment Express Request
+// Augment Express types globally.
+// Passport declares req.user as Express.User — we extend that interface here
+// rather than redeclaring req.user, which would cause TS2717.
 declare global {
   namespace Express {
+    interface User {
+      id: string;
+      email: string;
+      name: string;
+      avatar: string | null;
+      role: string;
+      isActive: boolean;
+      isExpired: boolean;
+    }
     interface Request {
-      user?: {
-        id: string;
-        email: string;
-        name: string;
-        teamId: string | null;
-        isVerified: boolean;
-        isActive: boolean;
-      };
       sessionId?: string;
     }
   }
@@ -62,17 +65,7 @@ export async function verifyToken(req: Request, res: Response, next: NextFunctio
       throw err;
     }
 
-    const user = await prisma.user.findUnique({
-      where: { id: decoded.userId },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        teamId: true,
-        isVerified: true,
-        isActive: true,
-      },
-    });
+    const user = await getUserById(decoded.userId);
 
     if (!user) {
       throw new AppError('User not found', 401, 'USER_NOT_FOUND');
@@ -98,17 +91,7 @@ export function requireRole(...roles: string[]) {
         throw new AppError('Authentication required', 401, 'UNAUTHORIZED');
       }
 
-      // Fetch full user with team membership role
-      const teamMembership = req.user.teamId
-        ? await prisma.user.findUnique({
-            where: { id: req.user.id },
-            select: { teamId: true },
-          })
-        : null;
-
-      // Simple role check - in a real app you'd check the team membership role
-      // For now, check if user is team member
-      if (roles.includes('OWNER') && !teamMembership?.teamId) {
+      if (roles.includes('OWNER') && !roles.includes(req.user.role)) {
         throw new AppError('Insufficient permissions', 403, 'FORBIDDEN');
       }
 
@@ -132,19 +115,9 @@ export async function optionalAuth(
 
     try {
       const decoded = jwt.verify(token, config.jwt.secret) as JwtPayload;
-      const user = await prisma.user.findUnique({
-        where: { id: decoded.userId, isActive: true },
-        select: {
-          id: true,
-          email: true,
-          name: true,
-          teamId: true,
-          isVerified: true,
-          isActive: true,
-        },
-      });
+      const user = await getUserById(decoded.userId);
 
-      if (user) {
+      if (user && user.isActive) {
         req.user = user;
       }
     } catch {

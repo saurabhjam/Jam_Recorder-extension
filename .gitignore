@@ -24,6 +24,8 @@ out/
 .env.production.local
 .env.production
 .env.portaldb
+*.env.bak
+.env.bak
 !.env.example
 
 # Logs
@@ -71,7 +73,6 @@ Thumbs.db
 
 # Prisma
 generated/
-prisma/migrations/
 
 # Testing
 junit.xml

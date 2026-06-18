@@ -11,7 +11,7 @@ interface AuthStore {
   isLoading: boolean;
   error: string | null;
 
-  login: (email: string, password: string) => Promise<void>;
+  login: (username: string, password: string) => Promise<void>;
   register: (email: string, password: string, name: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshToken: () => Promise<void>;
@@ -84,10 +84,10 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     }
   },
 
-  login: async (email: string, password: string) => {
+  login: async (username: string, password: string) => {
     set({ isLoading: true, error: null });
     try {
-      const { user, tokens, sessionId } = await authApi.login(email, password);
+      const { user, tokens, sessionId } = await authApi.login(username, password);
 
       await chrome.storage.local.set({
         [STORAGE_KEYS.AUTH_USER]: user,

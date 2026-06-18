@@ -11,13 +11,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum Role {
-  OWNER
-  ADMIN
-  MEMBER
-  VIEWER
-}
-
 enum RecordingStatus {
   UPLOADING
   PROCESSING
@@ -32,51 +25,9 @@ enum RecordingType {
   SCREENSHOT
 }
 
-enum Plan {
-  FREE
-  PRO
-  TEAM
-  ENTERPRISE
-}
-
-enum NotificationType {
-  RECORDING_READY
-  COMMENT
-  TEAM_INVITE
-  SHARE_VIEWED
-}
-
-model User {
-  id                   String          @id @default(cuid())
-  email                String          @unique
-  name                 String
-  password             String
-  avatar               String?
-  isVerified           Boolean         @default(false)
-  isActive             Boolean         @default(true)
-  teamId               String?
-  team                 Team?           @relation(fields: [teamId], references: [id])
-  recordings           Recording[]
-  sessions             Session[]
-  comments             Comment[]
-  reactions            Reaction[]
-  notifications        Notification[]
-  activityLogs         ActivityLog[]
-  passwordResets       PasswordReset[]
-  googleId             String?         @unique
-  passwordResetToken   String?         @unique
-  passwordResetExpires DateTime?
-  createdAt            DateTime        @default(now())
-  updatedAt            DateTime        @updatedAt
-
-  @@index([email])
-  @@index([teamId])
-}
-
 model Session {
   id           String   @id @default(cuid())
   userId       String
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   refreshToken String   @unique
   userAgent    String?
   ip           String?
@@ -87,44 +38,12 @@ model Session {
   @@index([refreshToken])
 }
 
-model Team {
-  id          String       @id @default(cuid())
-  name        String
-  slug        String       @unique
-  plan        Plan         @default(FREE)
-  logo        String?
-  members     User[]
-  recordings  Recording[]
-  invites     TeamInvite[]
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-
-  @@index([slug])
-}
-
-model TeamInvite {
-  id        String   @id @default(cuid())
-  teamId    String
-  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
-  email     String
-  role      Role     @default(MEMBER)
-  token     String   @unique
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-
-  @@index([teamId])
-  @@index([token])
-  @@index([email])
-}
-
 model Recording {
   id            String          @id @default(cuid())
   title         String          @default("Untitled Recording")
   description   String?
   userId        String
-  user          User            @relation(fields: [userId], references: [id])
   teamId        String?
-  team          Team?           @relation(fields: [teamId], references: [id])
   status        RecordingStatus @default(UPLOADING)
   type          RecordingType   @default(SCREEN)
   url           String?
@@ -190,7 +109,6 @@ model Comment {
   recordingId String
   recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
   userId      String?
-  user        User?     @relation(fields: [userId], references: [id])
   guestName   String?
   content     String
   timestamp   Float?
@@ -210,7 +128,6 @@ model Reaction {
   recordingId String
   recording   Recording @relation(fields: [recordingId], references: [id], onDelete: Cascade)
   userId      String?
-  user        User?     @relation(fields: [userId], references: [id])
   visitorId   String?
   emoji       String
   createdAt   DateTime  @default(now())
@@ -238,15 +155,14 @@ model Analytics {
 }
 
 model Notification {
-  id        String           @id @default(cuid())
+  id        String   @id @default(cuid())
   userId    String
-  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  type      NotificationType
+  type      String
   title     String
   message   String
-  isRead    Boolean          @default(false)
+  isRead    Boolean  @default(false)
   metadata  Json?
-  createdAt DateTime         @default(now())
+  createdAt DateTime @default(now())
 
   @@index([userId])
   @@index([isRead])
@@ -255,7 +171,6 @@ model Notification {
 model ActivityLog {
   id        String   @id @default(cuid())
   userId    String
-  user      User     @relation(fields: [userId], references: [id])
   action    String
   resource  String?
   metadata  Json?
@@ -271,7 +186,6 @@ model ActivityLog {
 model PasswordReset {
   id        String    @id @default(cuid())
   userId    String
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   token     String    @unique
   expiresAt DateTime
   usedAt    DateTime?

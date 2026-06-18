@@ -1,19 +1,14 @@
+import { addDays } from 'date-fns';
 import { Router, type Request, type Response, type NextFunction } from 'express';
 
 import { authService } from '../services/auth.service';
+import { prisma } from '../lib/prisma';
+import { getUserByLogin, getUserByEmail, getUserById, createUser } from '../lib/users-table';
+import type { ReportPortalUser } from '../lib/users-table';
 import { requireAuth } from '../middleware/auth';
-import { validate } from '../middleware/validate';
 import { authRateLimiter } from '../middleware/rateLimit';
-import {
-  loginSchema,
-  registerSchema,
-  updateProfileSchema,
-  forgotPasswordSchema,
-  resetPasswordSchema,
-} from '../schemas/auth.schema';
 import { config } from '../config';
 import { passport } from '../lib/passport';
-import type { User } from '@prisma/client';
 
 const router = Router();
 
@@ -44,57 +39,228 @@ function buildTokensPayload(tokens: {
 }
 
 // ============================================================
+// Shared login handler — used by both /login and /external-login.
+// Accepts username OR email + password, calls ReportPortal OAuth,
+// and issues our own session tokens.
+// ============================================================
+async function handleLogin(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    // Accept { username, password } (extension) or { email, password } (dashboard)
+    const body = req.body as { username?: string; email?: string; password?: string };
+    const password = body.password;
+    const credential = body.username ?? body.email; // whichever was supplied
+
+    if (!credential || !password) {
+      res.status(400).json({ success: false, message: 'Username/email and password are required' });
+      return;
+    }
+
+    const ip = req.ip;
+    const userAgent = req.get('User-Agent');
+
+    // ── 1. If an email was supplied, resolve the ReportPortal login first ────
+    let rpLogin = credential;
+    if (credential.includes('@')) {
+      const byEmail = await getUserByEmail(credential);
+      if (!byEmail) {
+        res.status(401).json({
+          success: false,
+          error: 'INVALID_CREDENTIALS',
+          message: 'Invalid email or password',
+        });
+        return;
+      }
+      rpLogin = byEmail.login;
+    }
+
+    // ── 2. Call external ReportPortal OAuth endpoint ─────────────────────────
+    const oauthRes = await fetch(`${config.externalApi.baseUrl}/uat/sso/oauth/token`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic dWk6dWltYW4=', // base64("ui:uiman") — fixed client credential
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ grant_type: 'password', username: rpLogin, password }).toString(),
+    });
+
+    if (!oauthRes.ok) {
+      res.status(401).json({
+        success: false,
+        error: 'INVALID_CREDENTIALS',
+        message: 'Invalid username or password',
+      });
+      return;
+    }
+
+    const oauthData = (await oauthRes.json()) as {
+      access_token: string;
+      token_type: string;
+      refresh_token?: string;
+      expires_in?: number;
+    };
+
+    // ── 3. Decode external JWT to get confirmed login name ───────────────────
+    try {
+      const payload = JSON.parse(
+        Buffer.from(oauthData.access_token.split('.')[1]!, 'base64url').toString(),
+      ) as Record<string, unknown>;
+      rpLogin = (payload['user_name'] ?? payload['sub'] ?? rpLogin) as string;
+    } catch {
+      // keep rpLogin as-is
+    }
+
+    // ── 4. Look up user in the `users` table ─────────────────────────────────
+    const user = await getUserByLogin(rpLogin);
+    if (!user) {
+      res.status(401).json({
+        success: false,
+        error: 'USER_NOT_FOUND',
+        message: 'User not found',
+      });
+      return;
+    }
+
+    if (!user.isActive) {
+      res.status(401).json({
+        success: false,
+        error: 'ACCOUNT_DEACTIVATED',
+        message: 'Account is deactivated',
+      });
+      return;
+    }
+
+    // ── 5. Issue our own session tokens ──────────────────────────────────────
+    const tokens = authService.generateTokens(user.id, user.email);
+    const session = await prisma.session.create({
+      data: {
+        userId: user.id,
+        refreshToken: tokens.refreshToken,
+        ip,
+        userAgent,
+        expiresAt: addDays(new Date(), 7),
+      },
+    });
+
+    await prisma.activityLog.create({
+      data: { userId: user.id, action: 'login', resource: 'session', ip, userAgent },
+    });
+
+    res.cookie(REFRESH_COOKIE_NAME, tokens.refreshToken, COOKIE_OPTIONS);
+
+    res.json({
+      success: true,
+      message: 'Logged in successfully',
+      data: {
+        user: {
+          id: user.id,
+          login: user.login,
+          email: user.email,
+          name: user.name,
+          avatar: user.avatar,
+          role: user.role,
+          isActive: user.isActive,
+        },
+        tokens: {
+          ...buildTokensPayload(tokens),
+          externalToken: oauthData.access_token,
+          externalTokenExpiresAt: oauthData.expires_in
+            ? Date.now() + oauthData.expires_in * 1000
+            : undefined,
+        },
+        sessionId: session.id,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+// ============================================================
+// POST /auth/login  (dashboard — sends { email, password })
+// POST /auth/external-login  (extension — sends { username, password })
+// Both delegate to the shared handleLogin function above.
+// ============================================================
+router.post('/login', authRateLimiter, handleLogin);
+router.post('/external-login', authRateLimiter, handleLogin);
+
+// ============================================================
 // POST /auth/register
+// Creates a new user in the `users` table (INTERNAL type),
+// then issues session tokens exactly like login.
+// Body: { name, email, password }
 // ============================================================
 router.post(
   '/register',
   authRateLimiter,
-  validate(registerSchema),
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
+      const { name, email, password } = req.body as {
+        name?: string;
+        email?: string;
+        password?: string;
+      };
+
+      if (!name || !email || !password) {
+        res.status(400).json({ success: false, message: 'Name, email, and password are required' });
+        return;
+      }
+
+      if (password.length < 6) {
+        res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+        return;
+      }
+
+      // Check for duplicate email
+      const existing = await getUserByEmail(email);
+      if (existing) {
+        res.status(409).json({
+          success: false,
+          error: 'DUPLICATE_ERROR',
+          message: 'An account with this email already exists',
+        });
+        return;
+      }
+
       const ip = req.ip;
       const userAgent = req.get('User-Agent');
-      const result = await authService.register(req.body, ip, userAgent);
 
-      res.cookie(REFRESH_COOKIE_NAME, result.tokens.refreshToken, COOKIE_OPTIONS);
+      // Create the user in the `users` table
+      const user = await createUser({ name, email, password });
+
+      // Issue session tokens
+      const tokens = authService.generateTokens(user.id, user.email);
+      const session = await prisma.session.create({
+        data: {
+          userId: user.id,
+          refreshToken: tokens.refreshToken,
+          ip,
+          userAgent,
+          expiresAt: addDays(new Date(), 7),
+        },
+      });
+
+      await prisma.activityLog.create({
+        data: { userId: user.id, action: 'register', resource: 'user', ip, userAgent },
+      });
+
+      res.cookie(REFRESH_COOKIE_NAME, tokens.refreshToken, COOKIE_OPTIONS);
 
       res.status(201).json({
         success: true,
         message: 'Account created successfully',
         data: {
-          user: result.user,
-          tokens: buildTokensPayload(result.tokens),
-          sessionId: result.sessionId,
-        },
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-// ============================================================
-// POST /auth/login
-// ============================================================
-router.post(
-  '/login',
-  authRateLimiter,
-  validate(loginSchema),
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const ip = req.ip;
-      const userAgent = req.get('User-Agent');
-      const result = await authService.login(req.body, ip, userAgent);
-
-      res.cookie(REFRESH_COOKIE_NAME, result.tokens.refreshToken, COOKIE_OPTIONS);
-
-      res.json({
-        success: true,
-        message: 'Logged in successfully',
-        data: {
-          user: result.user,
-          tokens: buildTokensPayload(result.tokens),
-          sessionId: result.sessionId,
+          user: {
+            id: user.id,
+            login: user.login,
+            email: user.email,
+            name: user.name,
+            avatar: user.avatar,
+            role: user.role,
+            isActive: user.isActive,
+          },
+          tokens: buildTokensPayload(tokens),
+          sessionId: session.id,
         },
       });
     } catch (error) {
@@ -182,7 +348,11 @@ router.get(
   requireAuth,
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const user = await authService.getUserById(req.user!.id);
+      const user = await getUserById(req.user!.id);
+      if (!user) {
+        res.status(404).json({ success: false, message: 'User not found' });
+        return;
+      }
       res.json({ success: true, data: user });
     } catch (error) {
       next(error);
@@ -191,70 +361,8 @@ router.get(
 );
 
 // ============================================================
-// PUT /auth/me
-// ============================================================
-router.put(
-  '/me',
-  requireAuth,
-  validate(updateProfileSchema),
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const updated = await authService.updateProfile(req.user!.id, req.body);
-      res.json({
-        success: true,
-        message: 'Profile updated successfully',
-        data: updated,
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-// ============================================================
-// POST /auth/forgot-password
-// ============================================================
-router.post(
-  '/forgot-password',
-  authRateLimiter,
-  validate(forgotPasswordSchema),
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const { email } = req.body as { email: string };
-      await authService.forgotPassword(email);
-      res.json({
-        success: true,
-        message: 'If an account with that email exists, a reset link has been sent.',
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-// ============================================================
-// POST /auth/reset-password
-// ============================================================
-router.post(
-  '/reset-password',
-  authRateLimiter,
-  validate(resetPasswordSchema),
-  async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const { token, newPassword } = req.body as { token: string; newPassword: string };
-      await authService.resetPassword(token, newPassword);
-      res.json({
-        success: true,
-        message: 'Password reset successfully. Please log in with your new password.',
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-// ============================================================
-// GET /auth/google — initiate Google OAuth
+// GET /auth/google
+// Redirects to Google consent screen.
 // ============================================================
 router.get(
   '/google',
@@ -262,38 +370,42 @@ router.get(
 );
 
 // ============================================================
-// GET /auth/google/callback — Google OAuth callback
+// GET /auth/google/callback
+// Google redirects here after consent. Issues our own session
+// tokens and redirects the browser to the frontend.
 // ============================================================
 router.get(
   '/google/callback',
   passport.authenticate('google', {
-    failureRedirect: `${config.server.frontendUrl}/login?error=oauth_failed`,
     session: false,
+    failureRedirect: `${config.server.frontendUrl}/login?error=google_failed`,
   }),
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const googleUser = req.user as User;
+      const user = req.user as ReportPortalUser;
+      const ip = req.ip;
+      const userAgent = req.get('User-Agent');
 
-      const { tokens } = await authService.handleGoogleCallback(
-        googleUser.googleId!,
-        googleUser.email,
-        googleUser.name,
-        googleUser.avatar ?? undefined,
-      );
+      const tokens = authService.generateTokens(user.id, user.email);
+      await prisma.session.create({
+        data: {
+          userId: user.id,
+          refreshToken: tokens.refreshToken,
+          ip,
+          userAgent,
+          expiresAt: addDays(new Date(), 7),
+        },
+      });
 
-      // Build the canonical tokens payload
+      await prisma.activityLog.create({
+        data: { userId: user.id, action: 'login', resource: 'session', ip, userAgent },
+      });
+
       const tokensPayload = buildTokensPayload(tokens);
-
-      // Set cookie for web clients
-      res.cookie(REFRESH_COOKIE_NAME, tokens.refreshToken, COOKIE_OPTIONS);
-
-      // Redirect with all token data in query params so
-      // both the web dashboard and the extension can consume them.
       const redirectUrl = new URL(`${config.server.frontendUrl}/auth/callback`);
       redirectUrl.searchParams.set('accessToken', tokensPayload.accessToken);
       redirectUrl.searchParams.set('refreshToken', tokensPayload.refreshToken);
       redirectUrl.searchParams.set('expiresAt', String(tokensPayload.expiresAt));
-
       res.redirect(redirectUrl.toString());
     } catch (error) {
       next(error);
