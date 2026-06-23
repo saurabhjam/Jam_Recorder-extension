@@ -17,7 +17,7 @@
  */
 
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
-import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
+import { STORAGE_KEYS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -34,16 +34,48 @@ interface OffscreenIncomingMessage {
   payload?: unknown;
 }
 
-// ─── API Config (mirrors services/api.ts) ─────────────────────────────────────
+// ─── API Config ───────────────────────────────────────────────────────────────
 
-const API_BASE_URL: string = (() => {
+// ReportPortal Java API — recordings, uploads, user info
+const RP_HOST = 'https://reportsv1.best-quality.in';
+const REPORTS_URL: string = (() => {
   try {
     const env = (import.meta as { env?: Record<string, string> }).env;
-    return env?.['VITE_API_BASE_URL'] ?? 'http://localhost:3000/api';
+    return env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
   } catch {
-    return 'http://localhost:3000/api';
+    return `${RP_HOST}/api`;
   }
 })();
+
+// ReportPortal SSO — used for silent token refresh
+const SSO_TOKEN_URL = `${RP_HOST}/uat/sso/oauth/token`;
+const SSO_AUTH_HEADER = 'Basic dWk6dWltYW4=';
+
+async function getProject(token: string): Promise<string> {
+  try {
+    const stored = await chrome.storage.local.get(['st_auth_project']);
+    const cached = stored['st_auth_project'] as string | undefined;
+    if (cached) return cached;
+
+    const res = await fetch(`${REPORTS_URL}/users?ids=`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) {
+      const raw = (await res.json()) as
+        | { assignedProjects?: Record<string, unknown> }
+        | Array<{ assignedProjects?: Record<string, unknown> }>;
+      const projects = Array.isArray(raw) ? raw[0]?.assignedProjects : raw?.assignedProjects;
+      const name = Object.keys(projects ?? {})[0];
+      if (name) {
+        await chrome.storage.local.set({ st_auth_project: name });
+        return name;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+  return 'superadmin_personal';
+}
 
 async function getAccessToken(): Promise<string | null> {
   try {
@@ -60,10 +92,17 @@ async function getAccessToken(): Promise<string | null> {
     // Token expired or expiring within 10s — try to silently refresh
     if (!tokens.refreshToken) return null;
 
-    const refreshRes = await fetch(`${API_BASE_URL}/auth/refresh`, {
+    const refreshRes = await fetch(SSO_TOKEN_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken: tokens.refreshToken }),
+      headers: {
+        Authorization: SSO_AUTH_HEADER,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: tokens.refreshToken,
+      }).toString(),
     });
 
     if (!refreshRes.ok) {
@@ -77,8 +116,16 @@ async function getAccessToken(): Promise<string | null> {
       return null;
     }
 
-    const body = (await refreshRes.json()) as { data: { tokens: AuthTokens } };
-    const newTokens = body.data.tokens;
+    const sso = (await refreshRes.json()) as {
+      access_token: string;
+      refresh_token: string;
+      expires_in: number;
+    };
+    const newTokens: AuthTokens = {
+      accessToken: sso.access_token,
+      refreshToken: sso.refresh_token,
+      expiresAt: Date.now() + sso.expires_in * 1000,
+    };
     if (!newTokens?.accessToken) return null;
 
     await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: newTokens });
@@ -97,9 +144,11 @@ function authHeaders(token: string | null): Record<string, string> {
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let recorder: MediaRecorder | null = null;
-let stream: MediaStream | null = null;
-let micStream: MediaStream | null = null;
+let stream: MediaStream | null = null; // the combined stream handed to MediaRecorder
+let captureStream: MediaStream | null = null; // raw screen/tab capture (video + system audio)
+let micStream: MediaStream | null = null; // raw microphone capture
 let webcamStream: MediaStream | null = null;
+let audioContext: AudioContext | null = null; // mixes mic + system audio into one track
 let chunks: Blob[] = [];
 let mimeType = 'video/webm';
 let isRecordingActive = false;
@@ -175,7 +224,12 @@ function getSupportedMimeType(): string {
 //   throw new Error(`Unsupported recording type: ${options.type}`);
 // }
 
-async function createRecordingStream(
+/**
+ * Acquire the primary capture stream (screen or tab) including its system/tab
+ * audio. Microphone audio is acquired and mixed separately by
+ * {@link createRecordingStream}.
+ */
+async function acquireCaptureStream(
   options: RecordingOptions,
   streamId?: string,
 ): Promise<MediaStream> {
@@ -197,13 +251,101 @@ async function createRecordingStream(
   }
 
   return navigator.mediaDevices.getUserMedia({
-    audio: options.systemAudio,
+    // Capture tab audio only when the user opted into system audio. When false
+    // we pass `audio: false` so the tab keeps playing through the speakers.
+    audio: options.systemAudio
+      ? ({
+          mandatory: {
+            chromeMediaSource: 'tab',
+            chromeMediaSourceId: streamId,
+          },
+        } as any)
+      : false,
     video: {
       mandatory: {
         chromeMediaSource: 'tab',
         chromeMediaSourceId: streamId,
       },
     } as any,
+  });
+}
+
+/**
+ * Acquire the microphone. Returns null if the mic is disabled or permission is
+ * denied — recording should continue without mic rather than failing outright.
+ *
+ * The permission grant must already exist for the extension origin (the popup
+ * requests it when the user enables the Mic toggle), because an offscreen
+ * document cannot surface a permission prompt itself.
+ */
+async function acquireMicStream(options: RecordingOptions): Promise<MediaStream | null> {
+  if (!options.micEnabled) return null;
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48_000,
+      },
+      video: false,
+    });
+  } catch (err) {
+    console.warn('[Offscreen] Microphone unavailable — recording without mic:', err);
+    sendToBackground('OFFSCREEN_MIC_UNAVAILABLE', {
+      error: err instanceof Error ? err.message : 'Microphone access denied',
+    });
+    return null;
+  }
+}
+
+/**
+ * Build the final stream handed to MediaRecorder: the capture video track plus
+ * a single audio track. When both system/tab audio and mic audio are present
+ * they are mixed through an AudioContext, because MediaRecorder only encodes
+ * the first audio track of a stream.
+ */
+async function createRecordingStream(
+  options: RecordingOptions,
+  streamId?: string,
+): Promise<MediaStream> {
+  captureStream = await acquireCaptureStream(options, streamId);
+  micStream = await acquireMicStream(options);
+
+  const videoTrack = captureStream.getVideoTracks()[0];
+  const systemAudioTracks = captureStream.getAudioTracks();
+  const micAudioTracks = micStream?.getAudioTracks() ?? [];
+
+  // No mic → record the capture stream (video + any system audio) untouched.
+  if (micAudioTracks.length === 0) {
+    return captureStream;
+  }
+
+  const tracks: MediaStreamTrack[] = [];
+  if (videoTrack) tracks.push(videoTrack);
+
+  if (systemAudioTracks.length === 0) {
+    // Mic only → no mixing needed.
+    tracks.push(...micAudioTracks);
+  } else {
+    // Both sources present → mix into one track via the Web Audio graph.
+    audioContext = new AudioContext();
+    const destination = audioContext.createMediaStreamDestination();
+    audioContext.createMediaStreamSource(new MediaStream(systemAudioTracks)).connect(destination);
+    audioContext.createMediaStreamSource(new MediaStream(micAudioTracks)).connect(destination);
+    tracks.push(...destination.stream.getAudioTracks());
+  }
+
+  return new MediaStream(tracks);
+}
+
+/**
+ * Mute/unmute the microphone mid-recording without interrupting the recorder.
+ * Disabling the track emits silence, which flows through the mix graph too.
+ */
+function setMicMuted(muted: boolean): void {
+  micStream?.getAudioTracks().forEach((t) => {
+    t.enabled = !muted;
   });
 }
 
@@ -220,8 +362,7 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
   mimeType = getSupportedMimeType();
   isRecordingActive = true;
 
-  const captureStream = await createRecordingStream(options, streamId);
-  stream = captureStream;
+  stream = await createRecordingStream(options, streamId);
 
   recorder = new MediaRecorder(stream, {
     mimeType: 'video/webm;codecs=vp9,opus',
@@ -342,12 +483,18 @@ async function generateThumbnail(blob: Blob): Promise<string | null> {
 
 function cleanup(): void {
   stream?.getTracks().forEach((t) => t.stop());
+  captureStream?.getTracks().forEach((t) => t.stop());
   micStream?.getTracks().forEach((t) => t.stop());
   webcamStream?.getTracks().forEach((t) => t.stop());
+  if (audioContext && audioContext.state !== 'closed') {
+    void audioContext.close();
+  }
 
   stream = null;
+  captureStream = null;
   micStream = null;
   webcamStream = null;
+  audioContext = null;
   recorder = null;
   chunks = [];
   isRecordingActive = false;
@@ -456,8 +603,6 @@ interface UploadMetadata {
   hasWebcam: boolean;
 }
 
-const DASHBOARD_URL = 'http://localhost:3001';
-
 async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
   const token = await getAccessToken();
   if (!token) {
@@ -467,92 +612,81 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
     return;
   }
 
-  const blobChunks = splitBlob(blob);
-  const totalChunks = blobChunks.length;
   const totalBytes = blob.size;
+  const project = await getProject(token);
+  const ts = Date.now();
+  const isoNow = new Date(ts).toISOString();
 
-  let recordingId: string;
-  let shareId: string;
+  let fileName = '';
+  let recordingId = '';
 
   try {
-    const init = await retryWithBackoff(
-      () => createRecordingAndInitiate(token, metadata, totalChunks),
-      3,
-    );
-    recordingId = init.recordingId;
-    shareId = init.shareId;
+    // Upload blob as a single file → get MinIO filename
+    const ext = metadata.mimeType.startsWith('image/') ? 'png' : 'webm';
+    const file = new File([blob], `${metadata.type}-${ts}.${ext}`, {
+      type: metadata.mimeType.split(';')[0],
+    });
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const uploadRes = await retryWithBackoff(async () => {
+      const res = await fetch(`${REPORTS_URL}/v1/${project}/files/upload`, {
+        method: 'POST',
+        headers: { ...authHeaders(token), Accept: 'text/plain, application/json, */*' },
+        body: formData,
+      });
+      if (!res.ok) throw new Error(`File upload failed: ${res.status}`);
+      return (await res.text()).trim();
+    }, 3);
+    fileName = uploadRes;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Upload init failed';
+    const msg = err instanceof Error ? err.message : 'Upload failed';
     sendToBackground('OFFSCREEN_ERROR', { error: msg });
     await saveToOfflineQueue(blob, metadata);
     return;
   }
 
-  const shareUrl = `${DASHBOARD_URL}/share/${shareId}`;
-
-  // Push the share URL to the already-open panel (second OFFSCREEN_RECORDING_READY updates it)
-  sendToBackground('OFFSCREEN_RECORDING_READY', {
-    thumbnailDataUrl: null, // thumbnail already set; background will preserve existing value
-    duration: metadata.duration,
-    blobSize: blob.size,
-    shareUrl,
-    recordingId,
-  });
-
-  let uploadedBytes = 0;
-  let uploadedChunks = 0;
-
-  // Upload chunks
-  for (let i = 0; i < blobChunks.length; i++) {
-    const chunk = blobChunks[i]!;
-    try {
-      await retryWithBackoff(
-        () =>
-          uploadChunk(token, recordingId, i, totalChunks, chunk, (pct) => {
-            const approxBytes = uploadedBytes + (pct / 100) * chunk.size;
-            const progress: UploadProgress = {
-              recordingId,
-              totalChunks,
-              uploadedChunks: i,
-              totalBytes,
-              uploadedBytes: Math.round(approxBytes),
-              speed: 0,
-              percentComplete: Math.round((approxBytes / totalBytes) * 100),
-              eta: 0,
-            };
-            sendToBackground('OFFSCREEN_UPLOAD_PROGRESS', progress);
-          }),
-        3,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Chunk upload failed';
-      sendToBackground('OFFSCREEN_ERROR', { error: `Chunk ${i} failed: ${msg}` });
-      return;
-    }
-
-    uploadedBytes += chunk.size;
-    uploadedChunks = i + 1;
-
-    sendToBackground('OFFSCREEN_UPLOAD_PROGRESS', {
-      recordingId,
-      totalChunks,
-      uploadedChunks,
-      totalBytes,
-      uploadedBytes,
-      speed: 0,
-      percentComplete: Math.round((uploadedBytes / totalBytes) * 100),
-      eta: 0,
-    } satisfies UploadProgress);
-  }
-
-  // Finalize
   try {
-    await retryWithBackoff(() => finalizeUpload(token, recordingId), 3);
+    // Create record with all required fields
+    const fileUrl = `${REPORTS_URL}/v1/${project}/files/${fileName}`;
+    const createBody: Record<string, unknown> = {
+      title: metadata.title,
+      description: 'Recording captured with SnapTrace',
+      type: 'video',
+      mimeType: metadata.mimeType.split(';')[0],
+      status: 'completed',
+      projectId: '1',
+      shareId: `share-${ts}`,
+      isPublic: false,
+      allowDownload: true,
+      viewCount: 0,
+      url: fileUrl,
+      duration: Math.round(metadata.duration ?? 0),
+      metadata: JSON.stringify({
+        browser: 'chrome',
+        source: (metadata.type ?? 'tab').toLowerCase(),
+      }),
+      createdAt: isoNow,
+      updatedAt: isoNow,
+    };
+    if (lastThumbnailDataUrl) createBody['thumbnailUrl'] = lastThumbnailDataUrl;
+
+    const createRes = await fetch(`${REPORTS_URL}/v1/${project}/records`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+      body: JSON.stringify(createBody),
+    });
+    if (!createRes.ok) {
+      const e = (await createRes.json().catch(() => ({}))) as { message?: string };
+      throw new Error(e.message ?? `Create record failed: ${createRes.status}`);
+    }
+    const created = (await createRes.json()) as { id: string };
+    recordingId = created.id;
 
     sendToBackground('OFFSCREEN_UPLOAD_PROGRESS', {
       recordingId,
-      totalChunks,
-      uploadedChunks: totalChunks,
+      totalChunks: 1,
+      uploadedChunks: 1,
       totalBytes,
       uploadedBytes: totalBytes,
       speed: 0,
@@ -560,95 +694,11 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
       eta: 0,
     } satisfies UploadProgress);
 
+    const shareUrl = `${RP_HOST}/ui/#/${project}/records/${recordingId}`;
     sendToBackground('OFFSCREEN_UPLOAD_COMPLETE', { shareUrl, recordingId });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Finalize failed';
+    const msg = err instanceof Error ? err.message : 'Create record failed';
     sendToBackground('OFFSCREEN_ERROR', { error: msg });
-  }
-}
-
-async function createRecordingAndInitiate(
-  token: string,
-  metadata: UploadMetadata,
-  totalChunks: number,
-): Promise<{ recordingId: string; shareId: string }> {
-  // Create recording
-  const createRes = await fetch(`${API_BASE_URL}/recordings`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({
-      title: metadata.title,
-      type: toBackendRecordingType(metadata.type),
-      totalChunks,
-      mimeType: metadata.mimeType,
-    }),
-  });
-  if (!createRes.ok) {
-    const err = (await createRes.json().catch(() => ({}))) as { message?: string };
-    throw new Error(err.message ?? `Create recording failed: ${createRes.status}`);
-  }
-  const createData = (await createRes.json()) as { data: { id: string; shareId: string } };
-  const recordingId = createData.data.id;
-  const shareId = createData.data.shareId ?? recordingId;
-
-  // Initiate upload session
-  const initiateRes = await fetch(`${API_BASE_URL}/uploads/initiate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ recordingId, totalChunks, mimeType: metadata.mimeType }),
-  });
-  if (!initiateRes.ok) {
-    const err = (await initiateRes.json().catch(() => ({}))) as { message?: string };
-    throw new Error(err.message ?? `Initiate upload failed: ${initiateRes.status}`);
-  }
-
-  return { recordingId, shareId };
-}
-
-async function uploadChunk(
-  token: string,
-  recordingId: string,
-  chunkIndex: number,
-  totalChunks: number,
-  chunk: Blob,
-  onProgress: (pct: number) => void,
-): Promise<void> {
-  const formData = new FormData();
-  formData.append('chunk', chunk, `chunk-${chunkIndex}`);
-
-  const url = `${API_BASE_URL}/uploads/chunk?recordingId=${encodeURIComponent(recordingId)}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`;
-
-  // Use XMLHttpRequest to get upload progress events
-  await new Promise<void>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url);
-    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) onProgress(Math.round((e.loaded * 100) / e.total));
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve();
-      } else {
-        reject(new Error(`Chunk upload ${chunkIndex} failed: ${xhr.status}`));
-      }
-    };
-
-    xhr.onerror = () => reject(new Error(`Network error uploading chunk ${chunkIndex}`));
-    xhr.send(formData);
-  });
-}
-
-async function finalizeUpload(token: string, recordingId: string): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/uploads/complete/${encodeURIComponent(recordingId)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-  });
-  if (!res.ok) {
-    const err = (await res.json().catch(() => ({}))) as { message?: string };
-    throw new Error(err.message ?? `Finalize failed: ${res.status}`);
   }
 }
 
@@ -791,6 +841,13 @@ chrome.runtime.onMessage.addListener((message: OffscreenIncomingMessage, _sender
 
     case 'OFFSCREEN_RESUME_RECORDING': {
       resumeRecording();
+      sendResponse({ success: true });
+      return false;
+    }
+
+    case 'OFFSCREEN_SET_MIC_MUTED': {
+      const { muted } = message.payload as { muted: boolean };
+      setMicMuted(muted);
       sendResponse({ success: true });
       return false;
     }

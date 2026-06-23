@@ -40,8 +40,12 @@ export default defineConfig(({ mode }) => {
       react(),
       webExtension({
         manifest: './public/manifest.json',
-        // offscreen and editor are not in the manifest so they need their own entries
-        additionalInputs: ['src/offscreen/index.html', 'src/editor/index.html'],
+        // offscreen, editor and permission are not in the manifest so they need their own entries
+        additionalInputs: [
+          'src/offscreen/index.html',
+          'src/editor/index.html',
+          'src/permission/index.html',
+        ],
         disableAutoLaunch: true,
       }),
       fixManifestExtensions(),

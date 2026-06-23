@@ -1,16 +1,19 @@
 // ─── Auth Types ────────────────────────────────────────────────────────────────
 
-/** User shape returned by the backend (matches Prisma select in auth.service.ts). */
+/** User shape — mapped from ReportPortal's UserResource. */
 export interface User {
   id: string;
+  login: string;
   email: string;
   name: string;
   avatar: string | null;
-  teamId: string | null;
-  isVerified: boolean;
+  role: string;
   isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
+  // Legacy fields kept optional so existing storage reads don't break
+  teamId?: string | null;
+  isVerified?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 /**
@@ -130,6 +133,7 @@ export type MessageType =
   | 'STOP_RECORDING'
   | 'PAUSE_RECORDING'
   | 'RESUME_RECORDING'
+  | 'SET_MIC_MUTED'
   | 'TAKE_SCREENSHOT'
   | 'RECORDING_STARTED'
   | 'RECORDING_STOPPED'
@@ -194,6 +198,8 @@ export type OffscreenMessageType =
   | 'OFFSCREEN_STOP_RECORDING'
   | 'OFFSCREEN_PAUSE_RECORDING'
   | 'OFFSCREEN_RESUME_RECORDING'
+  | 'OFFSCREEN_SET_MIC_MUTED'
+  | 'OFFSCREEN_MIC_UNAVAILABLE'
   | 'OFFSCREEN_TAKE_SCREENSHOT'
   | 'OFFSCREEN_RECORDING_STARTED'
   | 'OFFSCREEN_RECORDING_STOPPED'
@@ -304,6 +310,7 @@ export const STORAGE_KEYS = {
   AUTH_USER: 'st_auth_user',
   AUTH_TOKENS: 'st_auth_tokens',
   AUTH_SESSION_ID: 'st_auth_session_id',
+  AUTH_PROJECT: 'st_auth_project',
   SETTINGS: 'st_settings',
   RECORDING_STATE: 'st_recording_state',
   OFFLINE_QUEUE: 'st_offline_queue',

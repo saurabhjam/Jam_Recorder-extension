@@ -5,14 +5,10 @@ x-backend-env: &backend-env
     - .env
   environment:
     NODE_ENV: ${NODE_ENV:-development}
-    DATABASE_URL: postgresql://${POSTGRES_USER:-jam}:${POSTGRES_PASSWORD:-jampassword}@postgres:5432/${POSTGRES_DB:-jamdb}
-    REDIS_URL: redis://redis:6379
+    DATABASE_URL: postgresql://rpuser:rppass@192.168.30.184:5432/reportportal
     PORT: 5000
     JWT_SECRET: ${JWT_SECRET}
     JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
-    CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME}
-    CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY}
-    CLOUDINARY_API_SECRET: ${CLOUDINARY_API_SECRET}
     CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3001}
     MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-500}
 
@@ -43,33 +39,6 @@ services:
       - jam_network
 
   # ─────────────────────────────────────────────
-  # Redis Cache / Queue
-  # ─────────────────────────────────────────────
-  redis:
-    image: redis:7-alpine
-    container_name: jam_redis
-    restart: unless-stopped
-    command: >
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
-      --requirepass ${REDIS_PASSWORD:-redis-password}
-    volumes:
-      - redis_data:/data
-    ports:
-      - '${REDIS_PORT:-6379}:6379'
-    healthcheck:
-      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD:-redis-password}', 'ping']
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    networks:
-      - jam_network
-
-  # ─────────────────────────────────────────────
   # Backend API Server
   # ─────────────────────────────────────────────
   backend:
@@ -86,8 +55,6 @@ services:
       - '${BACKEND_PORT:-5000}:5000'
     depends_on:
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     volumes:
       # Development hot-reload mounts (only active in dev target)
@@ -110,59 +77,6 @@ services:
         max-file: '3'
 
   # ─────────────────────────────────────────────
-  # Background Worker (video processing, FFmpeg)
-  # ─────────────────────────────────────────────
-  worker:
-    build:
-      context: .
-      dockerfile: docker/worker.Dockerfile
-      target: ${BUILD_TARGET:-production}
-    container_name: jam_worker
-    restart: unless-stopped
-    <<: *backend-env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
-    volumes:
-      - uploads_tmp:/app/uploads
-    networks:
-      - jam_network
-    logging:
-      driver: 'json-file'
-      options:
-        max-size: '10m'
-        max-file: '3'
-
-  # ─────────────────────────────────────────────
-  # Dashboard (React SPA)
-  # ─────────────────────────────────────────────
-  dashboard:
-    build:
-      context: .
-      dockerfile: docker/dashboard.Dockerfile
-      args:
-        - VITE_API_URL=${VITE_API_URL:-http://localhost/api}
-        - VITE_WS_URL=${VITE_WS_URL:-ws://localhost}
-    container_name: jam_dashboard
-    restart: unless-stopped
-    ports:
-      - '${DASHBOARD_PORT:-3001}:80'
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - jam_network
-    logging:
-      driver: 'json-file'
-      options:
-        max-size: '5m'
-        max-file: '3'
-
-  # ─────────────────────────────────────────────
   # Nginx Reverse Proxy
   # ─────────────────────────────────────────────
   nginx:
@@ -179,8 +93,6 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-      dashboard:
-        condition: service_started
     networks:
       - jam_network
     healthcheck:
@@ -208,8 +120,6 @@ networks:
 volumes:
   postgres_data:
     name: jam_postgres_data
-  redis_data:
-    name: jam_redis_data
   uploads_tmp:
     name: jam_uploads_tmp
   nginx_logs:

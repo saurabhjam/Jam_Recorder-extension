@@ -19,6 +19,29 @@ async function persistSettings(settings: ExtensionSettings): Promise<void> {
   await chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: settings });
 }
 
+/** Path of the dedicated mic-permission page (opened in a real tab). */
+export const MIC_PERMISSION_PAGE = 'src/permission/index.html';
+
+/**
+ * Current microphone permission state for the extension origin.
+ * Returns 'unknown' if the Permissions API can't answer (treat as best-effort).
+ */
+export async function getMicPermissionState(): Promise<PermissionState | 'unknown'> {
+  try {
+    const status = await navigator.permissions.query({
+      name: 'microphone' as PermissionName,
+    });
+    return status.state;
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Open the permission page in a new tab so the user can grant mic access. */
+export async function openMicPermissionPage(): Promise<void> {
+  await chrome.tabs.create({ url: chrome.runtime.getURL(MIC_PERMISSION_PAGE) });
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   isLoading: false,
@@ -56,17 +79,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   toggleMic: async () => {
     const { settings, updateSettings } = get();
     const enabling = !settings.micEnabled;
-    if (enabling) {
-      try {
-        // Request permission — stream is immediately stopped; we only need the grant
-        const s = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        s.getTracks().forEach((t) => t.stop());
-      } catch {
-        // User denied — don't toggle on
-        return;
-      }
-    }
+
+    // Reflect the choice immediately so the toggle is responsive.
     await updateSettings({ micEnabled: enabling });
+    if (!enabling) return;
+
+    // The popup can't surface the mic permission prompt (it closes when the
+    // prompt steals focus), so when access isn't already granted we hand off
+    // to a dedicated permission tab. It writes the final state back to storage.
+    const state = await getMicPermissionState();
+    if (state !== 'granted') {
+      await openMicPermissionPage();
+    }
   },
 
   toggleWebcam: async () => {
@@ -97,3 +121,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     await persistSettings(DEFAULT_SETTINGS);
   },
 }));
+
+// Sync the mic toggle live when the permission page reports its result.
+if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+  chrome.runtime.onMessage.addListener((message: { type?: string; payload?: unknown }) => {
+    if (message?.type === 'MIC_PERMISSION_RESULT') {
+      const { granted } = (message.payload as { granted?: boolean }) ?? {};
+      const { settings } = useSettingsStore.getState();
+      useSettingsStore.setState({ settings: { ...settings, micEnabled: !!granted } });
+    }
+  });
+}

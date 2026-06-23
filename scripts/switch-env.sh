@@ -15,7 +15,7 @@
 #   newbranch   .env.newbranch.local     Neither exists → auto-create with .local suffix
 #
 # DIRECTORIES HANDLED (only those that exist)
-#   . (repo root)  apps/backend  apps/dashboard  apps/extension  apps/worker
+#   . (repo root)  apps/backend  apps/extension
 #
 # USAGE
 #   bash scripts/switch-env.sh              # auto-detect current git branch
@@ -34,9 +34,7 @@ BRANCH="${1:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "m
 DIRS=(
   "$ROOT"
   "$ROOT/apps/backend"
-  "$ROOT/apps/dashboard"
   "$ROOT/apps/extension"
-  "$ROOT/apps/worker"
 )
 
 # ── Resolve the env file suffix for a given branch + directory ───────────────

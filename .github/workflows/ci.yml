@@ -196,14 +196,6 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      - name: Upload dashboard build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dashboard-dist
-          path: apps/dashboard/dist/
-          retention-days: 7
-          if-no-files-found: warn
-
   # ──────────────────────────────────────────────
   # Docker build validation
   # ──────────────────────────────────────────────
@@ -237,28 +229,6 @@ jobs:
           cache-to: type=gha,mode=max
           tags: snaptrace-backend:ci
 
-      - name: Build worker Docker image (validate)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/worker.Dockerfile
-          target: production
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: snaptrace-worker:ci
-
-      - name: Build dashboard Docker image (validate)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/dashboard.Dockerfile
-          target: production
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: snaptrace-dashboard:ci
-
   # ──────────────────────────────────────────────
   # Deploy to production (main branch only)
   # ──────────────────────────────────────────────
@@ -289,8 +259,6 @@ jobs:
         with:
           images: |
             ${{ secrets.REGISTRY_URL }}/snaptrace-backend
-            ${{ secrets.REGISTRY_URL }}/snaptrace-worker
-            ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard
           tags: |
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
@@ -307,31 +275,6 @@ jobs:
           cache-to: type=gha,mode=max
           tags: ${{ secrets.REGISTRY_URL }}/snaptrace-backend:${{ github.sha }},${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
 
-      - name: Build and push worker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/worker.Dockerfile
-          target: production
-          push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: ${{ secrets.REGISTRY_URL }}/snaptrace-worker:${{ github.sha }},${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
-
-      - name: Build and push dashboard image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/dashboard.Dockerfile
-          target: production
-          push: true
-          build-args: |
-            VITE_API_URL=${{ secrets.VITE_API_URL }}
-            VITE_WS_URL=${{ secrets.VITE_WS_URL }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:${{ github.sha }},${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
-
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -345,16 +288,12 @@ jobs:
 
             # Pull latest images
             docker pull ${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
-            docker pull ${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
-            docker pull ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
 
             # Update image tags in compose
             export BACKEND_IMAGE=${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
-            export WORKER_IMAGE=${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
-            export DASHBOARD_IMAGE=${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
 
-            # Rolling restart (keeps DB and Redis running)
-            docker compose up -d --no-deps backend worker dashboard nginx
+            # Rolling restart
+            docker compose up -d --no-deps backend nginx
 
             # Run migrations
             docker compose exec -T backend node dist/migrate.js || true

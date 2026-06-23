@@ -13,21 +13,47 @@
  */
 
 import type { RecordingMetadata, UploadProgress, AuthTokens } from '@/types';
-import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
+import { STORAGE_KEYS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
+const RP_HOST = 'https://reportsv1.best-quality.in';
+
 const API_BASE_URL: string = (() => {
   try {
     const env = (import.meta as { env?: Record<string, string> }).env;
-    return env?.['VITE_API_BASE_URL'] ?? 'http://localhost:3000/api';
+    return env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
   } catch {
-    return 'http://localhost:3000/api';
+    return `${RP_HOST}/api`;
   }
 })();
 
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
+async function getProject(token: string): Promise<string> {
+  try {
+    const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_PROJECT]);
+    const cached = stored[STORAGE_KEYS.AUTH_PROJECT] as string | undefined;
+    if (cached) return cached;
+
+    const res = await fetch(`${API_BASE_URL}/users?ids=`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) {
+      const raw = (await res.json()) as
+        | { assignedProjects?: Record<string, unknown> }
+        | Array<{ assignedProjects?: Record<string, unknown> }>;
+      const projects = Array.isArray(raw) ? raw[0]?.assignedProjects : raw?.assignedProjects;
+      const name = Object.keys(projects ?? {})[0];
+      if (name) {
+        await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_PROJECT]: name });
+        return name;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+  return 'superadmin_personal';
+}
 
 // ─── Offline Queue Types ──────────────────────────────────────────────────────
 
@@ -41,97 +67,108 @@ interface QueuedUpload {
 // ─── ChunkUploader ────────────────────────────────────────────────────────────
 
 export class ChunkUploader {
-  private cancelled = false;
-
   async upload(
     blob: Blob,
     metadata: RecordingMetadata,
     onProgress: (progress: UploadProgress) => void,
   ): Promise<string> {
-    this.cancelled = false;
-
     const token = await this.getAccessToken();
     if (!token) throw new Error('Not authenticated — cannot upload');
 
-    const chunks = this.splitBlob(blob);
-    const totalChunks = chunks.length;
     const totalBytes = blob.size;
+    const project = await getProject(token);
+    const ts = Date.now();
+    const isoNow = new Date(ts).toISOString();
 
-    // Phase 1: create recording + open upload session
-    let recordingId: string;
+    // Phase 1: upload file → get MinIO filename
+    const ext = metadata.mimeType.startsWith('image/') ? 'png' : 'webm';
+    let fileName: string;
+    let recordingId = '';
     try {
-      recordingId = await retryWithBackoff(
-        () => this.createAndInitiate(token, metadata, totalChunks),
-        3,
-      );
+      fileName = await retryWithBackoff(async () => {
+        const file = new File([blob], `${metadata.type ?? 'recording'}-${ts}.${ext}`, {
+          type: metadata.mimeType.split(';')[0],
+        });
+        const formData = new FormData();
+        formData.append('file', file);
+
+        return await new Promise<string>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', `${API_BASE_URL}/v1/${project}/files/upload`);
+          xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+          xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+              onProgress({
+                recordingId: '',
+                totalChunks: 1,
+                uploadedChunks: 0,
+                totalBytes,
+                uploadedBytes: e.loaded,
+                speed: 0,
+                percentComplete: Math.round((e.loaded / e.total) * 85),
+                eta: 0,
+              });
+            }
+          };
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText.trim());
+            else reject(new Error(`File upload failed: ${xhr.status}`));
+          };
+          xhr.onerror = () => reject(new Error('Network error during file upload'));
+          xhr.send(formData);
+        });
+      }, 3);
     } catch (err) {
       await this.saveToOfflineQueue(blob, metadata);
-      throw new Error(`Upload init failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    let uploadedBytes = 0;
-    let uploadedChunks = 0;
-    let lastTime = Date.now();
-    let lastBytes = 0;
-
-    // Phase 2: upload chunks
-    for (let i = 0; i < chunks.length; i++) {
-      if (this.cancelled) {
-        await this.abortUpload(token, recordingId);
-        throw new Error('Upload cancelled');
-      }
-
-      const chunk = chunks[i]!;
-
-      await retryWithBackoff(
-        () =>
-          this.uploadChunk(token, recordingId, i, totalChunks, chunk, (pct) => {
-            const approxBytes = uploadedBytes + (pct / 100) * chunk.size;
-            const now = Date.now();
-            const timeDiff = (now - lastTime) / 1000;
-            let speed = 0;
-            if (timeDiff > 0.5) {
-              speed = (approxBytes - lastBytes) / timeDiff;
-              lastTime = now;
-              lastBytes = approxBytes;
-            }
-            const eta = speed > 0 ? Math.ceil((totalBytes - approxBytes) / speed) : 0;
-            onProgress({
-              recordingId,
-              totalChunks,
-              uploadedChunks: i,
-              totalBytes,
-              uploadedBytes: Math.round(approxBytes),
-              speed: Math.round(speed),
-              percentComplete: Math.round((approxBytes / totalBytes) * 100),
-              eta,
-            });
+    // Phase 2: create record with all required fields
+    const fileUrl = `${API_BASE_URL}/v1/${project}/files/${fileName}`;
+    try {
+      const userId = await this.getUserId();
+      const createRes = await fetch(`${API_BASE_URL}/v1/${project}/records`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...this.authHeader(token) },
+        body: JSON.stringify({
+          title: metadata.title,
+          description: 'Recording captured with SnapTrace',
+          type: 'video',
+          mimeType: metadata.mimeType.split(';')[0],
+          status: 'completed',
+          userId,
+          projectId: '1',
+          shareId: `share-${ts}`,
+          isPublic: false,
+          allowDownload: true,
+          viewCount: 0,
+          url: fileUrl,
+          duration: Math.round(metadata.duration ?? 0),
+          metadata: JSON.stringify({
+            browser: 'chrome',
+            source: (metadata.type ?? 'tab').toLowerCase(),
           }),
-        3,
-      );
-
-      uploadedBytes += chunk.size;
-      uploadedChunks = i + 1;
-
-      onProgress({
-        recordingId,
-        totalChunks,
-        uploadedChunks,
-        totalBytes,
-        uploadedBytes,
-        speed: 0,
-        percentComplete: Math.round((uploadedBytes / totalBytes) * 100),
-        eta: 0,
+          createdAt: isoNow,
+          updatedAt: isoNow,
+        }),
       });
+      if (!createRes.ok) {
+        const e = (await createRes.json().catch(() => ({}))) as { message?: string };
+        throw new Error(e.message ?? `Create record failed: ${createRes.status}`);
+      }
+      const created = (await createRes.json()) as { id: string };
+      recordingId = created.id;
+    } catch (err) {
+      throw new Error(`Create record failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    // Phase 3: finalize
-    const shareUrl = await retryWithBackoff(() => this.finalizeUpload(token, recordingId), 3);
+    const shareUrl = `${RP_HOST}/ui/#/${project}/records/${recordingId}`;
 
     onProgress({
       recordingId,
-      totalChunks,
-      uploadedChunks: totalChunks,
+      totalChunks: 1,
+      uploadedChunks: 1,
       totalBytes,
       uploadedBytes: totalBytes,
       speed: 0,
@@ -140,10 +177,6 @@ export class ChunkUploader {
     });
 
     return shareUrl;
-  }
-
-  cancel(): void {
-    this.cancelled = true;
   }
 
   // ─── Offline Queue ─────────────────────────────────────────────────────────
@@ -186,118 +219,18 @@ export class ChunkUploader {
     }
   }
 
+  private async getUserId(): Promise<string | null> {
+    try {
+      const result = await chrome.storage.local.get([STORAGE_KEYS.AUTH_USER]);
+      const user = result[STORAGE_KEYS.AUTH_USER] as { id?: string } | undefined;
+      return user?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   private authHeader(token: string): Record<string, string> {
     return { Authorization: `Bearer ${token}` };
-  }
-
-  private async createAndInitiate(
-    token: string,
-    metadata: RecordingMetadata,
-    totalChunks: number,
-  ): Promise<string> {
-    // Create recording row
-    const createRes = await fetch(`${API_BASE_URL}/recordings`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...this.authHeader(token) },
-      body: JSON.stringify({
-        title: metadata.title,
-        type: toBackendRecordingType(metadata.type),
-        totalChunks,
-        mimeType: metadata.mimeType,
-      }),
-    });
-    if (!createRes.ok) {
-      const err = (await createRes.json().catch(() => ({}))) as { message?: string };
-      throw new Error(err.message ?? `Create recording failed: ${createRes.status}`);
-    }
-    const createData = (await createRes.json()) as { data: { id: string } };
-    const recordingId = createData.data.id;
-
-    // Open upload session
-    const initiateRes = await fetch(`${API_BASE_URL}/uploads/initiate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...this.authHeader(token) },
-      body: JSON.stringify({ recordingId, totalChunks, mimeType: metadata.mimeType }),
-    });
-    if (!initiateRes.ok) {
-      const err = (await initiateRes.json().catch(() => ({}))) as { message?: string };
-      throw new Error(err.message ?? `Initiate failed: ${initiateRes.status}`);
-    }
-
-    return recordingId;
-  }
-
-  private async uploadChunk(
-    token: string,
-    recordingId: string,
-    chunkIndex: number,
-    totalChunks: number,
-    chunk: Blob,
-    onProgress: (pct: number) => void,
-  ): Promise<void> {
-    const formData = new FormData();
-    formData.append('chunk', chunk, `chunk-${chunkIndex}`);
-
-    const url = `${API_BASE_URL}/uploads/chunk?recordingId=${encodeURIComponent(recordingId)}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`;
-
-    await new Promise<void>((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', url);
-      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(Math.round((e.loaded * 100) / e.total));
-      };
-
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve();
-        } else {
-          reject(new Error(`Chunk ${chunkIndex} upload failed: HTTP ${xhr.status}`));
-        }
-      };
-
-      xhr.onerror = () => reject(new Error(`Network error on chunk ${chunkIndex}`));
-      xhr.ontimeout = () => reject(new Error(`Timeout on chunk ${chunkIndex}`));
-      xhr.timeout = 300_000;
-      xhr.send(formData);
-    });
-  }
-
-  private async finalizeUpload(token: string, recordingId: string): Promise<string> {
-    const res = await fetch(`${API_BASE_URL}/uploads/complete/${encodeURIComponent(recordingId)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...this.authHeader(token) },
-    });
-    if (!res.ok) {
-      const err = (await res.json().catch(() => ({}))) as { message?: string };
-      throw new Error(err.message ?? `Finalize failed: ${res.status}`);
-    }
-    const data = (await res.json()) as { data: { shareUrl?: string; url?: string } };
-    return data.data.shareUrl ?? data.data.url ?? '';
-  }
-
-  private async abortUpload(token: string, recordingId: string): Promise<void> {
-    try {
-      await fetch(`${API_BASE_URL}/uploads/abort/${encodeURIComponent(recordingId)}`, {
-        method: 'DELETE',
-        headers: this.authHeader(token),
-      });
-    } catch {
-      /* best-effort */
-    }
-  }
-
-  // ─── Blob Utilities ────────────────────────────────────────────────────────
-
-  private splitBlob(blob: Blob): Blob[] {
-    const result: Blob[] = [];
-    let offset = 0;
-    while (offset < blob.size) {
-      result.push(blob.slice(offset, offset + CHUNK_SIZE, blob.type));
-      offset += CHUNK_SIZE;
-    }
-    return result;
   }
 
   async saveToOfflineQueue(blob: Blob, metadata: RecordingMetadata): Promise<void> {

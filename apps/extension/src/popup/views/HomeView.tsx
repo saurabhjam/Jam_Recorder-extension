@@ -14,7 +14,11 @@ import {
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { useRecordingStore } from '@/store/recording.store';
-import { useSettingsStore } from '@/store/settings.store';
+import {
+  useSettingsStore,
+  getMicPermissionState,
+  openMicPermissionPage,
+} from '@/store/settings.store';
 import { Avatar } from '@/components/ui/Avatar';
 import { cn } from '@/utils';
 import type { RecordingType } from '@/types';
@@ -111,6 +115,19 @@ export function HomeView({ onNavigate }: HomeViewProps) {
   const handleStartRecording = async () => {
     setIsStarting(true);
     try {
+      // Neither the popup nor the offscreen recorder can surface a mic
+      // permission prompt, so if mic is on but not yet granted, send the user
+      // to the permission tab and abort this start — they grant once, then
+      // start again with the mic working.
+      if (settings.micEnabled) {
+        const state = await getMicPermissionState();
+        if (state === 'prompt' || state === 'denied') {
+          await openMicPermissionPage();
+          setIsStarting(false);
+          return;
+        }
+      }
+
       await startRecording({
         type: selectedRecordType,
         quality: settings.recordingQuality,

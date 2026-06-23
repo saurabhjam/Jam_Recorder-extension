@@ -131,6 +131,8 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         status: 'recording',
         currentRecordingId: response.recordingId,
         duration: 0,
+        // Mic starts muted only when it was disabled for this recording.
+        isMicMuted: !options.micEnabled,
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : 'Failed to start recording';
@@ -231,11 +233,10 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
 
   toggleMic: () => {
     const { isMicMuted } = get();
-    chrome.runtime.sendMessage({
-      type: isMicMuted ? 'RESUME_RECORDING' : 'PAUSE_RECORDING',
-      payload: { micMute: !isMicMuted },
-    });
-    set({ isMicMuted: !isMicMuted });
+    const muted = !isMicMuted;
+    // Mute the mic track in the offscreen recorder without pausing the recording.
+    chrome.runtime.sendMessage({ type: 'SET_MIC_MUTED', payload: { muted } });
+    set({ isMicMuted: muted });
   },
 
   toggleWebcam: () => {

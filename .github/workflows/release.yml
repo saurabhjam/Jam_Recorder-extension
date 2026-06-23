@@ -185,37 +185,6 @@ jobs:
             ${{ secrets.REGISTRY_URL }}/snaptrace-backend:${{ needs.validate.outputs.version }}
             ${{ secrets.REGISTRY_URL }}/snaptrace-backend:latest
 
-      - name: Build and push worker
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/worker.Dockerfile
-          target: production
-          platforms: linux/amd64,linux/arm64
-          push: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: |
-            ${{ secrets.REGISTRY_URL }}/snaptrace-worker:${{ needs.validate.outputs.version }}
-            ${{ secrets.REGISTRY_URL }}/snaptrace-worker:latest
-
-      - name: Build and push dashboard
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/dashboard.Dockerfile
-          target: production
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            VITE_API_URL=${{ secrets.VITE_API_URL }}
-            VITE_WS_URL=${{ secrets.VITE_WS_URL }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: |
-            ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:${{ needs.validate.outputs.version }}
-            ${{ secrets.REGISTRY_URL }}/snaptrace-dashboard:latest
-
   # ──────────────────────────────────────────────
   # Generate changelog and create GitHub Release
   # ──────────────────────────────────────────────

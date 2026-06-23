@@ -55,19 +55,44 @@ type LogTab = 'console' | 'network' | 'info' | 'actions';
 const EDITOR_DATA_KEY = 'st_editor_data';
 const PENDING_SHARE_KEY = 'st_pending_share';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
+const AUTH_USER_KEY = 'st_auth_user';
+const AUTH_PROJECT_KEY = 'st_auth_project';
+const RP_HOST = 'https://reportsv1.best-quality.in';
 const IDB_NAME = 'snaptrace-blobs';
 const IDB_STORE = 'recordings';
 const API_BASE: string =
-  (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ??
-  'http://localhost:4000/api';
-const DASHBOARD_URL: string =
-  (import.meta as { env?: Record<string, string> }).env?.['VITE_DASHBOARD_URL'] ??
-  'http://localhost:3001';
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
+  (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
 
-// ─── Upload helpers ───────────────────────────────────────────────────────────
+async function getProject(token: string): Promise<string> {
+  // Return cached project name
+  const stored = await chrome.storage.local.get([AUTH_PROJECT_KEY]);
+  const cached = stored[AUTH_PROJECT_KEY] as string | undefined;
+  if (cached) return cached;
+
+  // Fetch from RP: GET /api/users?ids= → first key of assignedProjects
+  try {
+    const res = await fetch(`${API_BASE}/users?ids=`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) {
+      const raw = (await res.json()) as
+        | { assignedProjects?: Record<string, unknown> }
+        | Array<{ assignedProjects?: Record<string, unknown> }>;
+      const projects = Array.isArray(raw) ? raw[0]?.assignedProjects : raw?.assignedProjects;
+      const name = Object.keys(projects ?? {})[0];
+      if (name) {
+        await chrome.storage.local.set({ [AUTH_PROJECT_KEY]: name });
+        return name;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+  return 'superadmin_personal';
+}
 
 function splitBlob(blob: Blob): Blob[] {
+  const CHUNK_SIZE = 2 * 1024 * 1024;
   const parts: Blob[] = [];
   for (let offset = 0; offset < blob.size; offset += CHUNK_SIZE) {
     parts.push(blob.slice(offset, offset + CHUNK_SIZE));
@@ -235,9 +260,10 @@ export function EditorApp() {
     setUploadPercent(0);
     setUploadError(null);
     try {
-      const tokenResult = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
+      const tokenResult = await chrome.storage.local.get([AUTH_TOKENS_KEY, AUTH_USER_KEY]);
       const token = (tokenResult[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)
         ?.accessToken;
+      const userId = (tokenResult[AUTH_USER_KEY] as { id?: string } | undefined)?.id ?? null;
       if (!token) {
         setUploadError('Not authenticated — please sign in.');
         return;
@@ -246,25 +272,144 @@ export function EditorApp() {
       const blob = await loadBlobFromIDB(recordingId);
       if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
 
-      const blobChunks = splitBlob(blob);
-      const totalChunks = blobChunks.length;
-      const totalBytes = blob.size;
       const mime = blob.type || 'video/webm';
-      const recType = (data.recordingType ?? 'screen').toUpperCase();
+      const mimeBase = mime.split(';')[0] ?? 'video/webm';
+      const ts = Date.now();
+      const isoNow = new Date(ts).toISOString();
+      const shareId = `share-${ts}`;
 
-      // 1. Create recording + initiate
-      const createRes = await fetch(`${API_BASE}/recordings`, {
+      // Step 1: get the user's RP project name
+      const project = await getProject(token);
+
+      // Step 2: upload video file → get MinIO filename
+      const videoFileName = await new Promise<string>((resolve, reject) => {
+        const videoFile = new File([blob], `recording-${ts}.webm`, { type: mimeBase });
+        const formData = new FormData();
+        formData.append('file', videoFile);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${API_BASE}/v1/${project}/files/upload`);
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) setUploadPercent(Math.round((e.loaded / e.total) * 80));
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText.trim());
+          else reject(new Error(`Video upload failed (${xhr.status})`));
+        };
+        xhr.onerror = () => reject(new Error('Network error during video upload'));
+        xhr.send(formData);
+      });
+
+      // Step 3: upload HAR (network logs) → get MinIO filename
+      setUploadPercent(82);
+      let harFileName = '';
+      try {
+        const harData = {
+          log: {
+            version: '1.2',
+            creator: { name: 'SnapTrace', version: '1.0' },
+            entries: (data.networkCaptures ?? []).map((r) => ({
+              startedDateTime: new Date(r.timestamp).toISOString(),
+              time: r.duration,
+              request: {
+                method: r.method,
+                url: r.url,
+                headers: [],
+                queryString: [],
+                cookies: [],
+                headersSize: -1,
+                bodySize: -1,
+              },
+              response: {
+                status: r.status,
+                statusText: r.statusText ?? '',
+                headers: [],
+                content: { size: r.size, mimeType: r.mimeType ?? '' },
+                redirectURL: '',
+                headersSize: -1,
+                bodySize: r.size,
+              },
+              cache: {},
+              timings: { send: 0, wait: r.duration, receive: 0 },
+            })),
+          },
+        };
+        const harFile = new File([JSON.stringify(harData)], `har-${ts}.json`, {
+          type: 'application/json',
+        });
+        const hForm = new FormData();
+        hForm.append('file', harFile);
+        const hRes = await fetch(`${API_BASE}/v1/${project}/files/upload`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'text/plain, application/json, */*',
+          },
+          body: hForm,
+        });
+        if (hRes.ok) harFileName = (await hRes.text()).trim();
+      } catch {
+        /* best-effort */
+      }
+
+      // Step 4: upload console logs → get MinIO filename
+      setUploadPercent(88);
+      let logsFileName = '';
+      try {
+        const logsText = (data.consoleLogs ?? [])
+          .map(
+            (l) =>
+              `[${new Date(l.timestamp).toISOString()}] [${l.level.toUpperCase()}] ${l.message}`,
+          )
+          .join('\n');
+        const logsFile = new File([logsText], `console-${ts}.txt`, { type: 'text/plain' });
+        const lForm = new FormData();
+        lForm.append('file', logsFile);
+        const lRes = await fetch(`${API_BASE}/v1/${project}/files/upload`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'text/plain, application/json, */*',
+          },
+          body: lForm,
+        });
+        if (lRes.ok) logsFileName = (await lRes.text()).trim();
+      } catch {
+        /* best-effort */
+      }
+
+      // Step 5: create record with all fields
+      setUploadPercent(92);
+      const videoUrl = `${API_BASE}/v1/${project}/files/${videoFileName}`;
+      const createRes = await fetch(`${API_BASE}/v1/${project}/records`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           title: title || data.title,
-          type: recType,
-          totalChunks,
-          mimeType: mime,
-          metadata: {
-            consoleLogs: data.consoleLogs,
-            networkLogs: data.networkCaptures,
-          },
+          description: 'Recording captured with SnapTrace',
+          type: 'video',
+          mimeType: mimeBase,
+          status: 'completed',
+          userId,
+          projectId: '1',
+          shareId,
+          isPublic: false,
+          allowDownload: true,
+          viewCount: 0,
+          url: videoUrl,
+          thumbnailUrl: data.thumbnailDataUrl ?? null,
+          duration: Math.round(data.duration ?? 0),
+          networkLogs: harFileName || null,
+          consoleLogs: logsFileName || null,
+          metadata: JSON.stringify({
+            browser: 'chrome',
+            source: (data.recordingType ?? 'tab').toLowerCase(),
+            harEntries: data.networkCaptures?.length ?? 0,
+            consoleLogEntries: data.consoleLogs?.length ?? 0,
+          }),
+          createdAt: isoNow,
+          updatedAt: isoNow,
         }),
       });
       if (!createRes.ok) {
@@ -275,61 +420,11 @@ export function EditorApp() {
         const detail = e.details ? ` (${JSON.stringify(e.details)})` : '';
         throw new Error(`${e.message ?? `Create recording failed (${createRes.status})`}${detail}`);
       }
-      const createBody = (await createRes.json()) as { data: { id: string; shareId: string } };
-      const backendId = createBody.data.id;
-      const shareId = createBody.data.shareId ?? backendId;
+      const createBody = (await createRes.json()) as { id: string };
+      const backendId = createBody.id;
 
-      const initRes = await fetch(`${API_BASE}/uploads/initiate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ recordingId: backendId, totalChunks }),
-      });
-      if (!initRes.ok) {
-        const e = (await initRes.json().catch(() => ({}))) as { message?: string };
-        throw new Error(e.message ?? `Upload initiation failed (${initRes.status})`);
-      }
-
-      // 2. Upload chunks
-      let uploadedBytes = 0;
-      for (let i = 0; i < blobChunks.length; i++) {
-        const chunk = blobChunks[i]!;
-        const formData = new FormData();
-        formData.append('chunk', chunk, `chunk-${i}`);
-        const url = `${API_BASE}/uploads/chunk?recordingId=${encodeURIComponent(backendId)}&chunkIndex=${i}&totalChunks=${totalChunks}`;
-        await new Promise<void>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open('POST', url);
-          xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable)
-              setUploadPercent(Math.round(((uploadedBytes + e.loaded) / totalBytes) * 100));
-          };
-          xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              uploadedBytes += chunk.size;
-              setUploadPercent(Math.round((uploadedBytes / totalBytes) * 100));
-              resolve();
-            } else reject(new Error(`Chunk ${i} failed (${xhr.status})`));
-          };
-          xhr.onerror = () => reject(new Error('Network error during upload'));
-          xhr.send(formData);
-        });
-      }
-
-      // 3. Finalize
-      const finalRes = await fetch(`${API_BASE}/uploads/complete/${backendId}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!finalRes.ok) {
-        const e = (await finalRes.json().catch(() => ({}))) as { message?: string };
-        throw new Error(e.message ?? `Finalize failed (${finalRes.status})`);
-      }
-
-      const finalBody = (await finalRes.json().catch(() => ({}))) as {
-        data?: { shareUrl?: string };
-      };
-      const newShareUrl = finalBody.data?.shareUrl ?? `${DASHBOARD_URL}/share/${shareId}`;
+      // Step 6: open RP UI record page
+      const newShareUrl = `${RP_HOST}/ui/#/${project}/records/${backendId}`;
       setShareUrl(newShareUrl);
       setUploadPercent(100);
       await chrome.storage.local.set({

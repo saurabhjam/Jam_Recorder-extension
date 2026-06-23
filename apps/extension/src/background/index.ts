@@ -1218,6 +1218,14 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
 
+      case 'SET_MIC_MUTED': {
+        const { muted } = (message.payload as { muted?: boolean }) ?? {};
+        void sendToOffscreen('OFFSCREEN_SET_MIC_MUTED', { muted: muted ?? false })
+          .then(() => sendResponse({ success: true }))
+          .catch((err: Error) => sendResponse({ error: err.message }));
+        return true;
+      }
+
       case 'TAKE_SCREENSHOT': {
         const {
           screenshotType = 'visible',
@@ -1472,7 +1480,7 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   void triggerOffscreenQueueProcessing();
 
   if (reason === 'install') {
-    chrome.tabs.create({ url: 'http://localhost:3001' });
+    chrome.tabs.create({ url: 'https://reportsv1.best-quality.in' });
   }
 });
 
@@ -1511,10 +1519,10 @@ const API_BASE_FOR_OAUTH = (() => {
   try {
     return (
       (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ??
-      'http://localhost:4000/api'
+      'https://reportsv1.best-quality.in/api'
     );
   } catch {
-    return 'http://localhost:4000/api';
+    return 'https://reportsv1.best-quality.in/api';
   }
 })();
 
@@ -1528,10 +1536,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     return;
   }
 
-  // Match http://localhost:3001/auth/callback?accessToken=...
+  // Match /auth/callback?accessToken=... on the real frontend
   const isOAuthCallback =
-    url.hostname === 'localhost' &&
-    (url.port === '3001' || url.port === '3000') &&
+    (url.hostname === 'reportsv1.best-quality.in' ||
+      (url.hostname === 'localhost' && (url.port === '3001' || url.port === '3000'))) &&
     url.pathname === '/auth/callback';
 
   if (!isOAuthCallback) return;
@@ -1552,15 +1560,31 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   };
 
   // Fetch user profile then store everything
-  fetch(`${API_BASE_FOR_OAUTH}/auth/me`, {
+  fetch(`${API_BASE_FOR_OAUTH}/users`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   })
     .then((res) => {
-      if (!res.ok) throw new Error(`/auth/me returned ${res.status}`);
-      return res.json() as Promise<{ data: unknown }>;
+      if (!res.ok) throw new Error(`/users returned ${res.status}`);
+      return res.json() as Promise<{
+        id: number;
+        userId: string;
+        email: string;
+        fullName: string;
+        photoId: string | null;
+        userRole: string;
+        active: boolean;
+      }>;
     })
-    .then(async (body) => {
-      const user = body.data;
+    .then(async (rpUser) => {
+      const user = {
+        id: String(rpUser.id),
+        login: rpUser.userId,
+        email: rpUser.email ?? '',
+        name: rpUser.fullName ?? rpUser.userId,
+        avatar: rpUser.photoId ?? null,
+        role: rpUser.userRole,
+        isActive: rpUser.active ?? true,
+      };
       await chrome.storage.local.set({
         [STORAGE_KEYS.AUTH_TOKENS]: tokens,
         [STORAGE_KEYS.AUTH_USER]: user,

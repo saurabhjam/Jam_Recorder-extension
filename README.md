@@ -1109,24 +1109,38 @@ Authorization: Bearer <accessToken>
 
 ---
 
+### Architecture Overview
+
+All backend services (database, video storage, authentication) are **externally hosted** — no Docker or local database is needed.
+
+| Service          | Location                                    | Notes                                      |
+| ---------------- | ------------------------------------------- | ------------------------------------------ |
+| **PostgreSQL**   | `192.168.30.184:5432/reportportal` (VPN)    | Shared ReportPortal DB — never drop tables |
+| **Auth**         | `https://reportsv1.best-quality.in` (OAuth) | ReportPortal OAuth2 password grant         |
+| **File storage** | `https://reportsv1.best-quality.in`         | Video upload + playback                    |
+
+> **VPN required** — the database at `192.168.30.184` is only reachable on the company VPN. Connect before starting the backend.
+
+---
+
 ### 1. Prerequisites — Install These First
 
-| Tool               | Version | macOS Install Command                                                                                                     |
-| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------- |
-| **Homebrew**       | any     | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`                         |
-| **Git**            | any     | pre-installed on macOS / `brew install git`                                                                               |
-| **Node.js**        | >= 18   | `brew install node@18` then `brew link node@18`                                                                           |
-| **pnpm**           | 8.15.0  | `npm install -g pnpm@8.15.0`                                                                                              |
-| **Docker Desktop** | latest  | Download from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) and run the installer |
-| **Google Chrome**  | latest  | Download from [chrome.google.com](https://www.google.com/chrome/)                                                         |
+| Tool              | Version | macOS Install Command                                                                             |
+| ----------------- | ------- | ------------------------------------------------------------------------------------------------- |
+| **Homebrew**      | any     | `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` |
+| **Git**           | any     | pre-installed on macOS / `brew install git`                                                       |
+| **Node.js**       | >= 18   | `brew install node@18` then `brew link node@18`                                                   |
+| **pnpm**          | 8.15.0  | `npm install -g pnpm@8.15.0`                                                                      |
+| **Google Chrome** | latest  | Download from [chrome.google.com](https://www.google.com/chrome/)                                 |
 
-Verify all tools are installed:
+> Docker Desktop is **not required** — the database runs on a shared external server.
+
+Verify:
 
 ```bash
-node --version        # should print v18.x.x or higher
-pnpm --version        # should print 8.15.0
-docker --version      # should print Docker version 24+
-git --version         # should print git version 2.x
+node --version   # v18.x.x or higher
+pnpm --version   # 8.15.0
+git --version    # 2.x
 ```
 
 ---
@@ -1139,15 +1153,13 @@ cd Jam_Recorder-extension
 git checkout v2version
 ```
 
-> After `git checkout v2version`, if husky is already set up from a prior `pnpm install`, the `post-checkout` hook will auto-run `switch-env.sh` and copy the correct `.env` files. On a fresh clone it won't fire yet — you'll do that in Step 4.
+> After `git checkout v2version`, if husky is already set up from a prior `pnpm install`, the `post-checkout` hook will auto-run `switch-env.sh`. On a fresh clone it won't fire yet — do that in Step 4.
 
 ---
 
 ### 3. Create Branch-Specific Environment Files
 
-`.env.*.local` files are **gitignored** — they are never committed to the repo and must be created manually on every new machine. These files hold all real secrets for the `v2version` branch.
-
-Create each file below exactly as shown.
+`.env.*.local` files are **gitignored** — never committed, must be created manually on every new machine.
 
 ---
 
@@ -1161,15 +1173,9 @@ PORT=4000
 NODE_ENV=development
 
 # ============================================================
-# Database
+# Database — external ReportPortal PostgreSQL (VPN required)
 # ============================================================
-DATABASE_URL="postgresql://jam:jampassword@localhost:5432/jamdb"
-
-# ============================================================
-# Redis
-# ============================================================
-REDIS_URL="redis://:redis-password@localhost:6379"
-REDIS_PASSWORD="redis-password"
+DATABASE_URL="postgresql://rpuser:rppass@192.168.30.184:5432/reportportal"
 
 # ============================================================
 # JWT Authentication
@@ -1180,8 +1186,7 @@ JWT_EXPIRES_IN="30m"
 JWT_REFRESH_EXPIRES_IN="10d"
 
 # ============================================================
-# External Storage + Task API (ReportPortal — live hosted instance)
-# No local installation needed for v2version.
+# External API — ReportPortal (video storage + OAuth)
 # ============================================================
 EXTERNAL_API_BASE_URL="https://reportsv1.best-quality.in"
 EXTERNAL_API_TOKEN=""
@@ -1192,13 +1197,6 @@ EXTERNAL_TASK_LABEL="Screen Recording"
 EXTERNAL_TASK_PRIORITY="P0"
 
 # ============================================================
-# Cloudinary (legacy — not used in upload flow)
-# ============================================================
-CLOUDINARY_CLOUD_NAME=""
-CLOUDINARY_API_KEY=""
-CLOUDINARY_API_SECRET=""
-
-# ============================================================
 # CORS & Security
 # ============================================================
 CORS_ORIGIN="http://localhost:3000,http://localhost:3001,chrome-extension://ndaeclgbabnjjcmffjdibmbkndiakkne"
@@ -1206,12 +1204,12 @@ RATE_LIMIT_WINDOW=900000
 RATE_LIMIT_MAX=100
 
 # ============================================================
-# Auth Configuration
+# Auth
 # ============================================================
 BCRYPT_ROUNDS=12
 
 # ============================================================
-# Upload Configuration
+# Upload
 # ============================================================
 UPLOAD_MAX_SIZE=5368709120
 CHUNK_SIZE=5242880
@@ -1223,6 +1221,7 @@ FRONTEND_URL="http://localhost:3001"
 
 # ============================================================
 # Google OAuth 2.0
+# Get credentials at: https://console.cloud.google.com/apis/credentials
 # ============================================================
 GOOGLE_CLIENT_ID="your-google-client-id.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET="your-google-client-secret"
@@ -1261,8 +1260,6 @@ VITE_BACKEND_URL=http://localhost:4000
 
 ### 4. Switch Env Files to `.env`
 
-The `switch-env` script reads the branch name (`v2version`) and copies each `.env.v2version.local` file to `.env` in every app directory. Run this once from the repo root:
-
 ```bash
 pnpm run switch-env
 ```
@@ -1277,93 +1274,59 @@ Expected output:
 [switch-env] Done.
 ```
 
-> **Automatic on future checkouts:** The `.husky/post-checkout` hook re-runs this script every time you `git checkout v2version`, so you only need to do this manually on the initial clone.
+> **Automatic on future checkouts:** The `.husky/post-checkout` hook re-runs this script every time you `git checkout v2version`.
 
 ---
 
 ### 5. Install Node Modules
 
-Run this once from the repo root. pnpm workspaces installs dependencies for all apps at once:
-
 ```bash
 pnpm install
 ```
 
-This also sets up the Husky git hooks automatically (via the `prepare` script in `package.json`).
+This installs all workspace dependencies and sets up Husky git hooks.
 
 ---
 
-### 6. Start PostgreSQL + Redis via Docker
+### 6. Connect to VPN
 
-Only the database and cache need to run locally. The video storage (ReportPortal) is a live hosted service — no local setup required.
+The database at `192.168.30.184` is only accessible on the company VPN.
 
-```bash
-docker-compose up -d postgres redis
-```
-
-Wait ~15 seconds, then verify both containers are healthy:
+**Connect before the next step.** Verify connectivity:
 
 ```bash
-docker ps
+ping -c 1 192.168.30.184
+# Expected: 1 packets transmitted, 1 received
 ```
 
-You should see both `jam_postgres` and `jam_redis` with status `Up` and health `healthy`.
-
-To check Redis specifically:
-
-```bash
-docker exec jam_redis redis-cli -a redis-password ping
-# Expected: PONG
-```
-
-To check PostgreSQL:
-
-```bash
-docker exec jam_postgres pg_isready -U jam -d jamdb
-# Expected: /var/run/postgresql:5432 - accepting connections
-```
+If ping fails, the backend will crash with a database connection error.
 
 ---
 
-### 7. Run Database Migrations
+### 7. Generate the Prisma Client
 
-Apply all pending migrations to create the schema:
+The database already exists and has all tables — **do not run `prisma migrate deploy`** (it will fail on the shared external DB). Only generate the client:
 
 ```bash
 cd apps/backend
-pnpm exec prisma migrate deploy
-```
-
-Expected output ends with: `All migrations have been successfully applied.`
-
----
-
-### 8. Generate the Prisma Client
-
-Generate the TypeScript database client from the schema:
-
-```bash
 pnpm exec prisma generate
 cd ../..
 ```
 
-Expected output ends with: `✔ Generated Prisma Client`.
+Expected output ends with: `✔ Generated Prisma Client`
 
 ---
 
-### 9. Start the Backend (Terminal 1)
-
-Open a **dedicated terminal**, leave it running:
+### 8. Start the Backend (Terminal 1)
 
 ```bash
 cd apps/backend
 pnpm dev
 ```
 
-Wait until you see all three of these lines:
+Wait until you see:
 
 ```
-[Redis] Connected
 [Database] Connected to PostgreSQL via Prisma
 Server started {"port":4000,"env":"development"}
 ```
@@ -1377,70 +1340,79 @@ curl http://localhost:4000/health
 
 ---
 
-### 10. Start the Dashboard (Terminal 2)
-
-Open a **second terminal**, leave it running:
+### 9. Start the Dashboard (Terminal 2)
 
 ```bash
 cd apps/dashboard
 pnpm dev
 ```
 
-Wait until you see:
+Wait for:
 
 ```
   ➜  Local:   http://localhost:3001/
 ```
 
-Open [http://localhost:3001](http://localhost:3001) in Chrome — you should see the login page.
+Open [http://localhost:3001](http://localhost:3001) — you should see the login page.
 
 ---
 
-### 11. Build the Extension (Terminal 3)
-
-Open a **third terminal**, leave it running (it watches for file changes):
+### 10. Build the Extension (Terminal 3)
 
 ```bash
 cd apps/extension
 pnpm dev
 ```
 
-The first build takes ~30 seconds. Wait until you see output like:
-
-```
-✓ built in Xs
-```
-
-The built extension is now in `apps/extension/dist/`.
+Wait for: `✓ built in Xs`. The built extension is in `apps/extension/dist/`.
 
 ---
 
-### 12. Load the Extension into Chrome
+### 11. Load the Extension into Chrome
 
-1. Open Chrome and navigate to `chrome://extensions`
-2. Enable **Developer mode** (toggle in the top-right corner)
+1. Open Chrome → `chrome://extensions`
+2. Enable **Developer mode** (top-right toggle)
 3. Click **Load unpacked**
-4. In the file picker, navigate to and select:
-   ```
-   <repo-root>/apps/extension/dist
-   ```
-5. The **SnapTrace Recorder** icon appears in your Chrome toolbar
+4. Select `<repo-root>/apps/extension/dist`
+5. The **SnapTrace Recorder** icon appears in the Chrome toolbar
 
-> If you already loaded the extension before and rebuilt it, click the **refresh** icon on the extension card in `chrome://extensions` to reload the latest build.
+> Rebuilt the extension? Click the **refresh** icon on the SnapTrace card in `chrome://extensions`.
+
+---
+
+### 12. Authentication — How Login Works
+
+Login is backed by **ReportPortal OAuth**. There is no separate user database.
+
+**Dashboard** (`http://localhost:3001`):
+
+- Sign in with your **email** and ReportPortal password
+- Sign up creates a new account in the shared `users` table
+
+**Extension** (popup):
+
+- Sign in with your **ReportPortal username** (not email) and password
+- Example: username `superadmin`, not `superadmin@example.com`
+
+**Continue with Google**:
+
+- Available on the dashboard login page
+- Requires the Google OAuth app to be set to **External** in Google Cloud Console
+- Add your Google email as a test user at: APIs & Services → OAuth consent screen → Test users
 
 ---
 
 ### 13. Verify the Full Setup
 
-**Check the backend is up:**
+**Backend + DB connectivity:**
 
 ```bash
 curl -s -X POST http://localhost:4000/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"test@test.com","password":"wrongpassword"}' | python3 -m json.tool
+  -d '{"email":"nonexistent@test.com","password":"wrongpassword"}' | python3 -m json.tool
 ```
 
-Expected response (means backend + DB are both working):
+Expected (proves backend and DB are both working):
 
 ```json
 {
@@ -1450,40 +1422,37 @@ Expected response (means backend + DB are both working):
 }
 ```
 
-**Check the extension:**
+**Extension:**
 
-1. Click the SnapTrace icon in Chrome toolbar
-2. The popup should load (not show an error page)
-3. Log in with your account credentials
-4. Try starting a tab recording — it should start without errors
+1. Click the SnapTrace icon in the Chrome toolbar
+2. Sign in with your ReportPortal **username** and password
+3. Start a tab recording — it should start without errors
 
-**Check the dashboard:**
+**Dashboard:**
 
 1. Open [http://localhost:3001](http://localhost:3001)
-2. Log in — you should see your recordings library
+2. Sign in with your ReportPortal **email** and password
+3. Recordings should appear in the library
 
 ---
 
 ### 14. What Runs Where (Quick Reference)
 
-| Service      | How to Start                                             | Port / URL              | Required?                            |
-| ------------ | -------------------------------------------------------- | ----------------------- | ------------------------------------ |
-| PostgreSQL   | `docker-compose up -d postgres redis`                    | `localhost:5432`        | Yes                                  |
-| Redis        | (same command as above)                                  | `localhost:6379`        | Yes                                  |
-| Backend API  | `cd apps/backend && pnpm dev`                            | `http://localhost:4000` | Yes                                  |
-| Dashboard    | `cd apps/dashboard && pnpm dev`                          | `http://localhost:3001` | Yes (share page + recordings viewer) |
-| Extension    | `cd apps/extension && pnpm dev` → load `dist/` in Chrome | Chrome toolbar          | Yes                                  |
-| ReportPortal | **Hosted** at `https://reportsv1.best-quality.in`        | — (no local setup)      | Yes (video upload + playback)        |
+| Service          | How to Start                                             | Port / URL              | Required?                     |
+| ---------------- | -------------------------------------------------------- | ----------------------- | ----------------------------- |
+| **VPN**          | Connect manually                                         | —                       | Yes (for DB access)           |
+| **Backend API**  | `cd apps/backend && pnpm dev`                            | `http://localhost:4000` | Yes                           |
+| **Dashboard**    | `cd apps/dashboard && pnpm dev`                          | `http://localhost:3001` | Yes                           |
+| **Extension**    | `cd apps/extension && pnpm dev` → load `dist/` in Chrome | Chrome toolbar          | Yes                           |
+| **PostgreSQL**   | Hosted at `192.168.30.184:5432/reportportal` (VPN)       | — (no local setup)      | Yes (auto-connected via .env) |
+| **ReportPortal** | Hosted at `https://reportsv1.best-quality.in`            | — (no local setup)      | Yes (video + OAuth)           |
 
 ---
 
 ### 15. Daily Workflow (after first setup)
 
-Every time you start work:
-
 ```bash
-# 1. Start Docker services (if not already running)
-docker-compose up -d postgres redis
+# 1. Connect to VPN first
 
 # 2. Terminal 1 — Backend
 cd apps/backend && pnpm dev
@@ -1491,11 +1460,11 @@ cd apps/backend && pnpm dev
 # 3. Terminal 2 — Dashboard
 cd apps/dashboard && pnpm dev
 
-# 4. Terminal 3 — Extension (auto-reloads on file changes)
+# 4. Terminal 3 — Extension
 cd apps/extension && pnpm dev
 ```
 
-Reload the extension in Chrome after any extension rebuild: go to `chrome://extensions` and click the refresh icon on the SnapTrace card.
+Reload the extension after any rebuild: `chrome://extensions` → refresh icon on the SnapTrace card.
 
 ---
 
@@ -1507,59 +1476,64 @@ Reload the extension in Chrome after any extension rebuild: go to `chrome://exte
 pnpm install --no-frozen-lockfile
 ```
 
-#### Backend starts but immediately crashes
+#### Backend crashes immediately on startup
 
-Check that Docker containers are running:
-
-```bash
-docker ps
-```
-
-If `jam_postgres` or `jam_redis` are missing, start them: `docker-compose up -d postgres redis`
-
-Check backend logs for the actual error:
+Almost always a VPN issue. Verify:
 
 ```bash
-cd apps/backend && pnpm dev 2>&1 | head -40
+ping -c 1 192.168.30.184
 ```
 
-#### `prisma migrate deploy` fails with "connection refused"
+If it fails, connect to the VPN and restart the backend.
 
-PostgreSQL is not yet ready. Wait 15 more seconds and retry. You can also check:
+#### `prisma generate` fails
 
-```bash
-docker logs jam_postgres | tail -20
-```
+Run `pnpm install` first to ensure all dependencies are installed, then retry.
+
+#### Do NOT run `prisma migrate deploy` or `prisma db push`
+
+The database is a shared external ReportPortal instance with live data. Running migrations or push will fail or damage existing tables. The schema is already in place — only `prisma generate` is needed.
+
+#### Login fails with "Invalid username or password"
+
+- **Dashboard**: make sure you're using your **email** address, not username
+- **Extension**: make sure you're using your **ReportPortal username** (e.g. `superadmin`), not your email
+- Confirm the external API is reachable: `curl -I https://reportsv1.best-quality.in`
+
+#### "Continue with Google" shows "Access blocked: org_internal"
+
+The Google OAuth app is set to Internal. Fix in Google Cloud Console:
+
+1. APIs & Services → OAuth consent screen → switch User Type to **External**
+2. Add your Google email under **Test users**
 
 #### Extension loads but popup shows blank / connection error
 
 - Make sure the backend is running on port 4000
-- Open `chrome://extensions`, find SnapTrace, click **Service Worker** → check for errors in the DevTools console
-- Verify `apps/extension/.env` exists and contains `VITE_API_BASE_URL=http://localhost:4000/api`
+- Open `chrome://extensions` → SnapTrace → **Service Worker** → check DevTools console for errors
+- Verify `apps/extension/.env` contains `VITE_API_BASE_URL=http://localhost:4000/api`
 
 #### Extension shows "This extension is not from the Chrome Web Store"
 
-This is expected in developer mode. Click **Keep it** or dismiss the warning. It appears every time Chrome restarts.
+Expected in developer mode. Click **Keep it**. Reappears on every Chrome restart.
 
 #### `pnpm run switch-env` prints "No env override for branch"
-
-You are not on the `v2version` branch. Switch first:
 
 ```bash
 git checkout v2version
 pnpm run switch-env
 ```
 
-#### Recordings upload but video doesn't play on the share page
+#### Recordings upload but video doesn't play
 
-The external ReportPortal service at `https://reportsv1.best-quality.in` must be reachable. Test from the machine:
+The hosted service must be reachable:
 
 ```bash
 curl -I https://reportsv1.best-quality.in
 # Expected: HTTP/2 200 or 302
 ```
 
-If it times out, the hosted service is down. Contact the team.
+If it times out, the hosted service is down — contact the team.
 
 ---
 

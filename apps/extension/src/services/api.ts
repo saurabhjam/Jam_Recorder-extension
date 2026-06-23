@@ -18,15 +18,22 @@ import type {
 } from '@/types';
 import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
 
-// ─── Base URL ─────────────────────────────────────────────────────────────────
-const API_BASE_URL: string = (() => {
+// ─── Base URLs ────────────────────────────────────────────────────────────────
+
+// ReportPortal Java API — recordings, uploads, and user info
+const PROJECT = 'superadmin_personal';
+const REPORTS_API_URL: string = (() => {
   try {
     const fromEnv = (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'];
-    return fromEnv ?? 'http://localhost:4000/api';
+    return fromEnv ?? 'https://reportsv1.best-quality.in/api';
   } catch {
-    return 'http://localhost:4000/api';
+    return 'https://reportsv1.best-quality.in/api';
   }
 })();
+
+// ReportPortal SSO — password and refresh_token grants
+const SSO_TOKEN_URL = 'https://reportsv1.best-quality.in/uat/sso/oauth/token';
+const SSO_AUTH_HEADER = 'Basic dWk6dWltYW4=';
 
 // ─── Error Extraction ─────────────────────────────────────────────────────────
 
@@ -65,10 +72,61 @@ function onRefreshFailed(): void {
   refreshSubscribers = [];
 }
 
+// ─── SSO Helpers ──────────────────────────────────────────────────────────────
+
+interface SsoTokenResponse {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+  token_type: string;
+  jti: string;
+}
+
+interface RpUserResponse {
+  id: number;
+  userId: string; // RP's login name — confusingly called "userId"
+  email: string;
+  fullName: string;
+  photoId: string | null;
+  userRole: string;
+  active: boolean;
+}
+
+async function callSso(params: Record<string, string>): Promise<SsoTokenResponse> {
+  const res = await axios.post<SsoTokenResponse>(
+    SSO_TOKEN_URL,
+    new URLSearchParams(params).toString(),
+    {
+      headers: {
+        Authorization: SSO_AUTH_HEADER,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+    },
+  );
+  return res.data;
+}
+
+async function fetchRpUser(accessToken: string): Promise<User> {
+  const res = await axios.get<RpUserResponse>(`${REPORTS_API_URL}/users`, {
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+  });
+  const r = res.data;
+  return {
+    id: String(r.id),
+    login: r.userId,
+    email: r.email,
+    name: r.fullName ?? r.userId,
+    avatar: r.photoId ?? null,
+    role: r.userRole,
+    isActive: r.active,
+  };
+}
+
 // ─── Axios Instance ───────────────────────────────────────────────────────────
 
 const apiClient: AxiosInstance = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: REPORTS_API_URL,
   timeout: 30_000,
   headers: {
     'Content-Type': 'application/json',
@@ -103,10 +161,7 @@ apiClient.interceptors.response.use(
 
     // Never try to refresh for auth endpoints — propagate the original error
     const reqUrl = (originalRequest.url ?? '').toLowerCase();
-    const isAuthEndpoint =
-      reqUrl.includes('/auth/login') ||
-      reqUrl.includes('/auth/register') ||
-      reqUrl.includes('/auth/refresh');
+    const isAuthEndpoint = reqUrl.includes('/uat/sso/oauth/token');
 
     if (error.response?.status !== 401 || originalRequest._retry || isAuthEndpoint) {
       return Promise.reject(error);
@@ -134,13 +189,15 @@ apiClient.interceptors.response.use(
         throw new Error('No refresh token available');
       }
 
-      // Call refresh — backend returns full token pair in body
-      const response = await axios.post<ApiResponse<{ tokens: AuthTokens }>>(
-        `${API_BASE_URL}/auth/refresh`,
-        { refreshToken: currentTokens.refreshToken },
-      );
-
-      const newTokens = response.data.data.tokens;
+      const sso = await callSso({
+        grant_type: 'refresh_token',
+        refresh_token: currentTokens.refreshToken,
+      });
+      const newTokens: AuthTokens = {
+        accessToken: sso.access_token,
+        refreshToken: sso.refresh_token,
+        expiresAt: Date.now() + sso.expires_in * 1000,
+      };
 
       await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: newTokens });
 
@@ -168,59 +225,46 @@ apiClient.interceptors.response.use(
 // ─── Auth API ─────────────────────────────────────────────────────────────────
 
 export const authApi = {
-  /**
-   * Authenticate via the external ReportPortal OAuth endpoint.
-   * The backend calls /uat/sso/oauth/token, upserts the user, and returns
-   * our own session tokens alongside the external bearer token.
-   */
   login: async (username: string, password: string): Promise<LoginResponse> => {
     try {
-      const response = await apiClient.post<ApiResponse<LoginResponse>>('/auth/external-login', {
-        username,
-        password,
-      });
-      return response.data.data;
+      const sso = await callSso({ grant_type: 'password', username, password });
+      const tokens: AuthTokens = {
+        accessToken: sso.access_token,
+        refreshToken: sso.refresh_token,
+        expiresAt: Date.now() + sso.expires_in * 1000,
+      };
+      const user = await fetchRpUser(sso.access_token);
+      return { user, tokens, sessionId: sso.jti };
     } catch (err) {
       throw new Error(extractErrorMessage(err, 'Login failed. Please try again.'));
     }
   },
 
-  register: async (email: string, password: string, name: string): Promise<LoginResponse> => {
-    try {
-      const response = await apiClient.post<ApiResponse<LoginResponse>>('/auth/register', {
-        email,
-        password,
-        name,
-      });
-      return response.data.data;
-    } catch (err) {
-      throw new Error(extractErrorMessage(err, 'Registration failed. Please try again.'));
-    }
+  logout: async (): Promise<void> => {
+    // ReportPortal SSO has no server-side logout — local state is cleared by the caller
   },
 
-  logout: async (sessionId?: string, logoutAll = false): Promise<void> => {
-    try {
-      await apiClient.post('/auth/logout', { sessionId, logoutAll });
-    } catch {
-      // Ignore logout errors — local state will be cleared regardless
-    }
-  },
-
-  refreshToken: async (refreshToken: string): Promise<AuthTokens> => {
-    const response = await apiClient.post<ApiResponse<{ tokens: AuthTokens }>>('/auth/refresh', {
-      refreshToken,
-    });
-    return response.data.data.tokens;
+  refreshToken: async (token: string): Promise<AuthTokens> => {
+    const sso = await callSso({ grant_type: 'refresh_token', refresh_token: token });
+    return {
+      accessToken: sso.access_token,
+      refreshToken: sso.refresh_token,
+      expiresAt: Date.now() + sso.expires_in * 1000,
+    };
   },
 
   getMe: async (): Promise<User> => {
-    const response = await apiClient.get<ApiResponse<User>>('/auth/me');
-    return response.data.data;
-  },
-
-  updateProfile: async (updates: { name?: string; avatar?: string | null }): Promise<User> => {
-    const response = await apiClient.put<ApiResponse<User>>('/auth/me', updates);
-    return response.data.data;
+    const res = await apiClient.get<RpUserResponse>('/users');
+    const r = res.data;
+    return {
+      id: String(r.id),
+      login: r.userId,
+      email: r.email,
+      name: r.fullName ?? r.userId,
+      avatar: r.photoId ?? null,
+      role: r.userRole,
+      isActive: r.active,
+    };
   },
 };
 
@@ -233,41 +277,66 @@ export interface CreateRecordingPayload {
   mimeType: string;
 }
 
+// Spring Page<T> shape returned by Java list endpoints
+interface SpringPage<T> {
+  content: T[];
+  totalElements: number;
+  number: number; // 0-indexed
+  size: number;
+  last: boolean;
+}
+
 export const recordingsApi = {
   create: async (payload: CreateRecordingPayload): Promise<Recording> => {
-    const response = await apiClient.post<ApiResponse<Recording>>('/recordings', payload);
-    return response.data.data;
+    const response = await apiClient.post<Recording>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/records`,
+      payload,
+    );
+    return response.data;
   },
 
   list: async (page = 1, limit = 20, type?: string): Promise<PaginatedResponse<Recording>> => {
     const params = new URLSearchParams({
-      page: String(page),
-      limit: String(limit),
+      page: String(page - 1), // Spring is 0-indexed
+      size: String(limit),
       ...(type ? { type } : {}),
     });
-    const response = await apiClient.get<PaginatedResponse<Recording>>(`/recordings?${params}`);
-    return response.data;
+    const response = await apiClient.get<SpringPage<Recording>>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/records?${params}`,
+    );
+    return {
+      data: response.data.content,
+      total: response.data.totalElements,
+      page: response.data.number + 1,
+      limit: response.data.size,
+      hasMore: !response.data.last,
+    };
   },
 
   get: async (id: string): Promise<Recording> => {
-    const response = await apiClient.get<ApiResponse<Recording>>(`/recordings/${id}`);
-    return response.data.data;
+    const response = await apiClient.get<Recording>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/records/${id}`,
+    );
+    return response.data;
   },
 
   delete: async (id: string): Promise<void> => {
-    await apiClient.delete(`/recordings/${id}`);
+    await apiClient.delete(`${REPORTS_API_URL}/v1/${PROJECT}/records/${id}`);
   },
 
   updateTitle: async (id: string, title: string): Promise<Recording> => {
-    const response = await apiClient.patch<ApiResponse<Recording>>(`/recordings/${id}`, { title });
-    return response.data.data;
+    const response = await apiClient.patch<Recording>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/records/${id}`,
+      { title },
+    );
+    return response.data;
   },
 
   search: async (query: string): Promise<Recording[]> => {
-    const response = await apiClient.get<ApiResponse<Recording[]>>(
-      `/recordings?search=${encodeURIComponent(query)}`,
+    const response = await apiClient.get<SpringPage<Recording>>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/records?search=${encodeURIComponent(query)}`,
     );
-    return response.data.data;
+    return response.data.content;
   },
 };
 
@@ -279,16 +348,10 @@ export const recordingsApi = {
 //   DELETE /uploads/abort/:recordingId
 
 export const uploadApi = {
-  /**
-   * Phase 1 — create the Recording row in the DB and get a recordingId.
-   * Phase 2 — initiate the chunk-upload session.
-   * Returns the recordingId to use for subsequent chunk calls.
-   */
   initUpload: async (metadata: RecordingMetadata): Promise<InitUploadResponse> => {
     const payload = metadata as RecordingMetadata & { totalChunks?: number };
     const resolvedChunks = payload.totalChunks ?? 1;
 
-    // Create recording row
     const recording = await recordingsApi.create({
       title: metadata.title,
       type: toBackendRecordingType(metadata.type),
@@ -296,8 +359,7 @@ export const uploadApi = {
       mimeType: metadata.mimeType,
     });
 
-    // Initiate the upload session
-    await apiClient.post('/uploads/initiate', {
+    await apiClient.post(`${REPORTS_API_URL}/v1/${PROJECT}/uploads/initiate`, {
       recordingId: recording.id,
       totalChunks: resolvedChunks,
       mimeType: metadata.mimeType,
@@ -316,8 +378,8 @@ export const uploadApi = {
     const formData = new FormData();
     formData.append('chunk', chunk, `chunk-${chunkIndex}`);
 
-    const response = await apiClient.post<ApiResponse<ChunkUploadResponse>>(
-      `/uploads/chunk?recordingId=${encodeURIComponent(recordingId)}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`,
+    const response = await apiClient.post<ChunkUploadResponse>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/uploads/chunk?recordingId=${encodeURIComponent(recordingId)}&chunkIndex=${chunkIndex}&totalChunks=${totalChunks}`,
       formData,
       {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -328,18 +390,20 @@ export const uploadApi = {
         },
       },
     );
-    return response.data.data;
+    return response.data;
   },
 
   finalizeUpload: async (recordingId: string): Promise<FinalizeUploadResponse> => {
-    const response = await apiClient.post<ApiResponse<FinalizeUploadResponse>>(
-      `/uploads/complete/${encodeURIComponent(recordingId)}`,
+    const response = await apiClient.post<FinalizeUploadResponse>(
+      `${REPORTS_API_URL}/v1/${PROJECT}/uploads/complete/${encodeURIComponent(recordingId)}`,
     );
-    return response.data.data;
+    return response.data;
   },
 
   cancelUpload: async (recordingId: string): Promise<void> => {
-    await apiClient.delete(`/uploads/abort/${encodeURIComponent(recordingId)}`);
+    await apiClient.delete(
+      `${REPORTS_API_URL}/v1/${PROJECT}/uploads/abort/${encodeURIComponent(recordingId)}`,
+    );
   },
 };
 
@@ -371,24 +435,6 @@ export const bugReportsApi = {
 export const api = {
   recordings: {
     createBugReport: (payload: BugReportPayload) => bugReportsApi.create(payload),
-  },
-};
-
-// ─── Shares API ───────────────────────────────────────────────────────────────
-
-export const sharesApi = {
-  getShareUrl: async (recordingId: string): Promise<string> => {
-    const response = await apiClient.get<ApiResponse<{ url: string }>>(
-      `/recordings/${recordingId}/share`,
-    );
-    return response.data.data.url;
-  },
-
-  createPublicLink: async (recordingId: string): Promise<string> => {
-    const response = await apiClient.post<ApiResponse<{ url: string }>>(
-      `/recordings/${recordingId}/share`,
-    );
-    return response.data.data.url;
   },
 };
 
