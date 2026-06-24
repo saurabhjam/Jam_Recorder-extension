@@ -25,6 +25,7 @@ import { generateId, retryWithBackoff, sleep } from '@/utils';
 interface StartRecordingPayload {
   options: RecordingOptions;
   streamId?: string; // from desktopCapture or tabCapture
+  tabAudioStreamId?: string; // tab-capture stream id for meeting audio on desktop recordings
   recordingId: string;
 }
 
@@ -147,6 +148,7 @@ let recorder: MediaRecorder | null = null;
 let stream: MediaStream | null = null; // the combined stream handed to MediaRecorder
 let captureStream: MediaStream | null = null; // raw screen/tab capture (video + system audio)
 let micStream: MediaStream | null = null; // raw microphone capture
+let tabAudioStream: MediaStream | null = null; // meeting-tab audio for desktop recordings
 let webcamStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null; // mixes mic + system audio into one track
 let chunks: Blob[] = [];
@@ -235,18 +237,22 @@ async function acquireCaptureStream(
 ): Promise<MediaStream> {
   if (options.type === 'screen') {
     return navigator.mediaDevices.getDisplayMedia({
+      // No displaySurface hint → the picker offers Chrome Tab / Window / Entire
+      // Screen equally. Picking a Tab captures that tab's audio on every OS;
+      // Entire-Screen system audio works on Windows/ChromeOS (macOS has no
+      // system-loopback driver, so screen/window audio can't be captured there).
       video: {
-        displaySurface: 'monitor',
         frameRate: 30,
         width: { ideal: 1920 },
         height: { ideal: 1080 },
       },
-      audio: {
-        suppressLocalAudioPlayback: false,
-      },
+      // Capture system/computer audio (meeting voices, media playback) only when
+      // the user enabled it. The browser still shows a "Share audio" checkbox in
+      // the picker that the user must also confirm.
+      audio: options.systemAudio ? { suppressLocalAudioPlayback: false } : false,
       preferCurrentTab: false,
       selfBrowserSurface: 'exclude',
-      systemAudio: 'include',
+      systemAudio: options.systemAudio ? 'include' : 'exclude',
     } as any);
   }
 
@@ -305,37 +311,127 @@ async function acquireMicStream(options: RecordingOptions): Promise<MediaStream 
  * they are mixed through an AudioContext, because MediaRecorder only encodes
  * the first audio track of a stream.
  */
+// Captured system/tab audio comes in well below mic level, so boost it.
+// A limiter after the gain prevents the boosted loud passages from clipping.
+const SYSTEM_AUDIO_GAIN = 3.0;
+const MIC_GAIN = 1.0;
+
+/**
+ * Capture a tab's audio via its tab-capture stream id. Used to fold meeting
+ * audio into a desktop recording when getDisplayMedia can't provide system
+ * audio (e.g. macOS screen/window shares have no system-loopback driver).
+ */
+async function acquireTabAudio(streamId: string): Promise<MediaStream | null> {
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        mandatory: {
+          chromeMediaSource: 'tab',
+          chromeMediaSourceId: streamId,
+        },
+      } as any,
+      video: false,
+    });
+  } catch (err) {
+    console.warn('[Offscreen] Could not capture tab audio for desktop recording:', err);
+    return null;
+  }
+}
+
 async function createRecordingStream(
   options: RecordingOptions,
   streamId?: string,
+  tabAudioStreamId?: string,
 ): Promise<MediaStream> {
   captureStream = await acquireCaptureStream(options, streamId);
   micStream = await acquireMicStream(options);
 
   const videoTrack = captureStream.getVideoTracks()[0];
-  const systemAudioTracks = captureStream.getAudioTracks();
+  let systemAudioTracks = captureStream.getAudioTracks();
   const micAudioTracks = micStream?.getAudioTracks() ?? [];
 
-  // No mic → record the capture stream (video + any system audio) untouched.
-  if (micAudioTracks.length === 0) {
+  // Tab capture mutes the source tab's local playback, so we must echo it back
+  // to the speakers. That's true for "Record Tab" and for desktop recordings
+  // that fall back to tab audio below.
+  let monitorSystemAudio = options.type === 'tab';
+
+  // Desktop recording produced no system audio (typical on macOS) → fold in the
+  // active tab's audio so meeting voice is still recorded.
+  if (options.type === 'screen' && systemAudioTracks.length === 0 && tabAudioStreamId) {
+    tabAudioStream = await acquireTabAudio(tabAudioStreamId);
+    if (tabAudioStream) {
+      systemAudioTracks = tabAudioStream.getAudioTracks();
+      monitorSystemAudio = true;
+    }
+  }
+
+  const hasSystem = systemAudioTracks.length > 0;
+  const hasMic = micAudioTracks.length > 0;
+
+  // No audio at all → record the capture stream untouched.
+  if (!hasSystem && !hasMic) {
     return captureStream;
   }
 
   const tracks: MediaStreamTrack[] = [];
   if (videoTrack) tracks.push(videoTrack);
 
-  if (systemAudioTracks.length === 0) {
-    // Mic only → no mixing needed.
+  // Mic only → no boosting/mixing needed.
+  if (hasMic && !hasSystem) {
     tracks.push(...micAudioTracks);
-  } else {
-    // Both sources present → mix into one track via the Web Audio graph.
-    audioContext = new AudioContext();
-    const destination = audioContext.createMediaStreamDestination();
-    audioContext.createMediaStreamSource(new MediaStream(systemAudioTracks)).connect(destination);
-    audioContext.createMediaStreamSource(new MediaStream(micAudioTracks)).connect(destination);
-    tracks.push(...destination.stream.getAudioTracks());
+    return new MediaStream(tracks);
   }
 
+  // System audio present (with or without mic) → build a Web Audio graph that
+  // boosts the quiet system capture to full volume and mixes in the mic.
+  // A limiter on the master bus catches the boosted peaks so they don't clip.
+  audioContext = new AudioContext();
+  const destination = audioContext.createMediaStreamDestination();
+
+  const limiter = audioContext.createDynamicsCompressor();
+  limiter.threshold.value = -3; // dB — start limiting just below clipping
+  limiter.knee.value = 0;
+  limiter.ratio.value = 20; // hard limit
+  limiter.attack.value = 0.003;
+  limiter.release.value = 0.25;
+  limiter.connect(destination);
+
+  const systemSource = audioContext.createMediaStreamSource(new MediaStream(systemAudioTracks));
+  const systemGain = audioContext.createGain();
+  systemGain.gain.value = SYSTEM_AUDIO_GAIN;
+  systemSource.connect(systemGain).connect(limiter);
+
+  // Tab capture (chromeMediaSource: 'tab') mutes the tab's local playback while
+  // capturing, so the user can't hear the meeting during recording. Echo the
+  // captured audio back to the speakers at normal (un-boosted) volume so they
+  // can. getDisplayMedia's own system audio does NOT mute playback, so we only
+  // monitor when the audio came from tab capture — otherwise it would echo.
+  if (monitorSystemAudio) {
+    systemSource.connect(audioContext.destination);
+  }
+
+  if (hasMic) {
+    const micGain = audioContext.createGain();
+    micGain.gain.value = MIC_GAIN;
+    audioContext
+      .createMediaStreamSource(new MediaStream(micAudioTracks))
+      .connect(micGain)
+      .connect(limiter);
+  }
+
+  // The offscreen document has no user gesture, so the AudioContext starts
+  // suspended and the graph outputs silence. With a mic, getUserMedia happens
+  // to resume it — which is why system audio previously only recorded when the
+  // mic was on. Resume explicitly so system audio is captured independently.
+  if (audioContext.state === 'suspended') {
+    try {
+      await audioContext.resume();
+    } catch (err) {
+      console.warn('[Offscreen] Could not resume AudioContext:', err);
+    }
+  }
+
+  tracks.push(...destination.stream.getAudioTracks());
   return new MediaStream(tracks);
 }
 
@@ -356,13 +452,13 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
     throw new Error('A recording is already in progress in offscreen');
   }
 
-  const { options, streamId } = payload;
+  const { options, streamId, tabAudioStreamId } = payload;
 
   chunks = [];
   mimeType = getSupportedMimeType();
   isRecordingActive = true;
 
-  stream = await createRecordingStream(options, streamId);
+  stream = await createRecordingStream(options, streamId, tabAudioStreamId);
 
   recorder = new MediaRecorder(stream, {
     mimeType: 'video/webm;codecs=vp9,opus',
@@ -485,6 +581,7 @@ function cleanup(): void {
   stream?.getTracks().forEach((t) => t.stop());
   captureStream?.getTracks().forEach((t) => t.stop());
   micStream?.getTracks().forEach((t) => t.stop());
+  tabAudioStream?.getTracks().forEach((t) => t.stop());
   webcamStream?.getTracks().forEach((t) => t.stop());
   if (audioContext && audioContext.state !== 'closed') {
     void audioContext.close();
@@ -493,6 +590,7 @@ function cleanup(): void {
   stream = null;
   captureStream = null;
   micStream = null;
+  tabAudioStream = null;
   webcamStream = null;
   audioContext = null;
   recorder = null;

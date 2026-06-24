@@ -15,6 +15,7 @@ import type {
   FinalizeUploadResponse,
   User,
   BackendRecordingType,
+  AssignedProject,
 } from '@/types';
 import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
 
@@ -90,6 +91,7 @@ interface RpUserResponse {
   photoId: string | null;
   userRole: string;
   active: boolean;
+  assignedProjects?: Record<string, AssignedProject>;
 }
 
 async function callSso(params: Record<string, string>): Promise<SsoTokenResponse> {
@@ -120,6 +122,7 @@ async function fetchRpUser(accessToken: string): Promise<User> {
     avatar: r.photoId ?? null,
     role: r.userRole,
     isActive: r.active,
+    assignedProjects: r.assignedProjects,
   };
 }
 
@@ -264,6 +267,7 @@ export const authApi = {
       avatar: r.photoId ?? null,
       role: r.userRole,
       isActive: r.active,
+      assignedProjects: r.assignedProjects,
     };
   },
 };

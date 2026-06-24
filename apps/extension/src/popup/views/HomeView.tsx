@@ -11,6 +11,8 @@ import {
   Play,
   FileImage,
   Crop,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { useRecordingStore } from '@/store/recording.store';
@@ -101,7 +103,7 @@ const SCREENSHOT_OPTIONS: Array<{
 export function HomeView({ onNavigate }: HomeViewProps) {
   const { user, logout, isAuthenticated } = useAuthStore();
   const { startRecording, takeScreenshot, fetchRecordings } = useRecordingStore();
-  const { settings, toggleMic, toggleWebcam } = useSettingsStore();
+  const { settings, toggleMic, toggleWebcam, toggleSystemAudio } = useSettingsStore();
 
   const [activeTab, setActiveTab] = useState<MainTab>('record');
   const [selectedRecordType, setSelectedRecordType] = useState<RecordingType>('tab');
@@ -240,6 +242,12 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                   label="Mic"
                   active={settings.micEnabled}
                   onClick={() => void toggleMic()}
+                />
+                <ControlToggle
+                  icon={settings.systemAudio ? <Volume2 size={12} /> : <VolumeX size={12} />}
+                  label="Audio"
+                  active={settings.systemAudio}
+                  onClick={() => void toggleSystemAudio()}
                 />
                 <ControlToggle
                   icon={settings.webcamOverlay ? <Video size={12} /> : <VideoOff size={12} />}

@@ -1,5 +1,12 @@
 // ─── Auth Types ────────────────────────────────────────────────────────────────
 
+/** Project assigned to a user. */
+export interface AssignedProject {
+  projectId: number;
+  projectRole: string;
+  entryType: 'INTERNAL' | 'PERSONAL';
+}
+
 /** User shape — mapped from ReportPortal's UserResource. */
 export interface User {
   id: string;
@@ -9,6 +16,8 @@ export interface User {
   avatar: string | null;
   role: string;
   isActive: boolean;
+  // Assigned projects mapping: projectName -> projectDetails
+  assignedProjects?: Record<string, AssignedProject>;
   // Legacy fields kept optional so existing storage reads don't break
   teamId?: string | null;
   isVerified?: boolean;

@@ -663,10 +663,25 @@ async function handleStartRecording(
   currentRecordingOptions = options;
 
   let streamId: string | undefined;
+  // For desktop recording we additionally tab-capture the active tab's audio so
+  // meeting/system voice is recorded even when the user shares the whole screen
+  // — macOS can't capture system-loopback audio for screen/window shares.
+  let tabAudioStreamId: string | undefined;
 
   try {
     if (options.type === 'screen') {
       streamId = 'native-display-media';
+      if (options.systemAudio) {
+        try {
+          const tabId =
+            options.tabId ??
+            (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+          if (tabId) tabAudioStreamId = await getTabStreamId(tabId);
+        } catch {
+          // Active tab not capturable (chrome://, no tab, etc.) — fall back to
+          // whatever system audio getDisplayMedia provides.
+        }
+      }
     } else if (options.type === 'tab') {
       const tabId =
         options.tabId ?? (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
@@ -688,6 +703,7 @@ async function handleStartRecording(
     await sendToOffscreen('OFFSCREEN_START_RECORDING', {
       options,
       streamId,
+      tabAudioStreamId,
       recordingId: currentRecordingId,
     });
 

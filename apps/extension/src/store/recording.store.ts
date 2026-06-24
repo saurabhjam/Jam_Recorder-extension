@@ -22,6 +22,10 @@ interface RecordingStore {
   isMicMuted: boolean;
   isWebcamVisible: boolean;
 
+  // Project selection state
+  selectedProjectName: string | null;
+  setSelectedProjectName: (projectName: string | null) => void;
+
   // Bug report state
   annotationScreenshot: string | null;
   setAnnotationScreenshot: (url: string | null) => void;
@@ -71,6 +75,10 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   error: null,
   isMicMuted: false,
   isWebcamVisible: false,
+
+  // Project selection state
+  selectedProjectName: null,
+  setSelectedProjectName: (projectName: string | null) => set({ selectedProjectName: projectName }),
 
   // Bug report state
   annotationScreenshot: null,
@@ -207,6 +215,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       shareUrl: null,
       currentRecordingId: null,
       error: null,
+      selectedProjectName: null,
     });
   },
 

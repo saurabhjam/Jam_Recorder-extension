@@ -11,6 +11,9 @@ import {
   Lock,
   LogIn,
   Scissors,
+  FolderOpen,
+  ChevronDown,
+  AlertCircle,
 } from 'lucide-react';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -49,6 +52,12 @@ interface NetworkCapture {
   source?: 'cdp' | 'injected';
 }
 
+interface AssignedProjectInfo {
+  projectId: number;
+  projectRole: string;
+  entryType: string;
+}
+
 type LogTab = 'console' | 'network' | 'info' | 'actions';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -56,40 +65,11 @@ const EDITOR_DATA_KEY = 'st_editor_data';
 const PENDING_SHARE_KEY = 'st_pending_share';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const AUTH_USER_KEY = 'st_auth_user';
-const AUTH_PROJECT_KEY = 'st_auth_project';
 const RP_HOST = 'https://reportsv1.best-quality.in';
 const IDB_NAME = 'snaptrace-blobs';
 const IDB_STORE = 'recordings';
 const API_BASE: string =
   (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
-
-async function getProject(token: string): Promise<string> {
-  // Return cached project name
-  const stored = await chrome.storage.local.get([AUTH_PROJECT_KEY]);
-  const cached = stored[AUTH_PROJECT_KEY] as string | undefined;
-  if (cached) return cached;
-
-  // Fetch from RP: GET /api/users?ids= → first key of assignedProjects
-  try {
-    const res = await fetch(`${API_BASE}/users?ids=`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (res.ok) {
-      const raw = (await res.json()) as
-        | { assignedProjects?: Record<string, unknown> }
-        | Array<{ assignedProjects?: Record<string, unknown> }>;
-      const projects = Array.isArray(raw) ? raw[0]?.assignedProjects : raw?.assignedProjects;
-      const name = Object.keys(projects ?? {})[0];
-      if (name) {
-        await chrome.storage.local.set({ [AUTH_PROJECT_KEY]: name });
-        return name;
-      }
-    }
-  } catch {
-    /* fall through */
-  }
-  return 'superadmin_personal';
-}
 
 function splitBlob(blob: Blob): Blob[] {
   const CHUNK_SIZE = 2 * 1024 * 1024;
@@ -168,6 +148,11 @@ export function EditorApp() {
   const [videoDuration, setVideoDuration] = useState(0);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(1); // 0–1 fractions of total duration
+  const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
+  const [assignedProjects, setAssignedProjects] = useState<Record<
+    string,
+    AssignedProjectInfo
+  > | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   // ── Load editor data + blob from IDB ───────────────────────────────────────
@@ -177,6 +162,7 @@ export function EditorApp() {
         EDITOR_DATA_KEY,
         PENDING_SHARE_KEY,
         AUTH_TOKENS_KEY,
+        AUTH_USER_KEY,
       ]);
 
       const stored = result[EDITOR_DATA_KEY] as EditorData | undefined;
@@ -195,6 +181,30 @@ export function EditorApp() {
 
       const tokens = result[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined;
       setIsAuthenticated(!!tokens?.accessToken);
+
+      // Load user's assigned projects from stored user…
+      const user = result[AUTH_USER_KEY] as
+        | { assignedProjects?: Record<string, AssignedProjectInfo> }
+        | undefined;
+      if (user?.assignedProjects && Object.keys(user.assignedProjects).length > 0) {
+        setAssignedProjects(user.assignedProjects);
+      } else if (tokens?.accessToken) {
+        // …or fetch fresh from the API for users who signed in before this feature.
+        try {
+          const res = await fetch(`${API_BASE}/users?ids=`, {
+            headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: 'application/json' },
+          });
+          if (res.ok) {
+            const raw = (await res.json()) as
+              | { assignedProjects?: Record<string, AssignedProjectInfo> }
+              | Array<{ assignedProjects?: Record<string, AssignedProjectInfo> }>;
+            const projects = Array.isArray(raw) ? raw[0]?.assignedProjects : raw?.assignedProjects;
+            if (projects && Object.keys(projects).length > 0) setAssignedProjects(projects);
+          }
+        } catch {
+          /* network unavailable — dropdown stays empty */
+        }
+      }
     };
     void load();
   }, [recordingId]);
@@ -256,6 +266,13 @@ export function EditorApp() {
 
   const handleSave = useCallback(async () => {
     if (!data || !recordingId || isSaving || shareUrl) return;
+
+    // Check if a project is selected
+    if (!selectedProjectName) {
+      setUploadError('Please select a project to save your recording');
+      return;
+    }
+
     setIsSaving(true);
     setUploadPercent(0);
     setUploadError(null);
@@ -278,8 +295,9 @@ export function EditorApp() {
       const isoNow = new Date(ts).toISOString();
       const shareId = `share-${ts}`;
 
-      // Step 1: get the user's RP project name
-      const project = await getProject(token);
+      // Use the selected project instead of fetching the first one
+      const project = selectedProjectName;
+      const projectId = assignedProjects?.[project]?.projectId ?? null;
 
       // Step 2: upload video file → get MinIO filename
       const videoFileName = await new Promise<string>((resolve, reject) => {
@@ -392,7 +410,7 @@ export function EditorApp() {
           mimeType: mimeBase,
           status: 'completed',
           userId,
-          projectId: '1',
+          projectId: projectId !== null ? String(projectId) : '1',
           shareId,
           isPublic: false,
           allowDownload: true,
@@ -435,7 +453,7 @@ export function EditorApp() {
     } finally {
       setIsSaving(false);
     }
-  }, [data, recordingId, title, isSaving, shareUrl]);
+  }, [data, recordingId, title, isSaving, shareUrl, selectedProjectName, assignedProjects]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -501,6 +519,15 @@ export function EditorApp() {
           </div>
           <span style={{ fontSize: '15px', fontWeight: 700, color: 'white' }}>SnapTrace</span>
         </div>
+
+        {/* ── Project selector (center) ── */}
+        <ProjectSelector
+          projects={assignedProjects}
+          selected={selectedProjectName}
+          onSelect={setSelectedProjectName}
+          disabled={!!shareUrl || isSaving}
+        />
+
         <motion.button
           whileTap={{ scale: 0.96 }}
           onClick={() => void handleCopyLink()}
@@ -1593,6 +1620,188 @@ function TrimBar({
 
       {/* Spacer for time labels */}
       <div style={{ height: '8px' }} />
+    </div>
+  );
+}
+
+// ─── Project Selector ──────────────────────────────────────────────────────────
+
+function ProjectSelector({
+  projects,
+  selected,
+  onSelect,
+  disabled,
+}: {
+  projects: Record<string, AssignedProjectInfo> | null;
+  selected: string | null;
+  onSelect: (name: string) => void;
+  disabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const entries = projects ? Object.entries(projects) : [];
+  const hasProjects = entries.length > 0;
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  const needsSelection = !selected;
+
+  return (
+    <div ref={ref} style={{ position: 'relative', minWidth: '260px' }}>
+      <button
+        type="button"
+        disabled={disabled || !hasProjects}
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          width: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          padding: '8px 12px',
+          borderRadius: '10px',
+          background: '#111118',
+          border: `1px solid ${needsSelection ? 'rgba(245,158,11,0.5)' : 'rgba(139,92,246,0.4)'}`,
+          color: selected ? 'white' : 'rgba(148,163,184,0.7)',
+          fontSize: '13px',
+          fontWeight: 600,
+          cursor: disabled || !hasProjects ? 'not-allowed' : 'pointer',
+          opacity: disabled || !hasProjects ? 0.6 : 1,
+          fontFamily: 'inherit',
+          transition: 'border-color 0.15s',
+        }}
+      >
+        <FolderOpen size={15} style={{ color: '#a78bfa', flexShrink: 0 }} />
+        <span
+          style={{
+            flex: 1,
+            textAlign: 'left',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {selected ?? (hasProjects ? 'Select a project' : 'No projects available')}
+        </span>
+        <ChevronDown
+          size={15}
+          style={{
+            color: 'rgba(148,163,184,0.6)',
+            flexShrink: 0,
+            transform: open ? 'rotate(180deg)' : 'none',
+            transition: 'transform 0.15s',
+          }}
+        />
+      </button>
+
+      {/* Warning when nothing is selected */}
+      {needsSelection && hasProjects && !disabled && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 5px)',
+            left: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '5px',
+            fontSize: '11px',
+            color: '#fbbf24',
+            fontWeight: 600,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <AlertCircle size={12} />
+          Please select a project
+        </div>
+      )}
+
+      <AnimatePresence>
+        {open && hasProjects && (
+          <motion.div
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.12 }}
+            style={{
+              position: 'absolute',
+              top: 'calc(100% + 6px)',
+              left: 0,
+              right: 0,
+              maxHeight: '280px',
+              overflowY: 'auto',
+              background: '#14141c',
+              border: '1px solid rgba(255,255,255,0.1)',
+              borderRadius: '12px',
+              boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+              zIndex: 50,
+              padding: '6px',
+            }}
+          >
+            {entries.map(([name, info]) => {
+              const isSel = name === selected;
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => {
+                    onSelect(name);
+                    setOpen(false);
+                  }}
+                  style={{
+                    width: '100%',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                    padding: '9px 10px',
+                    borderRadius: '8px',
+                    background: isSel ? 'rgba(139,92,246,0.18)' : 'transparent',
+                    border: 'none',
+                    color: isSel ? '#c4b5fd' : 'rgba(203,213,225,0.85)',
+                    fontSize: '13px',
+                    fontWeight: 600,
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    fontFamily: 'inherit',
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!isSel) e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!isSel) e.currentTarget.style.background = 'transparent';
+                  }}
+                >
+                  <span
+                    style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    {name}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: '9px',
+                      fontWeight: 700,
+                      letterSpacing: '0.4px',
+                      padding: '2px 6px',
+                      borderRadius: '6px',
+                      background: 'rgba(255,255,255,0.07)',
+                      color: 'rgba(148,163,184,0.7)',
+                      flexShrink: 0,
+                    }}
+                  >
+                    {info.projectRole?.replace(/_/g, ' ') ?? ''}
+                  </span>
+                </button>
+              );
+            })}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
