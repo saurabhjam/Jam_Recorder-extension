@@ -25,6 +25,7 @@ import type {
 } from '@/types';
 import { STORAGE_KEYS } from '@/types';
 import { generateId } from '@/utils';
+import { RP_HOST, RP_HOSTNAME, API_BASE_URL } from '@/config';
 
 // ─── Offscreen Management ─────────────────────────────────────────────────────
 
@@ -1496,7 +1497,7 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   void triggerOffscreenQueueProcessing();
 
   if (reason === 'install') {
-    chrome.tabs.create({ url: 'https://reportsv1.best-quality.in' });
+    chrome.tabs.create({ url: RP_HOST });
   }
 });
 
@@ -1531,16 +1532,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // Watches for the OAuth callback URL, extracts tokens, fetches the user profile,
 // stores everything in extension storage, and closes the OAuth tab.
 
-const API_BASE_FOR_OAUTH = (() => {
-  try {
-    return (
-      (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ??
-      'https://reportsv1.best-quality.in/api'
-    );
-  } catch {
-    return 'https://reportsv1.best-quality.in/api';
-  }
-})();
+const API_BASE_FOR_OAUTH = API_BASE_URL;
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!changeInfo.url) return;
@@ -1554,7 +1546,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
   // Match /auth/callback?accessToken=... on the real frontend
   const isOAuthCallback =
-    (url.hostname === 'reportsv1.best-quality.in' ||
+    (url.hostname === RP_HOSTNAME ||
       (url.hostname === 'localhost' && (url.port === '3001' || url.port === '3000'))) &&
     url.pathname === '/auth/callback';
 

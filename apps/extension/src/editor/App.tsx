@@ -15,6 +15,7 @@ import {
   ChevronDown,
   AlertCircle,
 } from 'lucide-react';
+import { RP_HOST, API_BASE_URL as API_BASE } from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -65,11 +66,8 @@ const EDITOR_DATA_KEY = 'st_editor_data';
 const PENDING_SHARE_KEY = 'st_pending_share';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const AUTH_USER_KEY = 'st_auth_user';
-const RP_HOST = 'https://reportsv1.best-quality.in';
 const IDB_NAME = 'snaptrace-blobs';
 const IDB_STORE = 'recordings';
-const API_BASE: string =
-  (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
 
 function splitBlob(blob: Blob): Blob[] {
   const CHUNK_SIZE = 2 * 1024 * 1024;

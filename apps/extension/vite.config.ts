@@ -59,6 +59,13 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_API_BASE_URL': JSON.stringify(
         env['VITE_API_BASE_URL'] || 'http://localhost:3000/api',
       ),
+      'import.meta.env.VITE_RP_HOST': JSON.stringify(
+        env['VITE_RP_HOST'] || 'http://localhost:3000',
+      ),
+      'import.meta.env.VITE_SSO_TOKEN_URL': JSON.stringify(
+        env['VITE_SSO_TOKEN_URL'] ||
+          `${env['VITE_RP_HOST'] || 'http://localhost:3000'}/uat/sso/oauth/token`,
+      ),
       'process.env.NODE_ENV': JSON.stringify(mode),
     },
     build: {

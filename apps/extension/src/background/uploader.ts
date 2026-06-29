@@ -15,19 +15,7 @@
 import type { RecordingMetadata, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
-
-// ─── Config ───────────────────────────────────────────────────────────────────
-
-const RP_HOST = 'https://reportsv1.best-quality.in';
-
-const API_BASE_URL: string = (() => {
-  try {
-    const env = (import.meta as { env?: Record<string, string> }).env;
-    return env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
-  } catch {
-    return `${RP_HOST}/api`;
-  }
-})();
+import { RP_HOST, API_BASE_URL } from '@/config';
 
 async function getProject(token: string): Promise<string> {
   try {

@@ -18,23 +18,12 @@ import type {
   AssignedProject,
 } from '@/types';
 import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
+import { API_BASE_URL as REPORTS_API_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
 
 // ─── Base URLs ────────────────────────────────────────────────────────────────
 
 // ReportPortal Java API — recordings, uploads, and user info
 const PROJECT = 'superadmin_personal';
-const REPORTS_API_URL: string = (() => {
-  try {
-    const fromEnv = (import.meta as { env?: Record<string, string> }).env?.['VITE_API_BASE_URL'];
-    return fromEnv ?? 'https://reportsv1.best-quality.in/api';
-  } catch {
-    return 'https://reportsv1.best-quality.in/api';
-  }
-})();
-
-// ReportPortal SSO — password and refresh_token grants
-const SSO_TOKEN_URL = 'https://reportsv1.best-quality.in/uat/sso/oauth/token';
-const SSO_AUTH_HEADER = 'Basic dWk6dWltYW4=';
 
 // ─── Error Extraction ─────────────────────────────────────────────────────────
 

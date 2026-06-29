@@ -12,17 +12,9 @@
 import axios from 'axios';
 import type { AuthTokens } from '@/types';
 import { STORAGE_KEYS, AUTH_REFRESH_ALARM } from '@/types';
+import { API_BASE_URL } from '@/config';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-
-const API_BASE_URL: string = (() => {
-  try {
-    const env = (import.meta as { env?: Record<string, string> }).env;
-    return env?.['VITE_API_BASE_URL'] ?? 'http://localhost:4000/api';
-  } catch {
-    return 'http://localhost:4000/api';
-  }
-})();
 
 /** Schedule refresh this many ms before expiry. */
 const REFRESH_BUFFER_MS = 2 * 60 * 1000; // 2 minutes

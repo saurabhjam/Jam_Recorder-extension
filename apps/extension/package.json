@@ -10,6 +10,7 @@
     "dev:patient": "vite build --watch --mode patient",
     "dev:doctor": "vite build --watch --mode doctor",
     "build": "vite build",
+    "build:qa": "vite build --mode qa",
     "build:prod": "vite build --mode production",
     "type-check": "tsc --noEmit",
     "lint": "eslint src --ext ts,tsx"

@@ -19,6 +19,7 @@
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
+import { RP_HOST, API_BASE_URL as REPORTS_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -36,21 +37,7 @@ interface OffscreenIncomingMessage {
 }
 
 // ─── API Config ───────────────────────────────────────────────────────────────
-
-// ReportPortal Java API — recordings, uploads, user info
-const RP_HOST = 'https://reportsv1.best-quality.in';
-const REPORTS_URL: string = (() => {
-  try {
-    const env = (import.meta as { env?: Record<string, string> }).env;
-    return env?.['VITE_API_BASE_URL'] ?? `${RP_HOST}/api`;
-  } catch {
-    return `${RP_HOST}/api`;
-  }
-})();
-
-// ReportPortal SSO — used for silent token refresh
-const SSO_TOKEN_URL = `${RP_HOST}/uat/sso/oauth/token`;
-const SSO_AUTH_HEADER = 'Basic dWk6dWltYW4=';
+// All host/URL values come from @/config (build-time env). See vite.config.ts.
 
 async function getProject(token: string): Promise<string> {
   try {
