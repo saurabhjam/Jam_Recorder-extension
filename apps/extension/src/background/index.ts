@@ -954,10 +954,12 @@ async function cropDataUrl(
 
 interface CaptureStrip {
   dataUrl: string;
+  srcX: number; // physical px offset from left of the captured viewport image
   srcY: number; // physical px offset from top of the captured viewport image
+  srcW: number; // physical px width of content to draw from this capture
   srcH: number; // physical px height of new content to draw from this capture
+  destX: number; // physical px destination X on the final canvas
   destY: number; // physical px destination Y on the final canvas
-  canvasW: number; // physical px canvas width (same for all strips)
 }
 
 /** Stitch non-overlapping strips into one full-page image. */
@@ -975,13 +977,13 @@ async function stitchCaptures(
       const bitmap = await createImageBitmap(blob);
       ctx.drawImage(
         bitmap,
-        0,
+        strip.srcX,
         strip.srcY,
-        strip.canvasW,
+        strip.srcW,
         strip.srcH, // source rect
-        0,
+        strip.destX,
         strip.destY,
-        strip.canvasW,
+        strip.srcW,
         strip.srcH, // dest rect
       );
       bitmap.close();
@@ -992,16 +994,53 @@ async function stitchCaptures(
   return blobToDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
 }
 
+// Chrome throttles tabs.captureVisibleTab to ~2 calls/sec (MAX_CAPTURE_VISIBLE_TAB_
+// CALLS_PER_SECOND). Capturing faster makes calls reject and strips go missing in the
+// stitched image. Space captures out and retry on the quota error (like GoFullPage).
+const CAPTURE_MIN_INTERVAL_MS = 550;
+let lastCaptureTs = 0;
+
+async function captureVisibleThrottled(windowId: number): Promise<string> {
+  const sinceLast = Date.now() - lastCaptureTs;
+  if (sinceLast < CAPTURE_MIN_INTERVAL_MS) {
+    await new Promise<void>((r) => setTimeout(r, CAPTURE_MIN_INTERVAL_MS - sinceLast));
+  }
+
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
+      lastCaptureTs = Date.now();
+      return dataUrl;
+    } catch (err) {
+      lastErr = err;
+      const msg = String((err as Error)?.message ?? err);
+      // Quota exceeded — wait a full interval and retry. Other errors are fatal.
+      if (msg.includes('MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND')) {
+        await new Promise<void>((r) => setTimeout(r, CAPTURE_MIN_INTERVAL_MS));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('captureVisibleTab failed after retries');
+}
+
 async function captureFullPage(tabId: number, windowId: number): Promise<string> {
   // ── 1. Get page dimensions ────────────────────────────────────────────────
   let dims: {
-    scrollWidth: number;
-    scrollHeight: number;
-    viewportWidth: number;
-    viewportHeight: number;
+    scrollHeight: number; // content height of the scroll target (CSS px)
+    viewportWidth: number; // FULL window width — canvas spans this so sidebars are kept
+    viewportHeight: number; // FULL window height
     currentScrollX: number;
     currentScrollY: number;
     devicePixelRatio: number;
+    // The scroll target's on-screen box (CSS px). This is the only region that changes
+    // between frames, so frames after the first only redraw this column.
+    clipX: number;
+    clipY: number;
+    clipWidth: number;
+    clipHeight: number;
   };
 
   try {
@@ -1020,19 +1059,23 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     currentScrollX,
     currentScrollY,
     devicePixelRatio: dpr,
+    clipX,
+    clipY,
+    clipWidth,
+    clipHeight,
   } = dims;
 
-  // Page fits in viewport — simple capture
-  if (scrollHeight <= viewportHeight + 2) {
+  // Content already fits the scroll target — nothing to scroll, simple capture.
+  if (scrollHeight <= clipHeight + 2) {
     return chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
   }
 
-  const maxScrollY = Math.max(0, scrollHeight - viewportHeight);
+  const maxScrollY = Math.max(0, scrollHeight - clipHeight);
 
   // ── 2. Build non-overlapping scroll positions (no duplicates) ────────────
-  // Each position is exactly viewportHeight apart, plus the final bottom position.
+  // Each step advances by the scroll target's visible height, plus the final bottom.
   const positions: number[] = [];
-  for (let y = 0; y < maxScrollY; y += viewportHeight) {
+  for (let y = 0; y < maxScrollY; y += clipHeight) {
     positions.push(Math.round(y));
   }
   if (positions[positions.length - 1] !== maxScrollY) {
@@ -1052,36 +1095,47 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     }
   }
 
-  // ── 4. Hide fixed/sticky elements so they don't pollute every strip ──────
+  // ── 4. Classify fixed/sticky overlays (header/sidebar/footer/composer) ───
   try {
     await chrome.tabs.sendMessage(tabId, {
       type: 'SCREENSHOT_PREPARE_CAPTURE',
     } as ExtensionMessage);
   } catch {
-    /* non-fatal — capture continues without hiding */
+    /* non-fatal — capture continues without overlay handling */
   }
 
-  // ── 5. Main capture pass: scroll → wait → capture ────────────────────────
-  const rawCaptures: Array<{ dataUrl: string; actualScrollY: number }> = [];
+  // ── 5. Main capture pass: per frame → set overlay visibility → scroll → capture
+  // Top overlays show only on the first frame, bottom overlays only on the last, so
+  // each appears exactly once instead of repeating down every strip.
+  const rawCaptures: Array<{ dataUrl: string; actualScrollY: number; isFirst: boolean }> = [];
 
-  for (const targetY of positions) {
+  for (let i = 0; i < positions.length; i++) {
+    const targetY = positions[i]!;
+    const phase = i === 0 ? 'first' : i === positions.length - 1 ? 'last' : 'middle';
     try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'SCREENSHOT_SET_FRAME',
+        payload: { phase },
+      } as ExtensionMessage);
+
       const scrolled = (await chrome.tabs.sendMessage(tabId, {
         type: 'SCREENSHOT_SCROLL_TO',
         payload: { x: 0, y: targetY },
       } as ExtensionMessage)) as { actualScrollX: number; actualScrollY: number };
 
-      // Wait for compositor + any remaining lazy-load renders
-      await new Promise<void>((r) => setTimeout(r, 180));
+      // captureVisibleThrottled enforces the ~2/sec quota gap; the page renders
+      // (and overlay visibility settles) during that wait. Add a small floor so the
+      // compositor paints even on the first (un-throttled) capture.
+      await new Promise<void>((r) => setTimeout(r, 120));
 
-      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-      rawCaptures.push({ dataUrl, actualScrollY: scrolled.actualScrollY });
+      const dataUrl = await captureVisibleThrottled(windowId);
+      rawCaptures.push({ dataUrl, actualScrollY: scrolled.actualScrollY, isFirst: i === 0 });
     } catch (err) {
       console.warn('[Background] Full-page: skipping position', targetY, err);
     }
   }
 
-  // ── 6. Restore fixed elements and original scroll position ───────────────
+  // ── 6. Restore overlays and original scroll position ─────────────────────
   try {
     await chrome.tabs.sendMessage(tabId, {
       type: 'SCREENSHOT_RESTORE_CAPTURE',
@@ -1103,31 +1157,49 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     return chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
   }
 
-  // ── 7. Build strips — each draws only the NEW content not in previous strips
+  // ── 7. Build strips ──────────────────────────────────────────────────────
+  // Canvas spans the full window width and the content's full height. Content row Y
+  // (in the scroll target) maps to canvas Y = clipY + Y.
   //
-  // For capture at actualScrollY S showing page rows [S, S+VH):
-  //   newStart = max(prevEndY, S)          — skip already-drawn overlap
-  //   newEnd   = min(S + VH, scrollHeight) — don't draw past page bottom
-  //   srcY     = (newStart - S) * dpr      — offset in the captured bitmap
-  //   srcH     = (newEnd - newStart) * dpr
-  //   destY    = newStart * dpr
-  //
+  //  • First frame: drawn FULL-WIDTH from the top — this lays down everything outside
+  //    the scroll column (sidebar, header) plus the first screen of content.
+  //  • Later frames: only the scroll column [clipX, clipX+clipWidth) is redrawn, for
+  //    the NEW content not already covered — so the sidebar/header are never repeated.
   const canvasW = Math.round(viewportWidth * dpr);
-  const canvasH = Math.round(scrollHeight * dpr);
+  const canvasH = Math.round((clipY + scrollHeight) * dpr);
+  const colSrcX = Math.round(clipX * dpr);
+  const colW = Math.round(clipWidth * dpr);
   const strips: CaptureStrip[] = [];
-  let prevEndY = 0; // CSS px
+  let prevEndY = 0; // CSS px, in scroll-target content coordinates
 
-  for (const { dataUrl, actualScrollY } of rawCaptures) {
+  for (const { dataUrl, actualScrollY, isFirst } of rawCaptures) {
+    if (isFirst) {
+      // Full viewport → top of canvas. Covers content rows [0, clipHeight).
+      strips.push({
+        dataUrl,
+        srcX: 0,
+        srcY: 0,
+        srcW: canvasW,
+        srcH: Math.round(viewportHeight * dpr),
+        destX: 0,
+        destY: 0,
+      });
+      prevEndY = clipHeight;
+      continue;
+    }
+
     const newStart = Math.max(prevEndY, actualScrollY);
-    const newEnd = Math.min(actualScrollY + viewportHeight, scrollHeight);
+    const newEnd = Math.min(actualScrollY + clipHeight, scrollHeight);
     if (newEnd <= newStart) continue;
 
     strips.push({
       dataUrl,
-      srcY: Math.round((newStart - actualScrollY) * dpr),
+      srcX: colSrcX,
+      srcY: Math.round((clipY + (newStart - actualScrollY)) * dpr),
+      srcW: colW,
       srcH: Math.round((newEnd - newStart) * dpr),
-      destY: Math.round(newStart * dpr),
-      canvasW,
+      destX: colSrcX,
+      destY: Math.round((clipY + newStart) * dpr),
     });
     prevEndY = newEnd;
   }

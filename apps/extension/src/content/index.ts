@@ -39,6 +39,56 @@ let isToolbarVisible = false;
 let networkCaptures: CaptureNetworkEntry[] = [];
 let consoleLogs: CaptureConsoleLog[] = [];
 
+// The element that actually scrolls the page. Resolved on SCREENSHOT_GET_DIMENSIONS
+// and reused by the scroll/restore handlers so a full-page capture stays consistent.
+// `null` means the window/document itself scrolls.
+let screenshotScrollEl: HTMLElement | null = null;
+
+// Fixed/sticky overlays (headers, sidebars, footers, composer bars) captured during a
+// full-page screenshot, with the anchor used to decide on which frame each is shown.
+// Top-anchored ones show only on the first frame; bottom-anchored only on the last;
+// all are hidden on the in-between frames so they never repeat down the stitched image.
+type OverlayAnchor = 'top' | 'bottom';
+let screenshotOverlays: Array<{ el: HTMLElement; anchor: OverlayAnchor; prevVisibility: string }> =
+  [];
+
+/**
+ * Find the element that actually scrolls the bulk of the page.
+ *
+ * Plain documents scroll the window, but most SPAs (ChatGPT, Gmail, etc.) keep the
+ * document at viewport height and scroll an inner `overflow:auto` container instead.
+ * Returns `null` when the window/document is the scroller, otherwise the largest
+ * scrollable descendant — so a full-page capture can scroll the right thing.
+ */
+function findScrollTarget(): HTMLElement | null {
+  const doc = document.documentElement;
+  // Window/document scrolls — the simple, common case.
+  if (doc.scrollHeight > window.innerHeight + 4) return null;
+
+  let best: HTMLElement | null = null;
+  let bestOverflow = 0;
+  const minWidth = window.innerWidth * 0.5;
+  const minHeight = window.innerHeight * 0.5;
+
+  document.querySelectorAll<HTMLElement>('*').forEach((el) => {
+    try {
+      const overflow = el.scrollHeight - el.clientHeight;
+      if (overflow <= 4) return; // not vertically scrollable
+      if (el.clientWidth < minWidth || el.clientHeight < minHeight) return; // too small to be the page scroller
+      const style = window.getComputedStyle(el);
+      if (style.overflowY !== 'auto' && style.overflowY !== 'scroll') return;
+      if (overflow > bestOverflow) {
+        bestOverflow = overflow;
+        best = el;
+      }
+    } catch {
+      /* skip elements that throw on getComputedStyle */
+    }
+  });
+
+  return best;
+}
+
 // ─── Toolbar Management ───────────────────────────────────────────────────────
 
 function mountToolbar(recordingId: string): void {
@@ -326,25 +376,63 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     // ── Screenshot workflow ──────────────────────────────────────────────────
 
     case 'SCREENSHOT_GET_DIMENSIONS': {
-      sendResponse({
-        scrollWidth: document.documentElement.scrollWidth,
-        scrollHeight: document.documentElement.scrollHeight,
-        viewportWidth: window.innerWidth,
-        viewportHeight: window.innerHeight,
-        currentScrollX: window.scrollX,
-        currentScrollY: window.scrollY,
-        devicePixelRatio: window.devicePixelRatio,
-      });
+      // Resolve (once per capture) whether the window or an inner element scrolls.
+      screenshotScrollEl = findScrollTarget();
+
+      // viewportWidth/Height is always the FULL viewport: the canvas spans the whole
+      // window width (so a left sidebar is kept) and the first frame draws full-width.
+      // clip{X,Y,W,H} is the scroll-container's on-screen box — the only region that
+      // actually changes between frames, so subsequent frames only redraw that column.
+      if (screenshotScrollEl) {
+        const el = screenshotScrollEl;
+        const rect = el.getBoundingClientRect();
+        sendResponse({
+          scrollHeight: el.scrollHeight,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          currentScrollX: el.scrollLeft,
+          currentScrollY: el.scrollTop,
+          devicePixelRatio: window.devicePixelRatio,
+          clipX: rect.left,
+          clipY: rect.top,
+          clipWidth: el.clientWidth,
+          clipHeight: el.clientHeight,
+        });
+      } else {
+        // Window/document scrolls — the clip column is the full viewport.
+        sendResponse({
+          scrollHeight: document.documentElement.scrollHeight,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          currentScrollX: window.scrollX,
+          currentScrollY: window.scrollY,
+          devicePixelRatio: window.devicePixelRatio,
+          clipX: 0,
+          clipY: 0,
+          clipWidth: window.innerWidth,
+          clipHeight: window.innerHeight,
+        });
+      }
       break;
     }
 
     case 'SCREENSHOT_SCROLL_TO': {
       const { x, y } = message.payload as { x: number; y: number };
-      window.scrollTo(x, y);
+      const el = screenshotScrollEl;
+      if (el) {
+        el.scrollLeft = x;
+        el.scrollTop = y;
+      } else {
+        window.scrollTo(x, y);
+      }
       // Double rAF ensures the compositor has painted before background captures
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          sendResponse({ actualScrollX: window.scrollX, actualScrollY: window.scrollY });
+          sendResponse(
+            el
+              ? { actualScrollX: el.scrollLeft, actualScrollY: el.scrollTop }
+              : { actualScrollX: window.scrollX, actualScrollY: window.scrollY },
+          );
         });
       });
       return true; // async
@@ -352,20 +440,33 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
 
     case 'SCREENSHOT_RESTORE_SCROLL': {
       const { x, y } = message.payload as { x: number; y: number };
-      window.scrollTo(x, y);
+      if (screenshotScrollEl) {
+        screenshotScrollEl.scrollLeft = x;
+        screenshotScrollEl.scrollTop = y;
+      } else {
+        window.scrollTo(x, y);
+      }
+      screenshotScrollEl = null; // capture finished — reset for next run
       sendResponse({ success: true });
       break;
     }
 
     case 'SCREENSHOT_PREPARE_CAPTURE': {
-      // Tag all position:fixed elements so a single injected CSS rule hides them.
-      // This prevents fixed headers/footers from appearing in every scroll strip.
+      // Collect fixed/sticky overlays and classify each by where it sits in the
+      // viewport, so the background can show it on just one frame instead of every
+      // strip. A tall element (e.g. a full-height sidebar) anchors to the top.
+      screenshotOverlays = [];
+      const vh = window.innerHeight;
       try {
-        document.querySelectorAll('*').forEach((node) => {
+        document.querySelectorAll<HTMLElement>('*').forEach((node) => {
           try {
-            if (window.getComputedStyle(node as HTMLElement).position === 'fixed') {
-              (node as HTMLElement).setAttribute('data-snaptrace-fixed', '1');
-            }
+            const pos = window.getComputedStyle(node).position;
+            if (pos !== 'fixed' && pos !== 'sticky') return;
+            const rect = node.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return;
+            const anchor: OverlayAnchor =
+              rect.height >= vh * 0.7 || rect.top + rect.height / 2 < vh * 0.5 ? 'top' : 'bottom';
+            screenshotOverlays.push({ el: node, anchor, prevVisibility: node.style.visibility });
           } catch {
             /* skip elements that throw on getComputedStyle */
           }
@@ -373,24 +474,30 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       } catch {
         /* ignore on restricted pages */
       }
+      sendResponse({ success: true });
+      break;
+    }
 
-      let styleEl = document.getElementById('__snaptrace_cap_style') as HTMLStyleElement | null;
-      if (!styleEl) {
-        styleEl = document.createElement('style');
-        styleEl.id = '__snaptrace_cap_style';
-        (document.head ?? document.documentElement).appendChild(styleEl);
+    case 'SCREENSHOT_SET_FRAME': {
+      // phase decides which overlays are visible for the about-to-be-taken capture:
+      //   first  → top-anchored only   (header/sidebar appears once at the top)
+      //   last   → bottom-anchored only (footer/composer appears once at the bottom)
+      //   middle → none                (clean scrolling content, no repeats)
+      const { phase } = message.payload as { phase: 'first' | 'middle' | 'last' };
+      for (const o of screenshotOverlays) {
+        const show =
+          (phase === 'first' && o.anchor === 'top') || (phase === 'last' && o.anchor === 'bottom');
+        o.el.style.visibility = show ? o.prevVisibility || 'visible' : 'hidden';
       }
-      styleEl.textContent =
-        '[data-snaptrace-fixed]{visibility:hidden!important;opacity:0!important;}';
       sendResponse({ success: true });
       break;
     }
 
     case 'SCREENSHOT_RESTORE_CAPTURE': {
-      document.querySelectorAll('[data-snaptrace-fixed]').forEach((el) => {
-        el.removeAttribute('data-snaptrace-fixed');
-      });
-      document.getElementById('__snaptrace_cap_style')?.remove();
+      for (const o of screenshotOverlays) {
+        o.el.style.visibility = o.prevVisibility;
+      }
+      screenshotOverlays = [];
       sendResponse({ success: true });
       break;
     }

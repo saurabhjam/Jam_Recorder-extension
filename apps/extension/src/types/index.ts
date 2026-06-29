@@ -167,6 +167,7 @@ export type MessageType =
   | 'SCREENSHOT_SHOW_PREVIEW'
   | 'SCREENSHOT_AREA_SELECTED'
   | 'SCREENSHOT_PREPARE_CAPTURE'
+  | 'SCREENSHOT_SET_FRAME'
   | 'SCREENSHOT_RESTORE_CAPTURE';
 
 // ─── Capture Types ─────────────────────────────────────────────────────────────
