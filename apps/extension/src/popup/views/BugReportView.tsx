@@ -17,6 +17,7 @@ import {
 import { bugReportService } from '../../services/bugReport.service';
 import type { BrowserInfo, ConsoleLog, NetworkLog } from '../../services/bugReport.service';
 import { Button } from '../../components/ui/Button';
+import { InstanceBadge } from '../../components/ui/InstanceBadge';
 import { useRecordingStore } from '../../store/recording.store';
 import { api } from '../../services/api';
 import { cn } from '../../utils';
@@ -306,9 +307,12 @@ export function BugReportView({ onCancel, onAnnotate }: BugReportViewProps) {
           </div>
           <h2 className="text-sm font-bold text-white">Report a Bug</h2>
         </div>
-        <button type="button" onClick={onCancel} className="icon-btn" aria-label="Close">
-          <X size={15} />
-        </button>
+        <div className="flex items-center gap-2">
+          <InstanceBadge size={14} />
+          <button type="button" onClick={onCancel} className="icon-btn" aria-label="Close">
+            <X size={15} />
+          </button>
+        </div>
       </div>
 
       {/* Scrollable Form Body */}

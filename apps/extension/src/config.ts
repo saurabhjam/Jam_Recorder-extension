@@ -29,6 +29,16 @@ export const SSO_TOKEN_URL: string =
 /** Basic auth header for the SSO token endpoint. */
 export const SSO_AUTH_HEADER = 'Basic dWk6dWltYW4=';
 
+/**
+ * Human-readable label for the build instance — e.g. "QA" or "Production".
+ * Set per-instance in `.env.qa` / `.env.production` via `VITE_INSTANCE_LABEL`.
+ * Empty in local dev builds (no badge shown).
+ */
+export const INSTANCE_LABEL: string = import.meta.env.VITE_INSTANCE_LABEL || '';
+
+/** True when this build targets the production instance. */
+export const IS_PRODUCTION: boolean = /prod/i.test(INSTANCE_LABEL);
+
 /** Hostname of the configured frontend host — used to match the OAuth callback tab. */
 export const RP_HOSTNAME: string = (() => {
   try {

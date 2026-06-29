@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { Check, Loader2, X } from 'lucide-react';
 import { useRecordingStore } from '@/store/recording.store';
 import { formatBytes } from '@/utils';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 
 type StepStatus = 'done' | 'active' | 'pending';
 
@@ -62,7 +63,11 @@ export function UploadView() {
   const steps = getSteps(percent);
 
   return (
-    <div className="h-full flex flex-col items-center justify-center px-6 py-6 gap-6">
+    <div className="relative h-full flex flex-col items-center justify-center px-6 py-6 gap-6">
+      <div className="absolute top-3 right-3">
+        <InstanceBadge size={14} />
+      </div>
+
       {/* ─── Circular Progress Ring ─── */}
       <motion.div
         initial={{ opacity: 0, scale: 0.6 }}

@@ -17,6 +17,7 @@ import { useRecordingStore } from '@/store/recording.store';
 import { useClipboard } from '@/hooks/useClipboard';
 import { useToast } from '@/components/ui/Toast';
 import { Button } from '@/components/ui/Button';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 import { recordingsApi } from '@/services/api';
 import { formatDuration } from '@/utils';
 import type { Recording } from '@/types';
@@ -115,6 +116,7 @@ export function ShareView({ onRecordAnother }: ShareViewProps) {
           <p className="text-sm font-bold text-white leading-none">Recording ready</p>
           <p className="text-xxs text-dark-400 mt-0.5">Upload complete — share it now</p>
         </div>
+        <InstanceBadge size={14} className="ml-auto" />
       </motion.div>
 
       <div className="flex-1 overflow-y-auto scrollbar-thin px-4 py-3 flex flex-col gap-3">

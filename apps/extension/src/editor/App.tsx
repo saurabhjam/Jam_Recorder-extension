@@ -14,8 +14,10 @@ import {
   FolderOpen,
   ChevronDown,
   AlertCircle,
+  ShieldCheck,
+  FlaskConical,
 } from 'lucide-react';
-import { RP_HOST, API_BASE_URL as API_BASE } from '@/config';
+import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -516,6 +518,48 @@ export function EditorApp() {
             </svg>
           </div>
           <span style={{ fontSize: '15px', fontWeight: 700, color: 'white' }}>SnapTrace</span>
+          {INSTANCE_LABEL && (
+            <motion.span
+              title={INSTANCE_LABEL}
+              initial={{ scale: 0, rotate: -25, opacity: 0 }}
+              animate={{
+                scale: 1,
+                rotate: 0,
+                opacity: 1,
+                boxShadow: IS_PRODUCTION
+                  ? [
+                      '0 0 0px 0px rgba(16,185,129,0.55)',
+                      '0 0 10px 1px rgba(16,185,129,0.55)',
+                      '0 0 0px 0px rgba(16,185,129,0.55)',
+                    ]
+                  : [
+                      '0 0 0px 0px rgba(245,158,11,0.55)',
+                      '0 0 10px 1px rgba(245,158,11,0.55)',
+                      '0 0 0px 0px rgba(245,158,11,0.55)',
+                    ],
+              }}
+              transition={{
+                scale: { type: 'spring', stiffness: 400, damping: 16 },
+                rotate: { type: 'spring', stiffness: 400, damping: 16 },
+                opacity: { duration: 0.2 },
+                boxShadow: { duration: 2.4, repeat: Infinity, ease: 'easeInOut' },
+              }}
+              whileHover={{ scale: 1.12, rotate: 6 }}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: '28px',
+                height: '28px',
+                borderRadius: '8px',
+                border: `1px solid ${IS_PRODUCTION ? 'rgba(16,185,129,0.3)' : 'rgba(245,158,11,0.4)'}`,
+                background: IS_PRODUCTION ? 'rgba(16,185,129,0.15)' : 'rgba(245,158,11,0.15)',
+                color: IS_PRODUCTION ? '#34d399' : '#fbbf24',
+              }}
+            >
+              {IS_PRODUCTION ? <ShieldCheck size={16} /> : <FlaskConical size={16} />}
+            </motion.span>
+          )}
         </div>
 
         {/* ── Project selector (center) ── */}

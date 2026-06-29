@@ -66,6 +66,7 @@ export default defineConfig(({ mode }) => {
         env['VITE_SSO_TOKEN_URL'] ||
           `${env['VITE_RP_HOST'] || 'http://localhost:3000'}/uat/sso/oauth/token`,
       ),
+      'import.meta.env.VITE_INSTANCE_LABEL': JSON.stringify(env['VITE_INSTANCE_LABEL'] || ''),
       'process.env.NODE_ENV': JSON.stringify(mode),
     },
     build: {

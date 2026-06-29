@@ -16,6 +16,7 @@ import { useSettingsStore } from '@/store/settings.store';
 import { Avatar } from '@/components/ui/Avatar';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 import { cn } from '@/utils';
 
 interface SettingsViewProps {
@@ -88,6 +89,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
           <ArrowLeft size={16} />
         </button>
         <h1 className="text-sm font-bold text-white">Settings</h1>
+        <InstanceBadge size={14} className="ml-auto" />
       </motion.div>
 
       {/* ─── Scrollable Content ─── */}

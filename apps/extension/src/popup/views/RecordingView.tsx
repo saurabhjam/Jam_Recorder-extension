@@ -16,6 +16,7 @@ import {
 import { useRecording } from '@/hooks/useRecording';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 import { cn } from '@/utils';
 
 interface RecordingViewProps {
@@ -111,9 +112,12 @@ export function RecordingView({ onCancel }: RecordingViewProps) {
             {recordingType ? TYPE_LABELS[recordingType] : 'Recording'}
           </span>
         </div>
-        <Badge variant={isPaused ? 'warning' : 'danger'} dot>
-          {isPaused ? 'Paused' : 'Recording'}
-        </Badge>
+        <div className="flex items-center gap-2">
+          <Badge variant={isPaused ? 'warning' : 'danger'} dot>
+            {isPaused ? 'Paused' : 'Recording'}
+          </Badge>
+          <InstanceBadge size={13} />
+        </div>
       </motion.div>
 
       {/* Center: Timer + Pulse */}

@@ -4,6 +4,7 @@ import { Lock, User, Eye, EyeOff, AlertCircle } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 
 interface LoginViewProps {
   onSuccess: () => void;
@@ -62,6 +63,9 @@ export function LoginView({ onSuccess }: LoginViewProps) {
         >
           <h1 className="text-xl font-bold text-white">Welcome back</h1>
           <p className="text-sm text-dark-400 mt-1">Sign in with your ReportPortal account</p>
+          <div className="flex justify-center mt-3">
+            <InstanceBadge size={16} />
+          </div>
         </motion.div>
       </div>
 

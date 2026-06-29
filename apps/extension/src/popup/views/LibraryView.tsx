@@ -17,6 +17,7 @@ import { useRecordingStore } from '@/store/recording.store';
 import { recordingsApi } from '@/services/api';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 import { formatDuration, formatRelativeDate, formatBytes, debounce } from '@/utils';
 import type { Recording, RecordingType } from '@/types';
 
@@ -120,6 +121,7 @@ export function LibraryView({ onBack }: LibraryViewProps) {
           <Badge variant="ghost" size="sm">
             {filteredRecordings.length}
           </Badge>
+          <InstanceBadge size={14} />
         </div>
 
         {/* Search */}

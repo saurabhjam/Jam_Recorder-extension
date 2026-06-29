@@ -22,6 +22,7 @@ import {
   openMicPermissionPage,
 } from '@/store/settings.store';
 import { Avatar } from '@/components/ui/Avatar';
+import { InstanceBadge } from '@/components/ui/InstanceBadge';
 import { cn } from '@/utils';
 import type { RecordingType } from '@/types';
 
@@ -174,6 +175,7 @@ export function HomeView({ onNavigate }: HomeViewProps) {
             <span className="text-[10px] font-semibold bg-jam-500/20 text-jam-300 border border-jam-500/30 px-1.5 py-0.5 rounded-md leading-none">
               v1
             </span>
+            <InstanceBadge size={13} />
           </div>
         </div>
 

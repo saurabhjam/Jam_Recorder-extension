@@ -1,6 +1,7 @@
 import { createElement } from 'react';
 import { motion } from 'framer-motion';
 import { ArrowLeft, X } from 'lucide-react';
+import { InstanceBadge } from '../../components/ui/InstanceBadge';
 import { AnnotationCanvas } from '../../content/AnnotationCanvas';
 import { useRecordingStore } from '../../store/recording.store';
 
@@ -47,9 +48,12 @@ export function AnnotationView({ imageUrl, onSave, onBack }: AnnotationViewProps
           Back
         </button>
         <span className="text-xs font-semibold text-white">Annotate Screenshot</span>
-        <button type="button" onClick={handleClose} className="icon-btn" aria-label="Cancel">
-          <X size={14} />
-        </button>
+        <div className="flex items-center gap-2">
+          <InstanceBadge size={13} />
+          <button type="button" onClick={handleClose} className="icon-btn" aria-label="Cancel">
+            <X size={14} />
+          </button>
+        </div>
       </div>
 
       {/* Canvas fills the remaining space below the header */}
