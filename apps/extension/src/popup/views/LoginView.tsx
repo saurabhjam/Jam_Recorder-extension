@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Lock, User, Eye, EyeOff, AlertCircle } from 'lucide-react';
+import { Lock, User, Eye, EyeOff, AlertCircle, KeyRound } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -10,18 +10,33 @@ interface LoginViewProps {
   onSuccess: () => void;
 }
 
-export function LoginView({ onSuccess }: LoginViewProps) {
-  const { login, isLoading, error, clearError } = useAuthStore();
+type LoginMode = 'password' | 'token';
 
+export function LoginView({ onSuccess }: LoginViewProps) {
+  const { login, loginWithToken, isLoading, error, clearError } = useAuthStore();
+
+  const [mode, setMode] = useState<LoginMode>('password');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [token, setToken] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
+  const switchMode = (next: LoginMode) => {
+    if (next === mode) return;
+    clearError();
+    setFieldErrors({});
+    setMode(next);
+  };
+
   const validate = (): boolean => {
     const errors: Record<string, string> = {};
-    if (!username.trim()) errors.username = 'Username is required';
-    if (!password) errors.password = 'Password is required';
+    if (mode === 'password') {
+      if (!username.trim()) errors.username = 'Username is required';
+      if (!password) errors.password = 'Password is required';
+    } else {
+      if (!token.trim()) errors.token = 'Token is required';
+    }
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -31,7 +46,11 @@ export function LoginView({ onSuccess }: LoginViewProps) {
     clearError();
     if (!validate()) return;
     try {
-      await login(username.trim(), password);
+      if (mode === 'password') {
+        await login(username.trim(), password);
+      } else {
+        await loginWithToken(token.trim());
+      }
       onSuccess();
     } catch {
       // Error is set in the store
@@ -62,7 +81,11 @@ export function LoginView({ onSuccess }: LoginViewProps) {
           className="text-center"
         >
           <h1 className="text-xl font-bold text-white">Welcome back</h1>
-          <p className="text-sm text-dark-400 mt-1">Sign in with your ReportPortal account</p>
+          <p className="text-sm text-dark-400 mt-1">
+            {mode === 'password'
+              ? 'Sign in with your ReportPortal account'
+              : 'Sign in with an access token'}
+          </p>
           <div className="flex justify-center mt-3">
             <InstanceBadge size={16} />
           </div>
@@ -79,6 +102,23 @@ export function LoginView({ onSuccess }: LoginViewProps) {
           className="flex flex-col gap-3"
           noValidate
         >
+          {/* Mode toggle */}
+          <div className="flex p-1 rounded-xl bg-dark-900/80 border border-jam-500/20">
+            {(['password', 'token'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => switchMode(m)}
+                className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  mode === m ? 'bg-jam-500/20 text-white' : 'text-dark-400 hover:text-dark-200'
+                }`}
+              >
+                {m === 'password' ? <User size={13} /> : <KeyRound size={13} />}
+                {m === 'password' ? 'Password' : 'Token'}
+              </button>
+            ))}
+          </div>
+
           {/* Global Error */}
           <AnimatePresence>
             {error && (
@@ -94,38 +134,55 @@ export function LoginView({ onSuccess }: LoginViewProps) {
             )}
           </AnimatePresence>
 
-          {/* Username */}
-          <Input
-            label="Username"
-            type="text"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="superadmin"
-            error={fieldErrors.username}
-            leftIcon={<User size={15} />}
-            autoComplete="username"
-          />
+          {mode === 'password' ? (
+            <>
+              {/* Username */}
+              <Input
+                label="Username"
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="superadmin"
+                error={fieldErrors.username}
+                leftIcon={<User size={15} />}
+                autoComplete="username"
+              />
 
-          {/* Password */}
-          <Input
-            label="Password"
-            type={showPassword ? 'text' : 'password'}
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="••••••••"
-            error={fieldErrors.password}
-            leftIcon={<Lock size={15} />}
-            rightIcon={
-              <button
-                type="button"
-                onClick={() => setShowPassword((s) => !s)}
-                className="text-dark-400 hover:text-dark-200 transition-colors"
-              >
-                {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
-              </button>
-            }
-            autoComplete="current-password"
-          />
+              {/* Password */}
+              <Input
+                label="Password"
+                type={showPassword ? 'text' : 'password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="••••••••"
+                error={fieldErrors.password}
+                leftIcon={<Lock size={15} />}
+                rightIcon={
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((s) => !s)}
+                    className="text-dark-400 hover:text-dark-200 transition-colors"
+                  >
+                    {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                  </button>
+                }
+                autoComplete="current-password"
+              />
+            </>
+          ) : (
+            /* Access token */
+            <Input
+              label="Access Token"
+              type="text"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="Paste your access token"
+              error={fieldErrors.token}
+              helperText="Your token is validated before sign in."
+              leftIcon={<KeyRound size={15} />}
+              autoComplete="off"
+            />
+          )}
 
           {/* Submit */}
           <Button

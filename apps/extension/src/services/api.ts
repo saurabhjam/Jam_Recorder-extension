@@ -98,6 +98,22 @@ async function callSso(params: Record<string, string>): Promise<SsoTokenResponse
   return res.data;
 }
 
+/**
+ * Decode a JWT's `exp` claim (seconds since epoch) into a JS timestamp (ms).
+ * Returns null when the value isn't a parseable three-part JWT with an `exp`.
+ */
+function getJwtExpiry(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(atob(base64)) as { exp?: number };
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchRpUser(accessToken: string): Promise<User> {
   const res = await axios.get<RpUserResponse>(`${REPORTS_API_URL}/users`, {
     headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
@@ -229,6 +245,36 @@ export const authApi = {
       return { user, tokens, sessionId: sso.jti };
     } catch (err) {
       throw new Error(extractErrorMessage(err, 'Login failed. Please try again.'));
+    }
+  },
+
+  /**
+   * Log in with a pre-issued JWT access token (no username/password).
+   * The token is validated by fetching the current user with it as a Bearer —
+   * an invalid/expired token surfaces as an error the caller can show.
+   * There is no refresh token: when the token expires the 401 handler logs out.
+   */
+  loginWithToken: async (token: string): Promise<LoginResponse> => {
+    const trimmed = token.trim();
+    if (!trimmed) {
+      throw new Error('Token is required.');
+    }
+    try {
+      const user = await fetchRpUser(trimmed);
+      const tokens: AuthTokens = {
+        accessToken: trimmed,
+        refreshToken: '',
+        expiresAt: getJwtExpiry(trimmed) ?? Date.now() + 12 * 60 * 60 * 1000,
+      };
+      return { user, tokens, sessionId: '' };
+    } catch (err) {
+      if (
+        axios.isAxiosError(err) &&
+        (err.response?.status === 401 || err.response?.status === 403)
+      ) {
+        throw new Error('Invalid or expired token. Please check and try again.');
+      }
+      throw new Error(extractErrorMessage(err, 'Token validation failed. Please try again.'));
     }
   },
 

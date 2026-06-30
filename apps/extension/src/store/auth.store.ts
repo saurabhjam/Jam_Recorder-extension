@@ -12,6 +12,7 @@ interface AuthStore {
   error: string | null;
 
   login: (username: string, password: string) => Promise<void>;
+  loginWithToken: (token: string) => Promise<void>;
   register: (email: string, password: string, name: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshToken: () => Promise<void>;
@@ -101,6 +102,38 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           type: 'TOKEN_REFRESHED',
           payload: { expiresAt: tokens.expiresAt },
         })
+        .catch(() => {});
+
+      set({
+        user,
+        accessToken: tokens.accessToken,
+        sessionId,
+        isAuthenticated: true,
+        isLoading: false,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Login failed. Please try again.';
+      set({ error: message, isLoading: false });
+      throw err;
+    }
+  },
+
+  loginWithToken: async (token: string) => {
+    set({ isLoading: true, error: null });
+    try {
+      const { user, tokens, sessionId } = await authApi.loginWithToken(token);
+
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.AUTH_USER]: user,
+        [STORAGE_KEYS.AUTH_TOKENS]: tokens,
+        [STORAGE_KEYS.AUTH_SESSION_ID]: sessionId,
+      });
+
+      // A pasted token has no refresh token, so we don't schedule a refresh
+      // alarm. Just tell the background it's authenticated; on expiry the 401
+      // handler clears auth and routes back to login.
+      chrome.runtime
+        .sendMessage({ type: 'AUTH_STATE_CHANGED', payload: { isAuthenticated: true } })
         .catch(() => {});
 
       set({
