@@ -68,7 +68,7 @@ const EDITOR_DATA_KEY = 'st_editor_data';
 const PENDING_SHARE_KEY = 'st_pending_share';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const AUTH_USER_KEY = 'st_auth_user';
-const IDB_NAME = 'snaptrace-blobs';
+const IDB_NAME = 'bestq-blobs';
 const IDB_STORE = 'recordings';
 
 function splitBlob(blob: Blob): Blob[] {
@@ -326,7 +326,7 @@ export function EditorApp() {
         const harData = {
           log: {
             version: '1.2',
-            creator: { name: 'SnapTrace', version: '1.0' },
+            creator: { name: 'BestQ', version: '1.0' },
             entries: (data.networkCaptures ?? []).map((r) => ({
               startedDateTime: new Date(r.timestamp).toISOString(),
               time: r.duration,
@@ -405,7 +405,7 @@ export function EditorApp() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           title: title || data.title,
-          description: 'Recording captured with SnapTrace',
+          description: 'Recording captured with BestQ',
           type: 'video',
           mimeType: mimeBase,
           status: 'completed',
@@ -506,18 +506,19 @@ export function EditorApp() {
               width: '30px',
               height: '30px',
               borderRadius: '10px',
-              background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
+              overflow: 'hidden',
             }}
           >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <circle cx="7" cy="7" r="3" fill="white" />
-              <circle cx="7" cy="7" r="5.5" stroke="white" strokeWidth="1" strokeOpacity="0.5" />
-            </svg>
+            <img
+              src={chrome.runtime.getURL('icons/bestq-logo.png')}
+              alt="BestQ"
+              style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+            />
           </div>
-          <span style={{ fontSize: '15px', fontWeight: 700, color: 'white' }}>SnapTrace</span>
+          <span style={{ fontSize: '15px', fontWeight: 700, color: 'white' }}>BestQ</span>
           {INSTANCE_LABEL && (
             <motion.span
               title={INSTANCE_LABEL}

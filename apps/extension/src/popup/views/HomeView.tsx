@@ -172,14 +172,15 @@ export function HomeView({ onNavigate }: HomeViewProps) {
         className="flex items-center justify-between px-4 pt-3.5 pb-3 shrink-0"
       >
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-jam-500 to-violet-600 flex items-center justify-center shadow-jam shrink-0">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-              <circle cx="8" cy="8" r="3" fill="white" />
-              <circle cx="8" cy="8" r="6" stroke="white" strokeWidth="1.5" strokeOpacity="0.5" />
-            </svg>
+          <div className="w-8 h-8 rounded-xl flex items-center justify-center shrink-0 overflow-hidden">
+            <img
+              src={chrome.runtime.getURL('icons/bestq-logo.png')}
+              alt="BestQ"
+              className="w-full h-full object-contain"
+            />
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="text-sm font-bold text-white tracking-tight">SnapTrace</span>
+            <span className="text-sm font-bold text-white tracking-tight">BestQ</span>
             <span className="text-[10px] font-semibold bg-jam-500/20 text-jam-300 border border-jam-500/30 px-1.5 py-0.5 rounded-md leading-none">
               v1
             </span>

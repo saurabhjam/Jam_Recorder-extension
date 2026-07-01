@@ -121,7 +121,7 @@ export class ChunkUploader {
         headers: { 'Content-Type': 'application/json', ...this.authHeader(token) },
         body: JSON.stringify({
           title: metadata.title,
-          description: 'Recording captured with SnapTrace',
+          description: 'Recording captured with BestQ',
           type: 'video',
           mimeType: metadata.mimeType.split(';')[0],
           status: 'completed',

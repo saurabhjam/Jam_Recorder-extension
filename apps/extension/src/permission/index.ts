@@ -1,5 +1,5 @@
 /**
- * SnapTrace — Microphone Permission Page
+ * BestQ — Microphone Permission Page
  *
  * An offscreen document and the action popup cannot reliably show the mic
  * permission prompt: the popup closes as soon as the prompt steals focus.
@@ -80,7 +80,7 @@ async function requestMic(): Promise<void> {
     stream.getTracks().forEach((t) => t.stop());
     await persistMicEnabled(true);
     setStatus('Microphone enabled! You can close this tab.', 'ok');
-    hintEl.textContent = 'Return to SnapTrace and start your recording.';
+    hintEl.textContent = 'Return to BestQ and start your recording.';
     retryBtn.textContent = 'Close';
     retryBtn.disabled = false;
     retryBtn.onclick = () => window.close();

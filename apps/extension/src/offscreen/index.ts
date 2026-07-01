@@ -1,5 +1,5 @@
 /**
- * SnapTrace — Offscreen Document (Manifest V3)
+ * BestQ — Offscreen Document (Manifest V3)
  *
  * This document runs in a hidden browser page that has access to all
  * Web APIs unavailable in the service worker:
@@ -684,7 +684,7 @@ const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
 // Stores the raw recording blob so the editor window can load it for playback.
 // All extension pages share the same IDB origin.
 
-const IDB_NAME = 'snaptrace-blobs';
+const IDB_NAME = 'bestq-blobs';
 const IDB_STORE = 'recordings';
 
 function openRecordingIDB(): Promise<IDBDatabase> {
@@ -766,7 +766,7 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
     const fileUrl = `${REPORTS_URL}/v1/${project}/files/${fileName}`;
     const createBody: Record<string, unknown> = {
       title: metadata.title,
-      description: 'Recording captured with SnapTrace',
+      description: 'Recording captured with BestQ',
       type: 'video',
       mimeType: metadata.mimeType.split(';')[0],
       status: 'completed',

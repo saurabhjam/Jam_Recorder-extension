@@ -1,5 +1,5 @@
 /**
- * SnapTrace — Background Service Worker (Manifest V3)
+ * BestQ — Background Service Worker (Manifest V3)
  *
  * Responsibilities:
  *  - Auth lifecycle (token refresh via chrome.alarms — survives SW termination)

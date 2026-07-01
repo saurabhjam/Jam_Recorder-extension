@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "SnapTrace Recorder",
+  "name": "BestQ Recorder",
   "version": "1.0.0",
-  "description": "Record your screen, capture bugs, and share instantly with SnapTrace",
+  "description": "Record your screen, capture bugs, and share instantly with BestQ",
   "permissions": [
     "storage",
     "tabs",
@@ -30,7 +30,7 @@
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
-    "default_title": "SnapTrace Recorder"
+    "default_title": "BestQ Recorder"
   },
   "icons": {
     "16": "icons/icon16.png",

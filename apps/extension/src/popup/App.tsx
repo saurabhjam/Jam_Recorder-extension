@@ -270,7 +270,7 @@ function LoadingSpinner() {
           <circle cx="12" cy="12" r="3" fill="currentColor" className="animate-recording-pulse" />
         </svg>
       </div>
-      <p className="text-dark-400 text-sm">Loading SnapTrace...</p>
+      <p className="text-dark-400 text-sm">Loading BestQ...</p>
     </div>
   );
 }

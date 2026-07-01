@@ -1,5 +1,5 @@
 /**
- * SnapTrace – Content Script
+ * BestQ – Content Script
  *
  * Injected into every page. Responsibilities:
  *  - Mount/unmount the floating recording toolbar
@@ -20,7 +20,7 @@ import { ScreenshotPreview } from './ScreenshotPreview';
 
 declare global {
   interface Window {
-    __snaptraceCaptureInitialized?: boolean;
+    __bestqCaptureInitialized?: boolean;
   }
 }
 
@@ -216,8 +216,8 @@ function mountScreenshotSelector(): void {
   unmountScreenshotSelector();
 
   screenshotSelectorContainer = document.createElement('div');
-  screenshotSelectorContainer.id = 'snaptrace-screenshot-selector';
-  screenshotSelectorContainer.setAttribute('data-snaptrace', 'true');
+  screenshotSelectorContainer.id = 'bestq-screenshot-selector';
+  screenshotSelectorContainer.setAttribute('data-bestq', 'true');
   document.body.appendChild(screenshotSelectorContainer);
   console.log('[Content Script] Screenshot selector container created and appended');
   screenshotSelectorRoot = createRoot(screenshotSelectorContainer);
@@ -258,8 +258,8 @@ function mountScreenshotPreview(dataUrl: string): void {
   unmountScreenshotPreview();
 
   screenshotPreviewContainer = document.createElement('div');
-  screenshotPreviewContainer.id = 'snaptrace-screenshot-preview';
-  screenshotPreviewContainer.setAttribute('data-snaptrace', 'true');
+  screenshotPreviewContainer.id = 'bestq-screenshot-preview';
+  screenshotPreviewContainer.setAttribute('data-bestq', 'true');
   document.body.appendChild(screenshotPreviewContainer);
   console.log('[Content Script] Screenshot preview container created and appended');
   screenshotPreviewRoot = createRoot(screenshotPreviewContainer);
@@ -286,9 +286,9 @@ function unmountScreenshotPreview(): void {
 // ─── Network Capture ──────────────────────────────────────────────────────────
 
 function startCapture(): void {
-  if (window.__snaptraceCaptureInitialized) return;
+  if (window.__bestqCaptureInitialized) return;
 
-  window.__snaptraceCaptureInitialized = true;
+  window.__bestqCaptureInitialized = true;
 
   networkCaptures = [];
   consoleLogs = [];
