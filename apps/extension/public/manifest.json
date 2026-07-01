@@ -14,7 +14,8 @@
     "downloads",
     "windows",
     "debugger",
-    "webNavigation"
+    "webNavigation",
+    "webRequest"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

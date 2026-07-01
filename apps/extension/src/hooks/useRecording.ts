@@ -75,12 +75,21 @@ export function useRecording(): UseRecordingReturn {
   }, [timer.seconds, status, setDuration]);
 
   const handleStartScreen = useCallback(async () => {
+    // Resolve the active tab here (popup is frontmost) and pass it through: for
+    // screen/window shares the browser can't provide system audio on macOS, so
+    // the background tab-captures this tab's audio as a fallback. Resolving it in
+    // the service worker with currentWindow:true is unreliable (no window context).
+    const [activeTab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
     await startRecording({
       type: 'screen',
       quality: settings.recordingQuality,
       micEnabled: settings.micEnabled,
       webcamOverlay: settings.webcamOverlay,
       systemAudio: settings.systemAudio,
+      tabId: activeTab?.id,
     });
   }, [startRecording, settings]);
 

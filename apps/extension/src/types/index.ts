@@ -157,6 +157,7 @@ export type MessageType =
   | 'OPEN_POPUP'
   | 'AUTH_STATE_CHANGED'
   | 'TOKEN_REFRESHED'
+  | 'START_GOOGLE_LOGIN'
   | 'OAUTH_LOGIN_COMPLETE'
   | 'CAPTURE_FLUSH'
   // Screenshot workflow messages (background ↔ content script)

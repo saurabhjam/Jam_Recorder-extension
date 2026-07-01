@@ -25,7 +25,7 @@ import type {
 } from '@/types';
 import { STORAGE_KEYS } from '@/types';
 import { generateId } from '@/utils';
-import { RP_HOST, RP_HOSTNAME, API_BASE_URL } from '@/config';
+import { RP_HOST, API_BASE_URL, RP_LOGIN_URL } from '@/config';
 
 // ─── Offscreen Management ─────────────────────────────────────────────────────
 
@@ -649,6 +649,95 @@ function getTabStreamId(tabId: number): Promise<string> {
   });
 }
 
+// ─── Dynamic Tab-Audio Capture (screen/window recordings) ─────────────────────
+// macOS can't capture system/window audio via getDisplayMedia, so the audio of a
+// screen/window recording is built by tab-capturing browser tabs and mixing them
+// in the offscreen document. To make the audio FOLLOW the selected scope — the
+// picked window, or the whole browser for entire-screen — rather than just the
+// starting tab, we capture every tab in scope that is (or becomes) audible, adding
+// each to the live mix as it starts playing.
+//
+// Scope is derived from the picked surface: 'monitor' (entire screen) → all
+// windows; 'window' → the Chrome window focused at record start (best effort — the
+// native picker never tells the extension which window was actually chosen).
+
+// null = dynamic capture off; 'all' = every window; a number = a single windowId.
+let audioScope: 'all' | number | null = null;
+// Tabs already handed to the offscreen mixer, so we don't double-capture them.
+const capturedAudioTabs = new Set<number>();
+
+function tabInAudioScope(windowId: number | undefined): boolean {
+  if (audioScope === 'all') return true;
+  if (typeof audioScope === 'number') return windowId === audioScope;
+  return false;
+}
+
+/** Tab-capture a single tab's audio and stream it into the offscreen mixer. */
+async function captureTabAudioIfNeeded(tab: chrome.tabs.Tab): Promise<void> {
+  if (audioScope === null || !tab.id) return;
+  if (capturedAudioTabs.has(tab.id)) return;
+  if (!tabInAudioScope(tab.windowId)) return;
+
+  capturedAudioTabs.add(tab.id); // reserve up-front so concurrent events don't race
+  try {
+    const streamId = await getTabStreamId(tab.id);
+    await sendToOffscreen('OFFSCREEN_ADD_TAB_AUDIO', { streamId });
+  } catch (err) {
+    // chrome://, the Web Store, discarded tabs, etc. can't be captured — allow a
+    // later retry if the tab becomes capturable.
+    capturedAudioTabs.delete(tab.id);
+    console.warn(`[Background] Could not add tab ${tab.id} audio:`, err);
+  }
+}
+
+// Fires whenever a tab starts/stops producing sound. We only act on tabs that
+// START being audible (and aren't captured yet) so newly-playing tabs join the mix.
+function handleAudibleTabChange(
+  _tabId: number,
+  changeInfo: chrome.tabs.TabChangeInfo,
+  tab: chrome.tabs.Tab,
+): void {
+  if (changeInfo.audible === true) void captureTabAudioIfNeeded(tab);
+}
+
+/**
+ * Begin following the recording's audio scope: capture every currently-audible tab
+ * in scope now, and keep capturing tabs as they start playing until teardown.
+ * The starting tab is always captured (even if silent) so a meeting whose audio
+ * hasn't registered as `audible` yet is still recorded.
+ */
+async function setupDynamicTabAudio(
+  displaySurface: string | undefined,
+  startWindowId: number | null,
+): Promise<void> {
+  // 'monitor' = entire screen → whole browser. 'window' → the focused window.
+  // Anything else (e.g. 'browser'/tab share) shouldn't reach here (it has direct
+  // audio) — default to the whole browser so we still capture something.
+  audioScope = displaySurface === 'window' && startWindowId != null ? startWindowId : 'all';
+  capturedAudioTabs.clear();
+
+  // Always capture the starting tab, then every audible tab in scope right now.
+  try {
+    const tabs = await chrome.tabs.query(audioScope === 'all' ? {} : { windowId: audioScope });
+    const startTab = tabs.find((t) => t.id === currentRecordingTabId);
+    const initial = tabs.filter((t) => t.audible);
+    if (startTab && !initial.includes(startTab)) initial.unshift(startTab);
+    for (const tab of initial) await captureTabAudioIfNeeded(tab);
+  } catch (err) {
+    console.warn('[Background] Initial tab-audio capture failed:', err);
+  }
+
+  chrome.tabs.onUpdated.addListener(handleAudibleTabChange);
+}
+
+/** Stop following tab audio and release listener/state. */
+function teardownDynamicTabAudio(): void {
+  if (audioScope === null) return;
+  chrome.tabs.onUpdated.removeListener(handleAudibleTabChange);
+  audioScope = null;
+  capturedAudioTabs.clear();
+}
+
 // ─── START RECORDING ──────────────────────────────────────────────────────────
 
 async function handleStartRecording(
@@ -664,28 +753,17 @@ async function handleStartRecording(
   currentRecordingOptions = options;
 
   let streamId: string | undefined;
-  // For desktop recording we additionally tab-capture the active tab's audio so
-  // meeting/system voice is recorded even when the user shares the whole screen
-  // — macOS can't capture system-loopback audio for screen/window shares.
-  let tabAudioStreamId: string | undefined;
 
   try {
     if (options.type === 'screen') {
       streamId = 'native-display-media';
-      if (options.systemAudio) {
-        try {
-          const tabId =
-            options.tabId ??
-            (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
-          if (tabId) tabAudioStreamId = await getTabStreamId(tabId);
-        } catch {
-          // Active tab not capturable (chrome://, no tab, etc.) — fall back to
-          // whatever system audio getDisplayMedia provides.
-        }
-      }
+      // Tab audio for screen/window shares is captured dynamically AFTER the
+      // picker closes (see setupDynamicTabAudio) — capturing it here would race
+      // the picker and let the tabCapture stream ids expire before use.
     } else if (options.type === 'tab') {
       const tabId =
-        options.tabId ?? (await chrome.tabs.query({ active: true, currentWindow: true }))[0]?.id;
+        options.tabId ??
+        (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0]?.id;
       if (!tabId) throw new Error('Could not determine active tab for capture');
       streamId = await getTabStreamId(tabId);
     }
@@ -701,12 +779,11 @@ async function handleStartRecording(
   try {
     await ensureOffscreenDocument();
 
-    await sendToOffscreen('OFFSCREEN_START_RECORDING', {
+    const startResp = (await sendToOffscreen('OFFSCREEN_START_RECORDING', {
       options,
       streamId,
-      tabAudioStreamId,
       recordingId: currentRecordingId,
-    });
+    })) as { displaySurface?: string; needsTabAudio?: boolean } | undefined;
 
     isRecordingActive = true;
     isPaused = false;
@@ -714,6 +791,13 @@ async function handleStartRecording(
     // Determine the active tab so we can attach CDP and show the toolbar
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     currentRecordingTabId = activeTab?.id ?? null;
+
+    // For screen/window shares that produced no direct audio (macOS), start
+    // capturing tab audio across the selected scope — the picked window, or the
+    // whole browser for entire-screen — and keep following tabs as they play.
+    if (options.type === 'screen' && options.systemAudio && startResp?.needsTabAudio) {
+      await setupDynamicTabAudio(startResp.displaySurface, activeTab?.windowId ?? null);
+    }
 
     setBadge('REC', '#ef4444');
     await injectFloatingToolbar();
@@ -745,6 +829,7 @@ async function handleStartRecording(
     isPaused = false;
     currentRecordingId = null;
     currentRecordingOptions = null;
+    teardownDynamicTabAudio();
     await closeOffscreenDocument();
 
     broadcastToAll({ type: 'RECORDING_ERROR', error });
@@ -829,6 +914,7 @@ async function handleStopRecording(
 
   stopTimer();
   clearBadge();
+  teardownDynamicTabAudio();
   await hideFloatingToolbar();
   await chrome.storage.local.remove([STORAGE_KEYS.RECORDING_STATE]);
 
@@ -1402,6 +1488,14 @@ chrome.runtime.onMessage.addListener(
         return false;
       }
 
+      case 'START_GOOGLE_LOGIN': {
+        // Open ReportPortal's login page, then auto-advance to Google and capture
+        // the bearer token the UI receives (see startGoogleLogin).
+        void startGoogleLogin();
+        sendResponse({ success: true });
+        return false;
+      }
+
       case 'OPEN_POPUP': {
         chrome.action.openPopup().catch(() => {
           // openPopup requires user gesture in some Chrome versions; open popup page as fallback
@@ -1600,81 +1694,216 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-// ─── Google OAuth Tab Interceptor ─────────────────────────────────────────────
-// Watches for the OAuth callback URL, extracts tokens, fetches the user profile,
-// stores everything in extension storage, and closes the OAuth tab.
+// ─── Google OAuth — Bearer Token Capture ──────────────────────────────────────
+// ReportPortal's "Login with Google" is a session/cookie based flow:
+//   /uat/oauth/login/google → Google consent → /uat/sso/login/google?code=...
+//   → the server establishes a session; the UI then loads at /ui/ and calls the
+//     API with `Authorization: Bearer <jwt>`.
+// The JWT is never present in a tab URL, so we capture it off the UI's own API
+// requests via chrome.webRequest (scoped to the tab we opened), then sign the
+// extension in with it — same result as pasting an access token.
 
-const API_BASE_FOR_OAUTH = API_BASE_URL;
+const GOOGLE_AUTH_TAB_KEY = 'google_auth_tab_id';
+const GOOGLE_AUTH_TIMEOUT_MS = 5 * 60 * 1000;
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!changeInfo.url) return;
+let googleAuthTabId: number | null = null;
+let googleAuthCaptured = false;
+let googleAuthAdvanced = false;
+let googleAuthTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  let url: URL;
-  try {
-    url = new URL(changeInfo.url);
-  } catch {
-    return;
+// Re-hydrate the capture target if the service worker restarted mid-flow.
+void chrome.storage.session.get(GOOGLE_AUTH_TAB_KEY).then((r) => {
+  const id = r[GOOGLE_AUTH_TAB_KEY] as number | undefined;
+  if (typeof id === 'number' && googleAuthTabId === null) googleAuthTabId = id;
+});
+
+function armGoogleLoginCapture(tabId: number): void {
+  googleAuthTabId = tabId;
+  googleAuthCaptured = false;
+  googleAuthAdvanced = false;
+  void chrome.storage.session.set({ [GOOGLE_AUTH_TAB_KEY]: tabId });
+  if (googleAuthTimeout) clearTimeout(googleAuthTimeout);
+  googleAuthTimeout = setTimeout(() => void disarmGoogleLoginCapture(), GOOGLE_AUTH_TIMEOUT_MS);
+}
+
+async function disarmGoogleLoginCapture(): Promise<void> {
+  googleAuthTabId = null;
+  googleAuthCaptured = false;
+  googleAuthAdvanced = false;
+  if (googleAuthTimeout) {
+    clearTimeout(googleAuthTimeout);
+    googleAuthTimeout = null;
   }
+  await chrome.storage.session.remove(GOOGLE_AUTH_TAB_KEY);
+}
 
-  // Match /auth/callback?accessToken=... on the real frontend
-  const isOAuthCallback =
-    (url.hostname === RP_HOSTNAME ||
-      (url.hostname === 'localhost' && (url.port === '3001' || url.port === '3000'))) &&
-    url.pathname === '/auth/callback';
+/**
+ * "Continue with Google" with no visible ReportPortal page:
+ *  1. Open ReportPortal's login page in a HIDDEN (background) tab. Loading it
+ *     for real primes the frontend session/CSRF that the OAuth endpoint needs
+ *     (a cold hit returns "Bad credentials").
+ *  2. When it finishes loading, auto-advance that tab to /uat/oauth/login/google
+ *     (see the webNavigation.onCompleted listener below).
+ *  3. When the tab reaches Google, bring it to the front so the user sees the
+ *     account chooser (see the webNavigation.onBeforeNavigate listener below).
+ *  4. The bearer token that comes back is grabbed by the webRequest listener
+ *     above, which signs the extension in and closes the tab.
+ */
+async function startGoogleLogin(): Promise<void> {
+  console.log('[GoogleLogin] starting — opening hidden ReportPortal tab');
+  const tab = await chrome.tabs.create({ url: RP_LOGIN_URL, active: false });
+  console.log('[GoogleLogin] tab created:', tab.id);
+  if (tab.id != null) armGoogleLoginCapture(tab.id);
+}
 
-  if (!isOAuthCallback) return;
+// Step 2: once the ReportPortal page has loaded in our tab, advance to Google.
+chrome.webNavigation.onCompleted.addListener((details) => {
+  if (details.frameId !== 0 || details.tabId !== googleAuthTabId) return;
+  if (googleAuthAdvanced || googleAuthCaptured) return;
+  if (!details.url.startsWith(`${RP_HOST}/ui`)) return;
 
-  const accessToken = url.searchParams.get('accessToken');
-  const refreshToken = url.searchParams.get('refreshToken');
-  const expiresAt = url.searchParams.get('expiresAt');
-
-  if (!accessToken || !refreshToken) return;
-
-  // Close the OAuth tab immediately so the user returns to their browsing context
-  chrome.tabs.remove(tabId);
-
-  const tokens = {
-    accessToken,
-    refreshToken,
-    expiresAt: expiresAt ? Number(expiresAt) : Date.now() + 30 * 60 * 1000,
-  };
-
-  // Fetch user profile then store everything
-  fetch(`${API_BASE_FOR_OAUTH}/users`, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  })
-    .then((res) => {
-      if (!res.ok) throw new Error(`/users returned ${res.status}`);
-      return res.json() as Promise<{
-        id: number;
-        userId: string;
-        email: string;
-        fullName: string;
-        photoId: string | null;
-        userRole: string;
-        active: boolean;
-      }>;
+  googleAuthAdvanced = true;
+  console.log('[GoogleLogin] /ui loaded — navigating to Google OAuth');
+  chrome.scripting
+    .executeScript({
+      target: { tabId: details.tabId },
+      // Same-origin navigation from the loaded /ui/ page — reproduces exactly
+      // the request ReportPortal's own "Login with Google" button makes.
+      func: () => {
+        window.location.href = '/uat/oauth/login/google';
+      },
     })
-    .then(async (rpUser) => {
-      const user = {
-        id: String(rpUser.id),
-        login: rpUser.userId,
-        email: rpUser.email ?? '',
-        name: rpUser.fullName ?? rpUser.userId,
-        avatar: rpUser.photoId ?? null,
-        role: rpUser.userRole,
-        isActive: rpUser.active ?? true,
-      };
-      await chrome.storage.local.set({
-        [STORAGE_KEYS.AUTH_TOKENS]: tokens,
-        [STORAGE_KEYS.AUTH_USER]: user,
-      });
-      await authManager.scheduleRefreshAlarm(tokens.expiresAt);
-      broadcastToAll({ type: 'OAUTH_LOGIN_COMPLETE', payload: { user, tokens } });
-    })
-    .catch((err) => {
-      console.error('[Background] OAuth user fetch failed:', err);
+    .then(() => console.log('[GoogleLogin] advance injected'))
+    .catch((e) => {
+      console.warn('[GoogleLogin] executeScript failed, falling back to tabs.update', e);
+      chrome.tabs
+        .update(details.tabId, { url: `${RP_HOST}/uat/oauth/login/google` })
+        .catch(() => {});
     });
+});
+
+// Step 3: when the tab reaches Google's sign-in, surface it to the user.
+// Use both events — onBeforeNavigate catches client-initiated navigations,
+// onCommitted catches server redirects (the /uat/oauth/login/google → Google
+// redirect commits without a fresh onBeforeNavigate).
+function focusIfGoogle(details: { frameId: number; tabId: number; url: string }): void {
+  if (details.frameId !== 0 || details.tabId !== googleAuthTabId) return;
+  if (!details.url.startsWith('https://accounts.google.com')) return;
+
+  console.log('[GoogleLogin] reached Google — focusing tab');
+  chrome.tabs.update(details.tabId, { active: true }).catch(() => {});
+  void chrome.tabs
+    .get(details.tabId)
+    .then((t) => {
+      if (t.windowId != null) return chrome.windows.update(t.windowId, { focused: true });
+    })
+    .catch(() => {});
+}
+chrome.webNavigation.onBeforeNavigate.addListener(focusIfGoogle);
+chrome.webNavigation.onCommitted.addListener(focusIfGoogle);
+
+/** Decode a claim from a JWT payload; returns null if not a decodable JWT. */
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const payload = token.split('.')[1];
+    if (!payload) return null;
+    return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/'))) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate the captured token by fetching the current user, then store auth
+ * state exactly like a token login (no refresh token — expiry triggers logout).
+ */
+async function completeGoogleLogin(accessToken: string, sourceTabId: number): Promise<void> {
+  if (googleAuthCaptured) return;
+  googleAuthCaptured = true; // set before any await so concurrent requests bail
+  console.log('[GoogleLogin] captured bearer token — validating & signing in');
+
+  try {
+    const res = await fetch(`${API_BASE_URL}/users`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    });
+    if (!res.ok) throw new Error(`/users returned ${res.status}`);
+    const rpUser = (await res.json()) as {
+      id: number;
+      userId: string;
+      email: string;
+      fullName: string;
+      photoId: string | null;
+      userRole: string;
+      active: boolean;
+      assignedProjects?: Record<string, unknown>;
+    };
+
+    const user = {
+      id: String(rpUser.id),
+      login: rpUser.userId,
+      email: rpUser.email ?? '',
+      name: rpUser.fullName ?? rpUser.userId,
+      avatar: rpUser.photoId ?? null,
+      role: rpUser.userRole,
+      isActive: rpUser.active ?? true,
+      assignedProjects: rpUser.assignedProjects,
+    };
+
+    const claims = decodeJwtPayload(accessToken);
+    const exp = typeof claims?.exp === 'number' ? claims.exp * 1000 : null;
+    const tokens = {
+      accessToken,
+      refreshToken: '',
+      expiresAt: exp ?? Date.now() + 12 * 60 * 60 * 1000,
+    };
+
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.AUTH_TOKENS]: tokens,
+      [STORAGE_KEYS.AUTH_USER]: user,
+      [STORAGE_KEYS.AUTH_SESSION_ID]: typeof claims?.jti === 'string' ? claims.jti : '',
+    });
+
+    console.log('[GoogleLogin] signed in as', user.login, `(${user.email})`);
+    broadcastToAll({ type: 'OAUTH_LOGIN_COMPLETE', payload: { user, tokens } });
+
+    // Return the user to their browsing context.
+    try {
+      await chrome.tabs.remove(sourceTabId);
+    } catch {
+      // Tab already closed — ignore.
+    }
+    await disarmGoogleLoginCapture();
+  } catch (err) {
+    console.error('[Background] Google login token capture failed:', err);
+    googleAuthCaptured = false; // allow a retry within the armed window
+  }
+}
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (googleAuthTabId === null || details.tabId !== googleAuthTabId || googleAuthCaptured) return;
+    const auth = details.requestHeaders?.find((h) => h.name.toLowerCase() === 'authorization');
+    const value = (auth?.value ?? '').trim();
+    console.log(
+      '[GoogleLogin] api request on tab:',
+      details.url,
+      '| auth:',
+      value ? value.slice(0, 12) : '(none)',
+    );
+    const match = /^bearer\s+(eyJ[\w-]+\.[\w-]+\.[\w-]+)$/i.exec(value);
+    if (!match) return;
+    void completeGoogleLogin(match[1], details.tabId);
+  },
+  { urls: [`${RP_HOST}/api/*`] },
+  ['requestHeaders', 'extraHeaders'],
+);
+
+// If the user closes the OAuth tab before it completes, stop capturing.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === googleAuthTabId) void disarmGoogleLoginCapture();
 });
 
 // ─── Tab Cleanup ──────────────────────────────────────────────────────────────

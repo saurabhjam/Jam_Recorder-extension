@@ -61,7 +61,9 @@ export default function App() {
         void initAuth();
       }
       if (message.type === 'OAUTH_LOGIN_COMPLETE') {
-        void initAuth();
+        // Re-hydrate auth from storage, then land on home (the auto-route effect
+        // won't move us off the login view on its own).
+        void initAuth().then(() => setCurrentView('home'));
       }
     };
     chrome.runtime.onMessage.addListener(listener);

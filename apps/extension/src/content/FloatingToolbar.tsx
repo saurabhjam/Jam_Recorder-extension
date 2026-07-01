@@ -16,6 +16,9 @@ export function FloatingToolbar({ duration, onStop, onPause, onResume }: Floatin
   const [isPaused, setIsPaused] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  // When hidden, the bar collapses to a small dot so it stays out of the recorded
+  // video. The user clicks the dot to bring the pause/stop controls back.
+  const [isHidden, setIsHidden] = useState(false);
   const constraintsRef = useRef<HTMLDivElement>(null);
 
   const handlePauseResume = useCallback(() => {
@@ -73,80 +76,126 @@ export function FloatingToolbar({ duration, onStop, onPause, onResume }: Floatin
           pointerEvents: 'all',
         }}
       >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '6px',
-            padding: '8px 10px',
-            borderRadius: '100px',
-            background: 'rgba(9,9,13,0.92)',
-            backdropFilter: 'blur(20px)',
-            WebkitBackdropFilter: 'blur(20px)',
-            border: '1px solid rgba(255,255,255,0.12)',
-            boxShadow: '0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(139,92,246,0.12)',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {/* Recording dot */}
-          <span
+        {isHidden ? (
+          /* Collapsed nub — just a small recording dot so it stays out of the
+             recorded video. Click to bring the controls back. */
+          <button
+            onClick={() => setIsHidden(false)}
+            title="Show recording controls"
             style={{
-              width: '7px',
-              height: '7px',
+              width: '20px',
+              height: '20px',
               borderRadius: '50%',
-              flexShrink: 0,
-              background: isPaused ? '#f59e0b' : '#ef4444',
-              boxShadow: isPaused ? '0 0 6px rgba(245,158,11,0.7)' : '0 0 6px rgba(239,68,68,0.7)',
-              animation: isPaused ? 'none' : 'st-dot-pulse 1.4s ease-in-out infinite',
+              border: '1px solid rgba(255,255,255,0.18)',
+              background: 'rgba(9,9,13,0.55)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'pointer',
+              padding: 0,
             }}
-          />
-
-          {/* Timer */}
-          <span
+          >
+            <span
+              style={{
+                width: '7px',
+                height: '7px',
+                borderRadius: '50%',
+                background: isPaused ? '#f59e0b' : '#ef4444',
+                boxShadow: isPaused
+                  ? '0 0 6px rgba(245,158,11,0.7)'
+                  : '0 0 6px rgba(239,68,68,0.7)',
+                animation: isPaused ? 'none' : 'st-dot-pulse 1.4s ease-in-out infinite',
+              }}
+            />
+          </button>
+        ) : (
+          <div
             style={{
-              fontFamily: "'Inter', ui-monospace, monospace",
-              fontSize: '13px',
-              fontWeight: 700,
-              color: 'white',
-              letterSpacing: '0.5px',
-              minWidth: '48px',
-              textAlign: 'center',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '8px 10px',
+              borderRadius: '100px',
+              background: 'rgba(9,9,13,0.92)',
+              backdropFilter: 'blur(20px)',
+              WebkitBackdropFilter: 'blur(20px)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(139,92,246,0.12)',
+              whiteSpace: 'nowrap',
             }}
           >
-            {formatDuration(duration)}
-          </span>
+            {/* Recording dot */}
+            <span
+              style={{
+                width: '7px',
+                height: '7px',
+                borderRadius: '50%',
+                flexShrink: 0,
+                background: isPaused ? '#f59e0b' : '#ef4444',
+                boxShadow: isPaused
+                  ? '0 0 6px rgba(245,158,11,0.7)'
+                  : '0 0 6px rgba(239,68,68,0.7)',
+                animation: isPaused ? 'none' : 'st-dot-pulse 1.4s ease-in-out infinite',
+              }}
+            />
 
-          {/* Divider */}
-          <span
-            style={{
-              width: '1px',
-              height: '16px',
-              background: 'rgba(255,255,255,0.12)',
-              flexShrink: 0,
-            }}
-          />
+            {/* Timer */}
+            <span
+              style={{
+                fontFamily: "'Inter', ui-monospace, monospace",
+                fontSize: '13px',
+                fontWeight: 700,
+                color: 'white',
+                letterSpacing: '0.5px',
+                minWidth: '48px',
+                textAlign: 'center',
+              }}
+            >
+              {formatDuration(duration)}
+            </span>
 
-          {/* Pause / Resume */}
-          <PillButton
-            onClick={handlePauseResume}
-            title={isPaused ? 'Resume' : 'Pause'}
-            color="rgba(255,255,255,0.1)"
-            hoverColor="rgba(255,255,255,0.18)"
-          >
-            {isPaused ? <PlaySvg /> : <PauseSvg />}
-          </PillButton>
+            {/* Divider */}
+            <span
+              style={{
+                width: '1px',
+                height: '16px',
+                background: 'rgba(255,255,255,0.12)',
+                flexShrink: 0,
+              }}
+            />
 
-          {/* Stop */}
-          <PillButton
-            onClick={handleStop}
-            title="Stop Recording"
-            color="rgba(239,68,68,0.2)"
-            hoverColor="rgba(239,68,68,0.35)"
-            disabled={isStopping}
-          >
-            <StopSvg />
-          </PillButton>
-        </div>
+            {/* Pause / Resume */}
+            <PillButton
+              onClick={handlePauseResume}
+              title={isPaused ? 'Resume' : 'Pause'}
+              color="rgba(255,255,255,0.1)"
+              hoverColor="rgba(255,255,255,0.18)"
+            >
+              {isPaused ? <PlaySvg /> : <PauseSvg />}
+            </PillButton>
+
+            {/* Hide — collapses the bar so it stays out of the recording */}
+            <PillButton
+              onClick={() => setIsHidden(true)}
+              title="Hide bar (keep it out of the recording)"
+              color="rgba(255,255,255,0.1)"
+              hoverColor="rgba(255,255,255,0.18)"
+            >
+              <HideSvg />
+            </PillButton>
+
+            {/* Stop */}
+            <PillButton
+              onClick={handleStop}
+              title="Stop Recording"
+              color="rgba(239,68,68,0.2)"
+              hoverColor="rgba(239,68,68,0.35)"
+              disabled={isStopping}
+            >
+              <StopSvg />
+            </PillButton>
+          </div>
+        )}
       </motion.div>
     </>
   );
@@ -210,6 +259,26 @@ function PlaySvg() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="white">
       <polygon points="6,3 20,12 6,21" />
+    </svg>
+  );
+}
+
+function HideSvg() {
+  // Eye-off icon — signals the bar will be hidden from the recording.
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="white"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 10 8 10 8a13.16 13.16 0 0 1-1.67 2.68" />
+      <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 8 10 8a9.74 9.74 0 0 0 5.39-1.61" />
+      <line x1="2" y1="2" x2="22" y2="22" />
     </svg>
   );
 }

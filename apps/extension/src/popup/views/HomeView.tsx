@@ -131,12 +131,20 @@ export function HomeView({ onNavigate }: HomeViewProps) {
         }
       }
 
+      // Resolve the active tab while the popup is still frontmost. Both tab and
+      // screen recordings need it: 'tab' captures this tab, and 'screen'/window
+      // shares tab-capture its audio as a fallback (macOS can't provide system
+      // audio for screen/window). The service worker can't resolve it reliably
+      // (currentWindow:true has no window context there).
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
       await startRecording({
         type: selectedRecordType,
         quality: settings.recordingQuality,
         micEnabled: settings.micEnabled,
         webcamOverlay: settings.webcamOverlay,
         systemAudio: settings.systemAudio,
+        tabId: activeTab?.id,
       });
       // Close the popup so the floating toolbar (injected into the page) takes over
       window.close();

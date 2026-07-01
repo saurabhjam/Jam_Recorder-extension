@@ -30,6 +30,22 @@ export const SSO_TOKEN_URL: string =
 export const SSO_AUTH_HEADER = 'Basic dWk6dWltYW4=';
 
 /**
+ * ReportPortal login page. For "Continue with Google" the background opens this
+ * in a hidden (background) tab to prime the frontend session/CSRF, then
+ * auto-advances that tab to Google's account chooser and only brings it to the
+ * front once Google is reached — so the user never sees a ReportPortal page.
+ * (Hitting the OAuth endpoint cold, without a real /ui/ load first, fails with
+ * "Bad credentials".)
+ *
+ * ReportPortal's Google flow is session/cookie based: after the Google
+ * round-trip it loads /ui/ and calls the API with `Authorization: Bearer <jwt>`.
+ * The token never appears in a tab URL, so `background/index.ts` captures that
+ * bearer JWT off the UI's own API requests via chrome.webRequest and signs the
+ * extension in with it.
+ */
+export const RP_LOGIN_URL: string = import.meta.env.VITE_RP_LOGIN_URL || `${RP_HOST}/ui/#login`;
+
+/**
  * Human-readable label for the build instance — e.g. "QA" or "Production".
  * Set per-instance in `.env.qa` / `.env.production` via `VITE_INSTANCE_LABEL`.
  * Empty in local dev builds (no badge shown).
