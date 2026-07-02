@@ -24,7 +24,7 @@ import type {
   CaptureData,
 } from '@/types';
 import { STORAGE_KEYS } from '@/types';
-import { generateId } from '@/utils';
+import { generateId, isRestrictedUrl } from '@/utils';
 import { RP_HOST, API_BASE_URL, RP_LOGIN_URL } from '@/config';
 
 // ─── Offscreen Management ─────────────────────────────────────────────────────
@@ -552,13 +552,13 @@ async function injectMainWorldCaptureScript(tabId: number): Promise<void> {
 
 // ─── Floating Toolbar ─────────────────────────────────────────────────────────
 
-async function injectFloatingToolbar(targetTabId?: number): Promise<void> {
+async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
   let tabId = targetTabId;
   if (!tabId) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     tabId = tab?.id;
   }
-  if (!tabId) return;
+  if (!tabId) return false;
 
   const showMsg = {
     type: 'SHOW_TOOLBAR' as const,
@@ -568,7 +568,7 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<void> {
   // Try messaging first (content script already running)
   try {
     await chrome.tabs.sendMessage(tabId, showMsg);
-    return;
+    return true;
   } catch {
     // Content script not ready — inject it programmatically then retry
   }
@@ -580,8 +580,10 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<void> {
     });
     await new Promise<void>((r) => setTimeout(r, 150));
     await chrome.tabs.sendMessage(tabId, showMsg);
+    return true;
   } catch (err) {
     console.error('[Background] Could not inject toolbar into tab', tabId, err);
+    return false;
   }
 }
 
@@ -591,19 +593,45 @@ async function reinjectToolbarIntoTab(tabId: number): Promise<void> {
     await restoreStateFromStorage();
     if (!isRecordingActive) return;
   }
-  // For tab/webcam: only the recording tab gets the toolbar.
-  // For screen: any tab the user navigates in gets it (screen capture is global).
-  if (
-    currentRecordingOptions?.type !== 'screen' &&
-    currentRecordingTabId !== null &&
-    currentRecordingTabId !== tabId
-  )
-    return;
-  // CDP auto-detaches on cross-origin navigation — always re-attach so captures
-  // continue uninterrupted after navigations. Accumulated entries are preserved.
-  void reattachDebugger(tabId);
+
+  // A tab recording captures only its own tab, so the toolbar stays pinned there
+  // and is never pushed onto other tabs. A screen/window share captures whatever
+  // is on screen, so the toolbar follows the user to whatever tab they navigate.
+  if (currentRecordingOptions?.type !== 'screen' && currentRecordingTabId !== tabId) return;
+
   await injectFloatingToolbar(tabId);
-  void injectMainWorldCaptureScript(tabId);
+
+  // Capture (CDP + main-world hooks) follows only the tab being recorded:
+  //  • screen/window share → follow the user across tabs (capture is global)
+  //  • tab recording → stay pinned to the recording tab, so navigating a
+  //    different tab never steals capture from the recorded one.
+  // CDP auto-detaches on cross-origin navigation, so we re-attach here to keep
+  // captures uninterrupted; accumulated entries are preserved. Skipped when the
+  // user disabled DevTools capture for this recording.
+  const captureThisTab =
+    currentRecordingOptions?.type === 'screen' || currentRecordingTabId === tabId;
+  if (captureThisTab && currentRecordingOptions?.captureDevtools !== false) {
+    void reattachDebugger(tabId);
+    void injectMainWorldCaptureScript(tabId);
+  }
+}
+
+// Surface the toolbar when the user switches to an already-loaded tab or another
+// browser window during a recording. Such a switch fires no navigation event, so
+// the content script won't self-mount the toolbar — we push SHOW_TOOLBAR
+// (injecting the content script first if it isn't there). Toolbar only: capture
+// stays where it is (a tab recording keeps capturing its tab; a screen recording
+// re-attaches CDP through the navigation handler).
+async function ensureToolbarOnActiveTab(tabId: number): Promise<void> {
+  if (!isRecordingActive) {
+    await restoreStateFromStorage();
+    if (!isRecordingActive) return;
+  }
+  // Tab recording → controls live on the recorded tab only; don't surface them on
+  // other tabs (those aren't being recorded). Screen/window share → the toolbar
+  // follows the user across tabs and windows.
+  if (currentRecordingOptions?.type !== 'screen' && currentRecordingTabId !== tabId) return;
+  await injectFloatingToolbar(tabId);
 }
 
 async function hideFloatingToolbar(): Promise<void> {
@@ -805,7 +833,9 @@ async function handleStartRecording(
 
     // Attach Chrome Debugger (CDP) + inject main-world capture script for
     // full coverage: CDP for all traffic, scripting API for CSP-strict pages.
-    if (currentRecordingTabId) {
+    // Skipped entirely when the user turned off DevTools capture for this
+    // recording — then no console/network logs are collected.
+    if (currentRecordingTabId && options.captureDevtools !== false) {
       void attachDebugger(currentRecordingTabId);
       void injectMainWorldCaptureScript(currentRecordingTabId);
     }
@@ -937,7 +967,7 @@ async function handleStopRecording(
   }
 
   const recordingId = currentRecordingId;
-  const quality = currentRecordingOptions?.quality ?? 'high';
+  const quality = currentRecordingOptions?.quality ?? '720p';
   const hasAudio =
     (currentRecordingOptions?.micEnabled || currentRecordingOptions?.systemAudio) ?? true;
   const hasWebcam = currentRecordingOptions?.webcamOverlay ?? false;
@@ -1322,6 +1352,20 @@ async function ensureContentScript(tabId: number): Promise<void> {
   }
 }
 
+/** Download a screenshot data URL to disk — used when we can't show the in-page
+ *  preview (e.g. restricted pages that can't host our content script). */
+async function downloadScreenshot(dataUrl: string): Promise<void> {
+  try {
+    await chrome.downloads.download({
+      url: dataUrl,
+      filename: `bestq-screenshot-${Date.now()}.png`,
+      saveAs: false,
+    });
+  } catch (err) {
+    console.error('[Background] Screenshot download fallback failed:', err);
+  }
+}
+
 async function handleTakeScreenshot(
   screenshotType: string,
   tabId: number,
@@ -1347,10 +1391,16 @@ async function handleTakeScreenshot(
       return;
     }
 
-    await chrome.tabs.sendMessage(tabId, {
-      type: 'SCREENSHOT_SHOW_PREVIEW',
-      payload: { dataUrl },
-    } as ExtensionMessage);
+    // Show the rich in-page preview when possible; on restricted pages the
+    // content script isn't there, so download the screenshot instead.
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'SCREENSHOT_SHOW_PREVIEW',
+        payload: { dataUrl },
+      } as ExtensionMessage);
+    } catch {
+      await downloadScreenshot(dataUrl);
+    }
   } catch (err) {
     console.error('[Background] Screenshot error:', err);
   }
@@ -1466,12 +1516,51 @@ chrome.runtime.onMessage.addListener(
       case 'GET_STATE': {
         void (async () => {
           if (!isRecordingActive) await restoreStateFromStorage();
+          // Tell a content script whether it should self-mount the toolbar on
+          // load: a tab recording shows it only on the recorded tab, while a
+          // screen/window share shows it on every page. Non-tab senders (the
+          // popup) get `true` — they don't mount the toolbar anyway.
+          const senderTabId = _sender.tab?.id;
+          const showToolbar =
+            isRecordingActive &&
+            (currentRecordingOptions?.type === 'screen' ||
+              senderTabId == null ||
+              currentRecordingTabId === senderTabId);
           sendResponse({
             isRecording: isRecordingActive,
             isPaused,
             elapsedSeconds,
             recordingId: currentRecordingId,
+            showToolbar,
           });
+        })();
+        return true;
+      }
+
+      case 'ENSURE_TOOLBAR': {
+        // Re-surface the floating toolbar on the current tab. Used when the user
+        // clicks the extension while recording but the toolbar was lost (page
+        // navigation, content-script eviction, etc.). Reports back whether the
+        // toolbar could be injected — the popup falls back to in-popup controls
+        // when the active page is restricted (chrome://, Web Store, …).
+        void (async () => {
+          try {
+            if (!isRecordingActive) await restoreStateFromStorage();
+            if (!isRecordingActive || !currentRecordingId) {
+              sendResponse({ injected: false });
+              return;
+            }
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (!tab?.id || isRestrictedUrl(tab.url)) {
+              sendResponse({ injected: false, restricted: true });
+              return;
+            }
+            const injected = await injectFloatingToolbar(tab.id);
+            sendResponse({ injected });
+          } catch (err) {
+            console.error('[Background] ENSURE_TOOLBAR error:', err);
+            sendResponse({ injected: false });
+          }
         })();
         return true;
       }
@@ -1609,7 +1698,7 @@ chrome.commands.onCommand.addListener((command) => {
           void handleStartRecording(
             {
               type: 'screen',
-              quality: 'high',
+              quality: '720p',
               micEnabled: true,
               webcamOverlay: false,
               systemAudio: false,
@@ -1649,6 +1738,25 @@ chrome.webNavigation.onCompleted.addListener(({ tabId, frameId }) => {
 chrome.webNavigation.onHistoryStateUpdated.addListener(({ tabId, frameId }) => {
   if (frameId !== 0) return;
   void reinjectToolbarIntoTab(tabId);
+});
+
+// Keep the toolbar visible when the user switches to an already-loaded tab or
+// focuses another browser window mid-recording. Neither fires a navigation
+// event, so without these the toolbar would be missing on that page.
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  void ensureToolbarOnActiveTab(tabId);
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  void (async () => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, windowId });
+      if (tab?.id) await ensureToolbarOnActiveTab(tab.id);
+    } catch {
+      /* window may have closed — ignore */
+    }
+  })();
 });
 
 // ─── Startup / Install ────────────────────────────────────────────────────────
@@ -1817,6 +1925,25 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
 }
 
 /**
+ * Fetch the user's profile photo (raw image bytes) and return it as a data URL,
+ * or null if there's no photo / the request fails. Uses the SW-safe blobToDataUrl
+ * (FileReader isn't reliable in service workers).
+ */
+async function fetchUserPhotoDataUrl(accessToken: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/v1/data/photo?loadThumbnail=true&at=${Date.now()}`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'image/*' },
+    });
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    if (blob.size === 0) return null;
+    return await blobToDataUrl(blob);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Validate the captured token by fetching the current user, then store auth
  * state exactly like a token login (no refresh token — expiry triggers logout).
  */
@@ -1846,7 +1973,7 @@ async function completeGoogleLogin(accessToken: string, sourceTabId: number): Pr
       login: rpUser.userId,
       email: rpUser.email ?? '',
       name: rpUser.fullName ?? rpUser.userId,
-      avatar: rpUser.photoId ?? null,
+      avatar: await fetchUserPhotoDataUrl(accessToken),
       role: rpUser.userRole,
       isActive: rpUser.active ?? true,
       assignedProjects: rpUser.assignedProjects,

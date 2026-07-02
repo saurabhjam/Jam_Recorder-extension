@@ -5,6 +5,7 @@ import { useRecordingStore } from '@/store/recording.store';
 import { useSettingsStore } from '@/store/settings.store';
 import { LoginView } from './views/LoginView';
 import { HomeView } from './views/HomeView';
+import { RecordingView } from './views/RecordingView';
 import { UploadView } from './views/UploadView';
 import { ShareView } from './views/ShareView';
 import { LibraryView } from './views/LibraryView';
@@ -15,6 +16,7 @@ import { SettingsView } from './views/SettingsView';
 type View =
   | 'login'
   | 'home'
+  | 'recording'
   | 'upload'
   | 'share'
   | 'library'
@@ -70,6 +72,27 @@ export default function App() {
     return () => chrome.runtime.onMessage.removeListener(listener);
   }, [initAuth]);
 
+  // Re-surface the floating toolbar on the current tab, then close the popup.
+  // If it can't be injected (restricted page), show the in-popup recording
+  // controls so the user can still pause/stop.
+  const ensureToolbarThenRoute = async () => {
+    try {
+      const res = await new Promise<{ injected?: boolean } | undefined>((resolve) => {
+        chrome.runtime.sendMessage({ type: 'ENSURE_TOOLBAR' }, (response) => {
+          if (chrome.runtime.lastError) resolve(undefined);
+          else resolve(response as { injected?: boolean } | undefined);
+        });
+      });
+      if (res?.injected) {
+        window.close();
+        return;
+      }
+    } catch {
+      // fall through to in-popup controls
+    }
+    setCurrentView('recording');
+  };
+
   // Auto-route based on recording status
   useEffect(() => {
     if (isInitializing || authLoading) return;
@@ -80,11 +103,18 @@ export default function App() {
     }
 
     switch (recordingStatus) {
+      case 'requesting':
+        // Still acquiring the stream — the popup that started it closes itself.
+        window.close();
+        break;
       case 'recording':
       case 'paused':
-      case 'requesting':
-        // Close popup — floating toolbar on the page is the control surface
-        window.close();
+        // The floating toolbar on the page is the control surface. It can be
+        // lost (page navigation, content-script eviction) — so re-inject it into
+        // the current tab, then close the popup once it's back. If the active
+        // page is restricted (chrome://, Web Store, …) the toolbar can't live
+        // there, so keep the popup open and show the recording controls in it.
+        void ensureToolbarThenRoute();
         break;
       case 'uploading':
       case 'stopping':
@@ -146,6 +176,20 @@ export default function App() {
             className="flex-1 overflow-hidden"
           >
             <HomeView onNavigate={navigate} />
+          </motion.div>
+        )}
+
+        {currentView === 'recording' && (
+          <motion.div
+            key="recording"
+            variants={PAGE_VARIANTS}
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            transition={PAGE_TRANSITION}
+            className="flex-1 overflow-hidden"
+          >
+            <RecordingView onCancel={() => navigate('home')} />
           </motion.div>
         )}
 

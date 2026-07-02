@@ -17,7 +17,7 @@
  */
 
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
-import { STORAGE_KEYS } from '@/types';
+import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
 import { RP_HOST, API_BASE_URL as REPORTS_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
 
@@ -138,7 +138,7 @@ let tabAudioStreams: MediaStream[] = []; // audible-tab audio mixed into desktop
 let webcamStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null; // mixes mic + system audio into one track
 let audioLimiter: DynamicsCompressorNode | null = null; // master bus tab-audio sources feed into
-let chunks: Blob[] = [];
+let sink: RecordingSink | null = null; // streams recorder chunks to disk (OPFS) or memory
 let mimeType = 'video/webm';
 let isRecordingActive = false;
 let lastThumbnailDataUrl: string | null = null;
@@ -158,6 +158,95 @@ function getSupportedMimeType(): string {
     if (MediaRecorder.isTypeSupported(type)) return type;
   }
   return 'video/webm';
+}
+
+// ─── Recording Sink (stream-to-disk) ───────────────────────────────────────────
+// MediaRecorder emits a Blob every timeslice. Buffering them all in a JS array
+// for the whole recording (the old approach) makes multi-hour captures balloon
+// memory and eventually crash the offscreen document. Instead we stream each
+// chunk straight to a file in the Origin Private File System (OPFS) — disk-backed
+// and shared across extension pages, so the editor can read it back without ever
+// holding the whole recording in RAM. Falls back to in-memory if OPFS is
+// unavailable (recording still works, just bounded by memory as before).
+
+/** OPFS filename for a recording's raw blob. Shared with the editor's reader. */
+export function recordingOpfsName(recordingId: string): string {
+  return `recording-${recordingId}.webm`;
+}
+
+interface RecordingSink {
+  /** Storage backing — the editor decides whether to also fall back to IDB. */
+  readonly kind: 'opfs' | 'memory';
+  /** Enqueue a chunk. Fire-and-forget; writes are serialized internally. */
+  write(chunk: Blob): void;
+  /** Flush all pending writes and return the full recording as a Blob. */
+  finalize(): Promise<Blob>;
+  /** Abandon the recording and free any partial data (on error paths). */
+  discard(): Promise<void>;
+}
+
+async function createRecordingSink(recordingId: string, mime: string): Promise<RecordingSink> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const name = recordingOpfsName(recordingId);
+    const handle = await root.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+
+    // Chain writes so overlapping timeslices can't interleave (a single 4K frame
+    // can take >1s to flush). Any write failure latches `failed` and is surfaced
+    // at finalize() rather than crashing the dataavailable handler.
+    let queue: Promise<void> = Promise.resolve();
+    let failed: unknown = null;
+
+    return {
+      kind: 'opfs',
+      write(chunk) {
+        queue = queue
+          .then(() => writable.write(chunk))
+          .catch((err) => {
+            failed ??= err;
+            console.error('[Offscreen] OPFS chunk write failed:', err);
+          });
+      },
+      async finalize() {
+        await queue;
+        await writable.close();
+        if (failed) throw failed instanceof Error ? failed : new Error(String(failed));
+        const file = await handle.getFile();
+        // Re-tag with the recorder's MIME type (OPFS files have no media type).
+        return file.slice(0, file.size, mime);
+      },
+      async discard() {
+        try {
+          await queue;
+          await writable.close();
+        } catch {
+          /* ignore */
+        }
+        try {
+          await root.removeEntry(name);
+        } catch {
+          /* ignore */
+        }
+      },
+    };
+  } catch (err) {
+    console.warn('[Offscreen] OPFS unavailable — buffering recording in memory:', err);
+    const mem: Blob[] = [];
+    return {
+      kind: 'memory',
+      write(chunk) {
+        mem.push(chunk);
+      },
+      finalize() {
+        return Promise.resolve(new Blob(mem, { type: mime }));
+      },
+      discard() {
+        mem.length = 0;
+        return Promise.resolve();
+      },
+    };
+  }
 }
 
 // ─── Stream Building ──────────────────────────────────────────────────────────
@@ -222,16 +311,22 @@ async function acquireCaptureStream(
   options: RecordingOptions,
   streamId?: string,
 ): Promise<MediaStream> {
+  const preset = QUALITY_PRESETS[options.quality] ?? QUALITY_PRESETS['720p'];
+
   if (options.type === 'screen') {
     return navigator.mediaDevices.getDisplayMedia({
       // No displaySurface hint → the picker offers Chrome Tab / Window / Entire
       // Screen equally. Picking a Tab captures that tab's audio on every OS;
       // Entire-Screen system audio works on Windows/ChromeOS (macOS has no
       // system-loopback driver, so screen/window audio can't be captured there).
+      //
+      // Frame rate is the biggest lever on file size for screen content: the
+      // capture track is constrained here (MediaRecorder only encodes the frames
+      // the track produces), so a low preset fps directly shrinks the output.
       video: {
-        frameRate: 30,
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        frameRate: { ideal: preset.frameRate, max: preset.frameRate },
+        width: { ideal: preset.width },
+        height: { ideal: preset.height },
       },
       // Capture system/computer audio (meeting voices, media playback) only when
       // the user enabled it. The browser still shows a "Share audio" checkbox in
@@ -258,6 +353,11 @@ async function acquireCaptureStream(
       mandatory: {
         chromeMediaSource: 'tab',
         chromeMediaSourceId: streamId,
+        // Cap resolution/frame rate to the quality preset so tab recordings get
+        // the same size reduction as screen shares.
+        maxWidth: preset.width,
+        maxHeight: preset.height,
+        maxFrameRate: preset.frameRate,
       },
     } as any,
   });
@@ -467,21 +567,27 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
     throw new Error('A recording is already in progress in offscreen');
   }
 
-  const { options, streamId } = payload;
+  const { options, streamId, recordingId } = payload;
 
-  chunks = [];
   mimeType = getSupportedMimeType();
+  const preset = QUALITY_PRESETS[options.quality] ?? QUALITY_PRESETS['720p'];
   isRecordingActive = true;
 
   stream = await createRecordingStream(options, streamId);
 
+  // Stream chunks straight to disk so multi-hour recordings don't exhaust memory.
+  sink = await createRecordingSink(recordingId, mimeType);
+
   recorder = new MediaRecorder(stream, {
-    mimeType: 'video/webm;codecs=vp9,opus',
-    videoBitsPerSecond: 8_000_000,
+    // Honor the negotiated MIME type instead of hardcoding vp9 (which throws on
+    // browsers without VP9 encode support), and drive bitrate from the preset.
+    mimeType,
+    videoBitsPerSecond: preset.videoBitrate,
+    audioBitsPerSecond: preset.audioBitrate,
   });
 
   recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
+    if (e.data.size > 0) sink?.write(e.data);
   };
 
   recorder.onerror = (e) => {
@@ -518,19 +624,20 @@ async function stopRecording(metadata: {
     throw new Error('No active recording');
   }
 
-  const finalBlob = await new Promise<Blob>((resolve, reject) => {
-    recorder!.onstop = () => {
-      resolve(new Blob(chunks, { type: mimeType }));
-    };
-    recorder!.onerror = (e) => {
-      reject(new Error(e.error?.message ?? 'Stop error'));
-    };
+  // Stopping fires a final `dataavailable` (flushed into the sink) before `stop`.
+  await new Promise<void>((resolve, reject) => {
+    recorder!.onstop = () => resolve();
+    recorder!.onerror = (e) => reject(new Error(e.error?.message ?? 'Stop error'));
     if (recorder!.state !== 'inactive') {
       recorder!.stop();
     } else {
-      resolve(new Blob(chunks, { type: mimeType }));
+      resolve();
     }
   });
+
+  const activeSink = sink;
+  const finalBlob = await (activeSink?.finalize() ??
+    Promise.resolve(new Blob([], { type: mimeType })));
 
   cleanup();
 
@@ -538,11 +645,14 @@ async function stopRecording(metadata: {
   const thumbnailDataUrl = await generateThumbnail(finalBlob);
   lastThumbnailDataUrl = thumbnailDataUrl;
 
-  // Save blob to IDB so the editor window can load it for playback
-  try {
-    await saveBlobToIDB(metadata.recordingId, finalBlob);
-  } catch (err) {
-    console.warn('[Offscreen] Could not save blob to IDB:', err);
+  // OPFS-backed recordings are already on disk (the editor reads them directly by
+  // name); only the in-memory fallback needs copying into IDB for the editor.
+  if (activeSink?.kind !== 'opfs') {
+    try {
+      await saveBlobToIDB(metadata.recordingId, finalBlob);
+    } catch (err) {
+      console.warn('[Offscreen] Could not save blob to IDB:', err);
+    }
   }
 
   sendToBackground('OFFSCREEN_RECORDING_READY', {
@@ -611,7 +721,7 @@ function cleanup(): void {
   audioLimiter = null;
   needsDynamicTabAudio = false;
   recorder = null;
-  chunks = [];
+  sink = null;
   isRecordingActive = false;
   lastThumbnailDataUrl = null;
 }
@@ -667,7 +777,7 @@ async function takeScreenshot(streamId: string): Promise<void> {
       type: 'screenshot',
       mimeType: 'image/png',
       duration: 0,
-      quality: 'high',
+      quality: '720p',
       hasAudio: false,
       hasWebcam: false,
     });

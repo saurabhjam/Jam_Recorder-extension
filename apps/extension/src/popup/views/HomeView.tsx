@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Monitor,
@@ -6,13 +6,18 @@ import {
   Settings,
   Mic,
   MicOff,
-  Video,
-  VideoOff,
   Play,
   FileImage,
   Crop,
   Volume2,
   VolumeX,
+  Gauge,
+  ChevronDown,
+  Check,
+  AlertTriangle,
+  X,
+  Bug,
+  Upload,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { useRecordingStore } from '@/store/recording.store';
@@ -23,8 +28,28 @@ import {
 } from '@/store/settings.store';
 import { Avatar } from '@/components/ui/Avatar';
 import { InstanceBadge } from '@/components/ui/InstanceBadge';
-import { cn } from '@/utils';
-import type { RecordingType } from '@/types';
+import { cn, isRestrictedUrl, generateId } from '@/utils';
+import type { RecordingType, RecordingQuality } from '@/types';
+import { STORAGE_KEYS } from '@/types';
+
+// Shared local blob store (same DB the editor reads recordings from) so an
+// uploaded video can be handed off to the editor by id.
+const IDB_NAME = 'bestq-blobs';
+const IDB_STORE = 'recordings';
+function saveBlobToIDB(id: string, blob: Blob): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => {
+      const db = req.result;
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(blob, id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
 
 type View =
   | 'home'
@@ -75,6 +100,14 @@ const RECORD_OPTIONS: Array<{
   },
 ];
 
+// Resolution options for the recording quality dropdown. Lower resolution =
+// smaller file; each maps to a preset in QUALITY_PRESETS (frame rate + bitrate).
+const QUALITY_OPTIONS: Array<{ value: RecordingQuality; label: string; hint: string }> = [
+  { value: '480p', label: '480p', hint: 'Smallest · ~80 MB/hr' },
+  { value: '720p', label: '720p', hint: 'Recommended · ~150 MB/hr' },
+  { value: '1080p', label: '1080p', hint: 'Best clarity · ~280 MB/hr' },
+];
+
 const SCREENSHOT_OPTIONS: Array<{
   type: ScreenshotType;
   icon: React.ReactNode;
@@ -104,18 +137,41 @@ const SCREENSHOT_OPTIONS: Array<{
 export function HomeView({ onNavigate }: HomeViewProps) {
   const { user, logout, isAuthenticated } = useAuthStore();
   const { startRecording, takeScreenshot, fetchRecordings } = useRecordingStore();
-  const { settings, toggleMic, toggleWebcam, toggleSystemAudio } = useSettingsStore();
+  const { settings, toggleMic, toggleSystemAudio, setQuality, updateSettings } = useSettingsStore();
 
   const [activeTab, setActiveTab] = useState<MainTab>('record');
   const [selectedRecordType, setSelectedRecordType] = useState<RecordingType>('tab');
   const [selectedScreenshotType, setSelectedScreenshotType] = useState<ScreenshotType>('full-page');
   const [isStarting, setIsStarting] = useState(false);
+  // Recording/screenshots can't run on chrome:// pages, the Web Store, etc. When
+  // the current tab is one of those we block the action and show a notice popup.
+  const [isRestrictedPage, setIsRestrictedPage] = useState(false);
+  const [showUnsupported, setShowUnsupported] = useState(false);
+  // Uploading a local video → hands it to the editor (same save/upload flow).
+  const [isPreparingUpload, setIsPreparingUpload] = useState(false);
+  const videoUploadInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (isAuthenticated) void fetchRecordings();
   }, [isAuthenticated, fetchRecordings]);
 
+  // Detect whether the current tab is a page the extension can't operate on.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        setIsRestrictedPage(isRestrictedUrl(tab?.url));
+      } catch {
+        setIsRestrictedPage(false);
+      }
+    })();
+  }, []);
+
   const handleStartRecording = async () => {
+    if (isRestrictedPage) {
+      setShowUnsupported(true);
+      return;
+    }
     setIsStarting(true);
     try {
       // Neither the popup nor the offscreen recorder can surface a mic
@@ -144,6 +200,7 @@ export function HomeView({ onNavigate }: HomeViewProps) {
         micEnabled: settings.micEnabled,
         webcamOverlay: settings.webcamOverlay,
         systemAudio: settings.systemAudio,
+        captureDevtools: settings.captureDevtools,
         tabId: activeTab?.id,
       });
       // Close the popup so the floating toolbar (injected into the page) takes over
@@ -154,11 +211,53 @@ export function HomeView({ onNavigate }: HomeViewProps) {
     }
   };
 
+  // Upload a local video: store it in the shared blob DB, then open the editor
+  // pointed at it so it goes through the exact same project-select → save →
+  // upload flow as a recording (same portal/DB API).
+  const handleVideoFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-picking the same file later
+    if (!file) return;
+    setIsPreparingUpload(true);
+    try {
+      const id = generateId();
+      await saveBlobToIDB(id, file);
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.EDITOR_DATA]: {
+          recordingId: id,
+          thumbnailDataUrl: null,
+          duration: 0,
+          blobSize: file.size,
+          title: file.name.replace(/\.[^./\\]+$/, ''),
+          recordingType: 'tab',
+          consoleLogs: [],
+          networkCaptures: [],
+        },
+      });
+      await chrome.windows.create({
+        url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${id}`),
+        type: 'popup',
+        width: 1200,
+        height: 800,
+        focused: true,
+      });
+      window.close();
+    } catch (err) {
+      console.error('Failed to prepare uploaded video:', err);
+      setIsPreparingUpload(false);
+    }
+  };
+
   const handleScreenshot = async () => {
+    // Restricted pages (chrome://, Web Store) can't host our content script, so
+    // full-page/area capture and the in-page preview won't work there. We still
+    // allow a plain visible-area screenshot — the background captures it and
+    // downloads the image as a fallback when it can't show the preview.
+    const type = isRestrictedPage ? 'visible' : selectedScreenshotType;
     // Await so the tab query inside completes before the popup closes.
     // The popup must still be open when chrome.tabs.query({currentWindow:true}) runs
     // so it resolves to the page tab, not the popup's own window.
-    await takeScreenshot(selectedScreenshotType);
+    await takeScreenshot(type);
     window.close();
   };
 
@@ -212,6 +311,19 @@ export function HomeView({ onNavigate }: HomeViewProps) {
         </div>
       </div>
 
+      {/* ─── Unsupported page banner ─── */}
+      {isRestrictedPage && (
+        <div className="px-4 pb-3 shrink-0">
+          <div className="flex items-start gap-2.5 px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25">
+            <AlertTriangle size={15} className="text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-[11px] leading-snug text-amber-200/90">
+              BestQ can't record or capture on this page. Open a normal website (http/https) and try
+              again.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* ─── Scrollable Body ─── */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-none">
         <AnimatePresence mode="wait">
@@ -246,6 +358,12 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                 ))}
               </div>
 
+              {/* Quality (resolution) selector — lower = smaller file */}
+              <QualitySelect
+                value={settings.recordingQuality}
+                onChange={(q) => void setQuality(q)}
+              />
+
               {/* Controls */}
               <div className="flex items-center gap-2">
                 <ControlToggle
@@ -261,10 +379,12 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                   onClick={() => void toggleSystemAudio()}
                 />
                 <ControlToggle
-                  icon={settings.webcamOverlay ? <Video size={12} /> : <VideoOff size={12} />}
-                  label="Cam"
-                  active={settings.webcamOverlay}
-                  onClick={() => void toggleWebcam()}
+                  icon={<Bug size={12} />}
+                  label="Logs"
+                  active={settings.captureDevtools}
+                  onClick={() =>
+                    void updateSettings({ captureDevtools: !settings.captureDevtools })
+                  }
                 />
               </div>
 
@@ -299,6 +419,41 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                   )}
                   <span>{isStarting ? 'Starting…' : 'Start Recording'}</span>
                 </span>
+              </motion.button>
+
+              {/* Divider */}
+              <div className="flex items-center gap-2">
+                <div className="flex-1 h-px bg-white/8" />
+                <span className="text-[10px] text-dark-500 font-semibold tracking-wide">OR</span>
+                <div className="flex-1 h-px bg-white/8" />
+              </div>
+
+              {/* Upload an existing local video → opens the editor to save it */}
+              <input
+                ref={videoUploadInputRef}
+                type="file"
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => void handleVideoFileSelected(e)}
+              />
+              <motion.button
+                whileTap={{ scale: 0.98 }}
+                whileHover={{ y: -1 }}
+                disabled={isPreparingUpload}
+                onClick={() => videoUploadInputRef.current?.click()}
+                className={cn(
+                  'w-full h-11 rounded-2xl flex items-center justify-center gap-2',
+                  'border border-white/10 bg-dark-900/70 hover:bg-dark-800/80 hover:border-white/16',
+                  'text-dark-200 font-semibold text-sm transition-all duration-200',
+                  'disabled:opacity-60 disabled:cursor-not-allowed',
+                )}
+              >
+                {isPreparingUpload ? (
+                  <span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" />
+                ) : (
+                  <Upload size={15} className="text-jam-300" />
+                )}
+                <span>{isPreparingUpload ? 'Opening editor…' : 'Upload a video'}</span>
               </motion.button>
             </motion.div>
           ) : (
@@ -367,7 +522,6 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                     .replace(/ (\w+)$/, ' $1')
                     .slice(0, 14)}
                 </p>
-                <span className="text-[10px] text-jam-400 font-medium">Pro Plan</span>
               </div>
             </div>
 
@@ -390,6 +544,54 @@ export function HomeView({ onNavigate }: HomeViewProps) {
           </div>
         </div>
       )}
+
+      {/* ─── Unsupported page popup ─── */}
+      <AnimatePresence>
+        {showUnsupported && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="absolute inset-0 z-50 flex items-center justify-center bg-dark-950/70 backdrop-blur-sm px-6"
+            onClick={() => setShowUnsupported(false)}
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.92, y: 8 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.92, y: 8 }}
+              transition={{ type: 'spring', stiffness: 340, damping: 26 }}
+              onClick={(e) => e.stopPropagation()}
+              className="relative w-full max-w-[300px] rounded-2xl bg-dark-900 border border-white/10 shadow-2xl p-5 text-center"
+            >
+              <button
+                onClick={() => setShowUnsupported(false)}
+                className="absolute top-3 right-3 w-7 h-7 flex items-center justify-center rounded-lg text-dark-500 hover:text-white hover:bg-white/8 transition-all"
+              >
+                <X size={15} />
+              </button>
+
+              <div className="w-12 h-12 mx-auto rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center">
+                <AlertTriangle size={22} className="text-amber-400" />
+              </div>
+
+              <h3 className="text-sm font-bold text-white mt-3.5">This page isn't supported</h3>
+              <p className="text-xs text-dark-400 mt-1.5 leading-relaxed">
+                BestQ can't record or take screenshots on browser pages like the Chrome Web Store or{' '}
+                <span className="text-dark-300">chrome://</span> settings. Switch to a regular
+                website and try again.
+              </p>
+
+              <button
+                onClick={() => setShowUnsupported(false)}
+                className="w-full h-10 mt-4 rounded-xl bg-gradient-to-r from-jam-500 to-violet-500 hover:from-jam-600 hover:to-violet-600 text-white font-semibold text-sm transition-all"
+              >
+                Got it
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -557,5 +759,86 @@ function ControlToggle({
         {active ? 'ON' : 'OFF'}
       </span>
     </motion.button>
+  );
+}
+
+// ─── Quality (resolution) Dropdown ────────────────────────────────────────────
+
+function QualitySelect({
+  value,
+  onChange,
+}: {
+  value: RecordingQuality;
+  onChange: (q: RecordingQuality) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const current = QUALITY_OPTIONS.find((o) => o.value === value) ?? QUALITY_OPTIONS[1];
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          'w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border transition-all duration-200',
+          open
+            ? 'bg-dark-800/80 border-jam-500/40'
+            : 'bg-dark-900/70 border-white/8 hover:bg-dark-800/80 hover:border-white/14',
+        )}
+      >
+        <Gauge size={13} className="text-jam-300 shrink-0" />
+        <span className="text-xs font-medium text-dark-300">Quality</span>
+        <span className="ml-auto flex items-center gap-1.5">
+          <span className="text-[10px] text-dark-500">{current.hint}</span>
+          <span className="text-xs font-semibold text-white">{current.label}</span>
+          <ChevronDown
+            size={13}
+            className={cn('text-dark-400 transition-transform duration-200', open && 'rotate-180')}
+          />
+        </span>
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <>
+            {/* Click-outside catcher */}
+            <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+            <motion.div
+              initial={{ opacity: 0, y: -4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: 0.12 }}
+              className="absolute left-0 right-0 mt-1.5 z-20 rounded-xl border border-white/10 bg-dark-900 shadow-xl overflow-hidden"
+            >
+              {QUALITY_OPTIONS.map((o) => (
+                <button
+                  key={o.value}
+                  onClick={() => {
+                    onChange(o.value);
+                    setOpen(false);
+                  }}
+                  className={cn(
+                    'w-full flex items-center gap-2 px-3 py-2.5 text-left transition-colors',
+                    o.value === value ? 'bg-jam-500/15' : 'hover:bg-white/5',
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'text-xs font-semibold w-11 shrink-0',
+                      o.value === value ? 'text-jam-200' : 'text-dark-200',
+                    )}
+                  >
+                    {o.label}
+                  </span>
+                  <span className="text-[10px] text-dark-500">{o.hint}</span>
+                  {o.value === value && (
+                    <Check size={13} className="ml-auto text-jam-400 shrink-0" />
+                  )}
+                </button>
+              ))}
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+    </div>
   );
 }

@@ -1,16 +1,6 @@
 import { useState, useRef } from 'react';
 import { motion } from 'framer-motion';
-import {
-  ArrowLeft,
-  Camera,
-  Mic,
-  Link,
-  Timer,
-  Cloud,
-  AlertTriangle,
-  Check,
-  User,
-} from 'lucide-react';
+import { ArrowLeft, Camera, Mic, Link, Timer, AlertTriangle, Check, User } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { useSettingsStore } from '@/store/settings.store';
 import { Avatar } from '@/components/ui/Avatar';
@@ -38,12 +28,11 @@ const ITEM_VARIANTS = {
 
 export function SettingsView({ onBack }: SettingsViewProps) {
   const { user, logout } = useAuthStore();
-  const { settings, updateSettings, toggleMic, toggleWebcam } = useSettingsStore();
+  const { settings, updateSettings, toggleMic } = useSettingsStore();
 
   const [name, setName] = useState(user?.name ?? '');
   const [isSaving, setIsSaving] = useState(false);
   const [savedOk, setSavedOk] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleSave = async () => {
@@ -61,16 +50,6 @@ export function SettingsView({ onBack }: SettingsViewProps) {
 
   const handleSignOutAll = async () => {
     await logout();
-  };
-
-  const handleDeleteAccount = () => {
-    if (!confirmDelete) {
-      setConfirmDelete(true);
-      setTimeout(() => setConfirmDelete(false), 4000);
-      return;
-    }
-    // Perform deletion — handled by a real API call in production
-    void logout();
   };
 
   return (
@@ -180,12 +159,6 @@ export function SettingsView({ onBack }: SettingsViewProps) {
             <SectionLabel>Preferences</SectionLabel>
             <div className="flex flex-col gap-1.5 bg-dark-800/40 border border-white/6 rounded-2xl overflow-hidden">
               <ToggleSetting
-                icon={<Camera size={14} />}
-                label="Start recording with camera"
-                checked={settings.webcamOverlay}
-                onChange={() => void toggleWebcam()}
-              />
-              <ToggleSetting
                 icon={<Mic size={14} />}
                 label="Start recording with mic"
                 checked={settings.micEnabled}
@@ -204,14 +177,6 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                 onChange={() =>
                   void updateSettings({ countdownEnabled: !settings.countdownEnabled })
                 }
-              />
-              <ToggleSetting
-                icon={<Cloud size={14} />}
-                label="Auto upload to cloud"
-                checked={true}
-                onChange={() => {
-                  /* Future feature */
-                }}
                 last
               />
             </div>
@@ -236,46 +201,6 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                     Sign out from all devices
                   </p>
                   <p className="text-xxs text-dark-500">Revoke all active sessions</p>
-                </div>
-              </button>
-
-              <button
-                onClick={handleDeleteAccount}
-                className={cn(
-                  'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border transition-all text-left group',
-                  confirmDelete
-                    ? 'bg-red-500/15 border-red-500/50'
-                    : 'bg-dark-800/50 border-white/6 hover:border-red-500/30 hover:bg-red-500/6',
-                )}
-              >
-                <div
-                  className={cn(
-                    'w-7 h-7 rounded-lg flex items-center justify-center shrink-0 transition-colors',
-                    confirmDelete ? 'bg-red-500/25' : 'bg-dark-700 group-hover:bg-red-500/15',
-                  )}
-                >
-                  <AlertTriangle
-                    size={13}
-                    className={cn(
-                      'transition-colors',
-                      confirmDelete ? 'text-red-400' : 'text-dark-400 group-hover:text-red-400',
-                    )}
-                  />
-                </div>
-                <div>
-                  <p
-                    className={cn(
-                      'text-xs font-medium transition-colors',
-                      confirmDelete ? 'text-red-300' : 'text-dark-200 group-hover:text-red-300',
-                    )}
-                  >
-                    {confirmDelete ? 'Click again to confirm deletion' : 'Delete account'}
-                  </p>
-                  <p className="text-xxs text-dark-500">
-                    {confirmDelete
-                      ? 'This action is permanent and cannot be undone'
-                      : 'Permanently remove your account and data'}
-                  </p>
                 </div>
               </button>
             </div>

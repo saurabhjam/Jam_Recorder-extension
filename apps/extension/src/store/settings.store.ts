@@ -19,6 +19,22 @@ async function persistSettings(settings: ExtensionSettings): Promise<void> {
   await chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: settings });
 }
 
+/**
+ * Map legacy quality values (low/medium/high/4k) onto the resolution-based ones
+ * so users who saved settings before the switch keep a sensible resolution.
+ * Anything unrecognized falls back to the 720p default.
+ */
+function migrateQuality(q: unknown): RecordingQuality {
+  const legacy: Record<string, RecordingQuality> = {
+    low: '480p',
+    medium: '720p',
+    high: '1080p',
+    '4k': '1080p', // capped at 1080p
+  };
+  if (q === '480p' || q === '720p' || q === '1080p') return q;
+  return (typeof q === 'string' && legacy[q]) || '720p';
+}
+
 /** Path of the dedicated mic-permission page (opened in a real tab). */
 export const MIC_PERMISSION_PAGE = 'src/permission/index.html';
 
@@ -54,10 +70,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
       if (stored) {
         // Merge with defaults to handle new settings fields
-        set({
-          settings: { ...DEFAULT_SETTINGS, ...stored },
-          isLoading: false,
-        });
+        const merged: ExtensionSettings = { ...DEFAULT_SETTINGS, ...stored };
+        merged.recordingQuality = migrateQuality(merged.recordingQuality);
+        set({ settings: merged, isLoading: false });
+        // Persist the migrated value so it sticks after the first load.
+        if (merged.recordingQuality !== stored.recordingQuality) {
+          await persistSettings(merged);
+        }
       } else {
         // Save defaults on first run
         await persistSettings(DEFAULT_SETTINGS);

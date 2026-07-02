@@ -58,6 +58,39 @@ export function generateId(size = 21): string {
 }
 
 /**
+ * True for pages where Chrome forbids content-script injection, tab capture and
+ * screenshots — chrome:// internal pages (settings, the extensions manager),
+ * other extension pages, and the Chrome Web Store. Trying to record or capture
+ * on these fails silently, so the popup shows an "unsupported page" notice and
+ * the floating toolbar can't be re-injected there.
+ */
+export function isRestrictedUrl(url: string | undefined | null): boolean {
+  if (!url) return true;
+
+  const restrictedPrefixes = [
+    'chrome://',
+    'chrome-extension://',
+    'chrome-search://',
+    'chrome-untrusted://',
+    'edge://',
+    'about:',
+    'devtools://',
+    'view-source:',
+  ];
+  if (restrictedPrefixes.some((prefix) => url.startsWith(prefix))) return true;
+
+  // Chrome Web Store — both the legacy and current hosts block extensions.
+  if (
+    url.startsWith('https://chrome.google.com/webstore') ||
+    url.startsWith('https://chromewebstore.google.com')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Debounces a function call.
  */
 export function debounce<T extends (...args: unknown[]) => unknown>(
@@ -117,6 +150,9 @@ export async function retryWithBackoff<T>(
       return await fn();
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
+      // Let callers mark an error as non-retryable (e.g. a 4xx that will never
+      // succeed on retry) so we fail fast instead of burning the whole budget.
+      if ((err as { noRetry?: boolean } | null)?.noRetry) throw lastError;
       if (attempt < retries - 1) {
         const delay = baseDelay * Math.pow(2, attempt);
         await sleep(delay);

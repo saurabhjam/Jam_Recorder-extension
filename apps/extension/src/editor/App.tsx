@@ -10,6 +10,7 @@ import {
   Link2,
   Lock,
   LogIn,
+  Download,
   Scissors,
   FolderOpen,
   ChevronDown,
@@ -18,6 +19,7 @@ import {
   FlaskConical,
 } from 'lucide-react';
 import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
+import { retryWithBackoff } from '@/utils';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -107,6 +109,137 @@ async function loadBlobFromIDB(id: string): Promise<Blob | null> {
   }
 }
 
+/** Filename the offscreen recorder streams the raw blob to in OPFS. */
+function recordingOpfsName(id: string): string {
+  return `recording-${id}.webm`;
+}
+
+/** Read the recording from OPFS (disk-backed; where long recordings now live). */
+async function loadBlobFromOPFS(id: string): Promise<Blob | null> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(recordingOpfsName(id));
+    const file = await handle.getFile();
+    return file.size > 0 ? file : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Load a recording's blob, preferring the OPFS file the recorder streams to,
+ * falling back to the in-memory→IDB path for older/small recordings.
+ */
+async function loadRecordingBlob(id: string): Promise<Blob | null> {
+  return (await loadBlobFromOPFS(id)) ?? (await loadBlobFromIDB(id));
+}
+
+/** Free the recording's local copy once it's safely uploaded. */
+async function deleteRecordingBlob(id: string): Promise<void> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(recordingOpfsName(id));
+  } catch {
+    /* not in OPFS */
+  }
+  try {
+    const db = await openRecordingIDB();
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Trim a recorded video blob to [startSec, endSec] entirely in the browser.
+ *
+ * There's no ffmpeg here, so we re-record: play the source <video> from the trim
+ * start to the trim end while capturing its stream through MediaRecorder. This is
+ * real-time (a 30s clip takes ~30s) but needs no native deps and preserves audio.
+ * `onProgress` reports 0–1 based on how far through the selection we are.
+ */
+async function trimVideoBlob(
+  blob: Blob,
+  startSec: number,
+  endSec: number,
+  onProgress?: (fraction: number) => void,
+): Promise<Blob> {
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement('video');
+  video.src = url;
+  video.muted = true; // muted so autoplay is allowed; audio track is still captured
+  video.playsInline = true;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      video.onloadedmetadata = () => resolve();
+      video.onerror = () => reject(new Error('Could not load recording for trimming'));
+    });
+
+    const capture = video as HTMLVideoElement & { captureStream?: () => MediaStream };
+    const stream = capture.captureStream?.();
+    if (!stream) throw new Error('captureStream unavailable — cannot trim in this browser');
+
+    // Prefer a codec the recorder actually supports; fall back to default.
+    const preferred = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+    const mimeType = preferred.find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const chunks: BlobPart[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+    const stopped = new Promise<void>((resolve) => {
+      recorder.onstop = () => resolve();
+    });
+
+    // Seek to the start of the selection before recording.
+    video.currentTime = startSec;
+    await new Promise<void>((resolve) => {
+      video.onseeked = () => resolve();
+    });
+
+    recorder.start(100);
+    await video.play();
+
+    await new Promise<void>((resolve) => {
+      const tick = () => {
+        const t = video.currentTime;
+        onProgress?.(Math.max(0, Math.min(1, (t - startSec) / Math.max(0.001, endSec - startSec))));
+        if (t >= endSec || video.ended) {
+          resolve();
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      tick();
+    });
+
+    video.pause();
+    recorder.stop();
+    await stopped;
+    return new Blob(chunks, { type: mimeType.split(';')[0] || 'video/webm' });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** Trigger a browser download of a blob under the given filename. */
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function formatDur(secs: number): string {
@@ -139,6 +272,9 @@ export function EditorApp() {
   const [uploadPercent, setUploadPercent] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  // Progress phase label shown next to the % while saving (trim → upload).
+  const [saveStage, setSaveStage] = useState<'idle' | 'trimming' | 'uploading'>('idle');
+  const [isDownloading, setIsDownloading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<LogTab>('console');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -229,7 +365,7 @@ export function EditorApp() {
     if (!recordingId || recordingId === 'unknown') return;
     let objectUrl: string | null = null;
     const tryLoad = async () => {
-      const blob = await loadBlobFromIDB(recordingId);
+      const blob = await loadRecordingBlob(recordingId);
       if (blob) {
         objectUrl = URL.createObjectURL(blob);
         setVideoUrl(objectUrl);
@@ -264,6 +400,100 @@ export function EditorApp() {
 
   const handleOpenSignIn = () => chrome.runtime.sendMessage({ type: 'OPEN_POPUP' });
 
+  // Re-fetch the user's assigned projects from the API (called when the project
+  // dropdown opens) so newly-granted projects show up without signing in again.
+  // Result is cached back onto the stored user for instant population next time.
+  const refreshProjects = useCallback(async () => {
+    try {
+      const r = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
+      const token = (r[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)?.accessToken;
+      if (!token) return;
+      const res = await fetch(`${API_BASE}/users`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      });
+      if (!res.ok) return;
+      const raw = (await res.json()) as
+        | { assignedProjects?: Record<string, AssignedProjectInfo> }
+        | Array<{ assignedProjects?: Record<string, AssignedProjectInfo> }>;
+      const projects = Array.isArray(raw) ? raw[0]?.assignedProjects : raw?.assignedProjects;
+      if (projects && Object.keys(projects).length > 0) {
+        setAssignedProjects(projects);
+        const stored = await chrome.storage.local.get([AUTH_USER_KEY]);
+        const user = (stored[AUTH_USER_KEY] as Record<string, unknown> | undefined) ?? {};
+        await chrome.storage.local.set({
+          [AUTH_USER_KEY]: { ...user, assignedProjects: projects },
+        });
+      }
+    } catch {
+      /* network unavailable — keep whatever projects we already have */
+    }
+  }, []);
+
+  // Upload just the video file (the big, slow part) and return the MinIO
+  // filename the server assigns. Retried with backoff; a 4xx fails fast.
+  const uploadVideoFile = useCallback(
+    (project: string, token: string, blob: Blob, onPct: (p: number) => void): Promise<string> =>
+      retryWithBackoff(
+        () =>
+          new Promise<string>((resolve, reject) => {
+            const videoFile = new File([blob], `recording-${Date.now()}.webm`, {
+              type: (blob.type || 'video/webm').split(';')[0],
+            });
+            const formData = new FormData();
+            formData.append('file', videoFile);
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${API_BASE}/v1/${project}/files/upload`);
+            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+            xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
+            xhr.timeout = 30 * 60 * 1000; // 30 min ceiling for very large uploads
+            const startedAt = performance.now();
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) onPct(Math.round((e.loaded / e.total) * 100));
+            };
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
+                console.info(`[Editor] Video uploaded (${blob.size} bytes) in ${secs}s`);
+                resolve(xhr.responseText.trim());
+              } else {
+                const err = new Error(
+                  xhr.status === 413
+                    ? 'Video is too large for the server to accept in one upload.'
+                    : `Video upload failed (${xhr.status})`,
+                ) as Error & { noRetry?: boolean };
+                if (xhr.status >= 400 && xhr.status < 500) err.noRetry = true;
+                reject(err);
+              }
+            };
+            xhr.onerror = () => {
+              // Surfaced so we can tell a real slow transfer apart from repeated
+              // reconnect attempts (the latter points at a server/proxy reset).
+              console.warn('[Editor] Video upload network error — will retry');
+              reject(new Error('Network error during video upload'));
+            };
+            xhr.ontimeout = () => reject(new Error('Video upload timed out'));
+            xhr.send(formData);
+          }),
+        3,
+      ),
+    [],
+  );
+
+  // Load the recording and apply the current trim selection. Returns the raw blob
+  // unchanged when the whole clip is selected (skips the costly re-encode). Shared
+  // by Save (upload) and Download (local) so the trim always applies to both.
+  const getExportBlob = useCallback(
+    async (onTrimProgress?: (f: number) => void): Promise<Blob> => {
+      const blob = await loadRecordingBlob(recordingId);
+      if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
+      const dur = videoDuration || data?.duration || 0;
+      const isFullClip = trimStart <= 0.005 && trimEnd >= 0.995;
+      if (isFullClip || dur <= 0) return blob;
+      return trimVideoBlob(blob, trimStart * dur, trimEnd * dur, onTrimProgress);
+    },
+    [recordingId, videoDuration, data, trimStart, trimEnd],
+  );
+
   const handleSave = useCallback(async () => {
     if (!data || !recordingId || isSaving || shareUrl) return;
 
@@ -286,7 +516,10 @@ export function EditorApp() {
         return;
       }
 
-      const blob = await loadBlobFromIDB(recordingId);
+      // Build the export blob — applies the trim selection when the user picked a
+      // sub-range (trim progress drives 0–15% of the bar).
+      setSaveStage('trimming');
+      const blob = await getExportBlob((f) => setUploadPercent(Math.round(f * 15)));
       if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
 
       const mime = blob.type || 'video/webm';
@@ -299,25 +532,12 @@ export function EditorApp() {
       const project = selectedProjectName;
       const projectId = assignedProjects?.[project]?.projectId ?? null;
 
-      // Step 2: upload video file → get MinIO filename
-      const videoFileName = await new Promise<string>((resolve, reject) => {
-        const videoFile = new File([blob], `recording-${ts}.webm`, { type: mimeBase });
-        const formData = new FormData();
-        formData.append('file', videoFile);
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', `${API_BASE}/v1/${project}/files/upload`);
-        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-        xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) setUploadPercent(Math.round((e.loaded / e.total) * 80));
-        };
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText.trim());
-          else reject(new Error(`Video upload failed (${xhr.status})`));
-        };
-        xhr.onerror = () => reject(new Error('Network error during video upload'));
-        xhr.send(formData);
-      });
+      // Step 2: upload the video → MinIO filename (drives 15–80% of the bar).
+      setSaveStage('uploading');
+      const videoFileName = await uploadVideoFile(project, token, blob, (p) =>
+        setUploadPercent(15 + Math.round(p * 0.65)),
+      );
+      setUploadPercent(80);
 
       // Step 3: upload HAR (network logs) → get MinIO filename
       setUploadPercent(82);
@@ -417,7 +637,7 @@ export function EditorApp() {
           viewCount: 0,
           url: videoUrl,
           thumbnailUrl: data.thumbnailDataUrl ?? null,
-          duration: Math.round(data.duration ?? 0),
+          duration: Math.round((trimEnd - trimStart) * (videoDuration || data.duration || 0)),
           networkLogs: harFileName || null,
           consoleLogs: logsFileName || null,
           metadata: JSON.stringify({
@@ -448,12 +668,49 @@ export function EditorApp() {
       await chrome.storage.local.set({
         [PENDING_SHARE_KEY]: { shareUrl: newShareUrl, recordingId: backendId },
       });
+      // Uploaded successfully — reclaim the local disk copy (OPFS/IDB).
+      void deleteRecordingBlob(recordingId);
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setIsSaving(false);
+      setSaveStage('idle');
     }
-  }, [data, recordingId, title, isSaving, shareUrl, selectedProjectName, assignedProjects]);
+  }, [
+    data,
+    recordingId,
+    title,
+    isSaving,
+    shareUrl,
+    selectedProjectName,
+    assignedProjects,
+    getExportBlob,
+    uploadVideoFile,
+    trimStart,
+    trimEnd,
+    videoDuration,
+  ]);
+
+  // Download the recording locally (applies the trim) without uploading — for
+  // users who just want the file. Works whether or not they're signed in.
+  const handleDownload = useCallback(async () => {
+    if (!recordingId || isDownloading || isSaving) return;
+    setIsDownloading(true);
+    setUploadError(null);
+    try {
+      const blob = await getExportBlob();
+      const safeTitle = (title || data?.title || 'recording')
+        .replace(/[^a-z0-9-_ ]/gi, '')
+        .trim()
+        .replace(/\s+/g, '-')
+        .slice(0, 60);
+      downloadBlob(blob, `${safeTitle || 'recording'}.webm`);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Download failed');
+    } finally {
+      setIsDownloading(false);
+    }
+  }, [recordingId, isDownloading, isSaving, getExportBlob, title, data]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -568,6 +825,7 @@ export function EditorApp() {
           projects={assignedProjects}
           selected={selectedProjectName}
           onSelect={setSelectedProjectName}
+          onOpen={refreshProjects}
           disabled={!!shareUrl || isSaving}
         />
 
@@ -1135,7 +1393,7 @@ export function EditorApp() {
                 style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}
               >
                 <span style={{ fontSize: '11px', color: 'rgba(148,163,184,0.7)', fontWeight: 600 }}>
-                  UPLOADING
+                  {saveStage === 'trimming' ? 'TRIMMING' : 'UPLOADING'}
                 </span>
                 <span style={{ fontSize: '11px', color: '#8b5cf6', fontWeight: 700 }}>
                   {uploadPercent}%
@@ -1180,125 +1438,177 @@ export function EditorApp() {
             </div>
           )}
 
-          {/* Action button: Save → Uploading → Copy Link */}
-          <div style={{ padding: '12px 16px', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
-            {shareUrl ? (
-              /* ── Upload done: copy link ── */
-              <motion.button
-                whileTap={{ scale: 0.97 }}
-                onClick={() => void handleCopyLink()}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  borderRadius: '12px',
-                  background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
-                  border: 'none',
-                  color: 'white',
-                  fontSize: '14px',
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '8px',
-                  boxShadow: '0 4px 20px rgba(139,92,246,0.3)',
-                  transition: 'all 0.2s',
-                  fontFamily: 'inherit',
-                }}
-              >
-                {copied ? <Check size={16} /> : <Copy size={16} />}
-                {copied ? 'Copied!' : 'Copy Link'}
-              </motion.button>
-            ) : isSaving ? (
-              /* ── Uploading in progress ── */
-              <div
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  borderRadius: '12px',
-                  background: 'rgba(139,92,246,0.15)',
-                  border: '1px solid rgba(139,92,246,0.3)',
-                  color: 'rgba(139,92,246,0.6)',
-                  fontSize: '14px',
-                  fontWeight: 700,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '8px',
-                }}
-              >
-                <motion.div
+          {/* Action buttons: primary (Save / Uploading / Copy Link / Sign in) + Download */}
+          <div
+            style={{
+              padding: '12px 16px',
+              borderTop: '1px solid rgba(255,255,255,0.06)',
+              display: 'flex',
+              gap: '8px',
+            }}
+          >
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {shareUrl ? (
+                /* ── Upload done: copy link ── */
+                <motion.button
+                  whileTap={{ scale: 0.97 }}
+                  onClick={() => void handleCopyLink()}
                   style={{
-                    width: '14px',
-                    height: '14px',
-                    borderRadius: '50%',
-                    border: '2px solid rgba(139,92,246,0.4)',
-                    borderTopColor: '#8b5cf6',
+                    width: '100%',
+                    padding: '12px',
+                    borderRadius: '12px',
+                    background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
+                    border: 'none',
+                    color: 'white',
+                    fontSize: '14px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                    boxShadow: '0 4px 20px rgba(139,92,246,0.3)',
+                    transition: 'all 0.2s',
+                    fontFamily: 'inherit',
                   }}
-                  animate={{ rotate: 360 }}
-                  transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
-                />
-                Uploading {uploadPercent}%…
-              </div>
-            ) : isAuthenticated ? (
-              /* ── Ready to save ── */
+                >
+                  {copied ? <Check size={16} /> : <Copy size={16} />}
+                  {copied ? 'Copied!' : 'Copy Link'}
+                </motion.button>
+              ) : isSaving ? (
+                /* ── Saving in progress ── */
+                <div
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    borderRadius: '12px',
+                    background: 'rgba(139,92,246,0.15)',
+                    border: '1px solid rgba(139,92,246,0.3)',
+                    color: 'rgba(139,92,246,0.6)',
+                    fontSize: '14px',
+                    fontWeight: 700,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                  }}
+                >
+                  <motion.div
+                    style={{
+                      width: '14px',
+                      height: '14px',
+                      borderRadius: '50%',
+                      border: '2px solid rgba(139,92,246,0.4)',
+                      borderTopColor: '#8b5cf6',
+                    }}
+                    animate={{ rotate: 360 }}
+                    transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
+                  />
+                  {saveStage === 'trimming' ? 'Trimming' : 'Uploading'} {uploadPercent}%…
+                </div>
+              ) : isAuthenticated ? (
+                /* ── Ready to save ── */
+                <motion.button
+                  whileTap={{ scale: 0.97 }}
+                  onClick={() => void handleSave()}
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    borderRadius: '12px',
+                    background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
+                    border: 'none',
+                    color: 'white',
+                    fontSize: '14px',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                    boxShadow: '0 4px 20px rgba(139,92,246,0.3)',
+                    transition: 'all 0.2s',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  <svg
+                    width="15"
+                    height="15"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                  >
+                    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+                    <polyline points="17 21 17 13 7 13 7 21" />
+                    <polyline points="7 3 7 8 15 8" />
+                  </svg>
+                  Save Recording
+                </motion.button>
+              ) : (
+                /* ── Not signed in ── */
+                <div
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    borderRadius: '12px',
+                    background: 'rgba(139,92,246,0.08)',
+                    border: '1px solid rgba(139,92,246,0.2)',
+                    color: 'rgba(139,92,246,0.4)',
+                    fontSize: '14px',
+                    fontWeight: 700,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '8px',
+                    cursor: 'not-allowed',
+                  }}
+                >
+                  <Lock size={14} /> Sign in to Save
+                </div>
+              )}
+            </div>
+
+            {/* Download locally — available whenever the video is loaded (no upload,
+                no sign-in required). Applies the trim like Save does. */}
+            {videoUrl && (
               <motion.button
-                whileTap={{ scale: 0.97 }}
-                onClick={() => void handleSave()}
+                whileTap={{ scale: 0.96 }}
+                onClick={() => void handleDownload()}
+                disabled={isSaving || isDownloading}
+                title="Download recording to this computer"
                 style={{
-                  width: '100%',
-                  padding: '12px',
+                  flexShrink: 0,
+                  padding: '12px 14px',
                   borderRadius: '12px',
-                  background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
-                  border: 'none',
+                  background: '#14141c',
+                  border: '1px solid rgba(255,255,255,0.12)',
                   color: 'white',
                   fontSize: '14px',
                   fontWeight: 700,
-                  cursor: 'pointer',
+                  cursor: isSaving || isDownloading ? 'not-allowed' : 'pointer',
+                  opacity: isSaving || isDownloading ? 0.5 : 1,
                   display: 'flex',
                   alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '8px',
-                  boxShadow: '0 4px 20px rgba(139,92,246,0.3)',
-                  transition: 'all 0.2s',
+                  gap: '7px',
                   fontFamily: 'inherit',
                 }}
               >
-                <svg
-                  width="15"
-                  height="15"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.5"
-                >
-                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
-                  <polyline points="17 21 17 13 7 13 7 21" />
-                  <polyline points="7 3 7 8 15 8" />
-                </svg>
-                Save Recording
+                {isDownloading ? (
+                  <motion.div
+                    style={{
+                      width: '14px',
+                      height: '14px',
+                      borderRadius: '50%',
+                      border: '2px solid rgba(255,255,255,0.3)',
+                      borderTopColor: 'white',
+                    }}
+                    animate={{ rotate: 360 }}
+                    transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
+                  />
+                ) : (
+                  <Download size={16} />
+                )}
               </motion.button>
-            ) : (
-              /* ── Not signed in ── */
-              <div
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  borderRadius: '12px',
-                  background: 'rgba(139,92,246,0.08)',
-                  border: '1px solid rgba(139,92,246,0.2)',
-                  color: 'rgba(139,92,246,0.4)',
-                  fontSize: '14px',
-                  fontWeight: 700,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: '8px',
-                  cursor: 'not-allowed',
-                }}
-              >
-                <Lock size={14} /> Sign in to Save
-              </div>
             )}
           </div>
         </div>
@@ -1673,17 +1983,28 @@ function ProjectSelector({
   projects,
   selected,
   onSelect,
+  onOpen,
   disabled,
 }: {
   projects: Record<string, AssignedProjectInfo> | null;
   selected: string | null;
   onSelect: (name: string) => void;
+  onOpen?: () => void;
   disabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const entries = projects ? Object.entries(projects) : [];
   const hasProjects = entries.length > 0;
+
+  // Refresh the project list from the API each time the dropdown opens.
+  const toggleOpen = () => {
+    setOpen((v) => {
+      const next = !v;
+      if (next) onOpen?.();
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -1700,8 +2021,8 @@ function ProjectSelector({
     <div ref={ref} style={{ position: 'relative', minWidth: '260px' }}>
       <button
         type="button"
-        disabled={disabled || !hasProjects}
-        onClick={() => setOpen((v) => !v)}
+        disabled={disabled}
+        onClick={toggleOpen}
         style={{
           width: '100%',
           display: 'flex',
@@ -1714,8 +2035,8 @@ function ProjectSelector({
           color: selected ? 'white' : 'rgba(148,163,184,0.7)',
           fontSize: '13px',
           fontWeight: 600,
-          cursor: disabled || !hasProjects ? 'not-allowed' : 'pointer',
-          opacity: disabled || !hasProjects ? 0.6 : 1,
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          opacity: disabled ? 0.6 : 1,
           fontFamily: 'inherit',
           transition: 'border-color 0.15s',
         }}
@@ -1765,7 +2086,7 @@ function ProjectSelector({
       )}
 
       <AnimatePresence>
-        {open && hasProjects && (
+        {open && (
           <motion.div
             initial={{ opacity: 0, y: -6 }}
             animate={{ opacity: 1, y: 0 }}
@@ -1786,6 +2107,18 @@ function ProjectSelector({
               padding: '6px',
             }}
           >
+            {!hasProjects && (
+              <div
+                style={{
+                  padding: '12px 10px',
+                  fontSize: '12px',
+                  color: 'rgba(148,163,184,0.6)',
+                  textAlign: 'center',
+                }}
+              >
+                No projects available
+              </div>
+            )}
             {entries.map(([name, info]) => {
               const isSel = name === selected;
               return (

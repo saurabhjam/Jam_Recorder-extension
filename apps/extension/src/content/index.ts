@@ -576,7 +576,14 @@ void (async function autoRestoreToolbar() {
     const response = await chrome.runtime.sendMessage({
       type: 'GET_STATE',
     } satisfies ExtensionMessage);
-    if (response?.isRecording && response?.recordingId && !toolbarContainer) {
+    // showToolbar is false for tabs that aren't being recorded (a tab recording
+    // only shows the toolbar on its own tab) — so we don't self-mount there.
+    if (
+      response?.isRecording &&
+      response?.showToolbar &&
+      response?.recordingId &&
+      !toolbarContainer
+    ) {
       mountToolbar(response.recordingId as string);
       startCapture();
     }

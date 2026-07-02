@@ -69,7 +69,8 @@ export type RecordingStatus =
   | 'done'
   | 'error';
 
-export type RecordingQuality = 'low' | 'medium' | 'high' | '4k';
+/** Recording resolution. Capped at 1080p; 720p is the size-optimized default. */
+export type RecordingQuality = '480p' | '720p' | '1080p';
 
 export interface RecordingOptions {
   type: RecordingType;
@@ -77,6 +78,8 @@ export interface RecordingOptions {
   micEnabled: boolean;
   webcamOverlay: boolean;
   systemAudio: boolean;
+  /** Capture console + network logs (DevTools) alongside the video. */
+  captureDevtools?: boolean;
   tabId?: number;
 }
 
@@ -151,6 +154,7 @@ export type MessageType =
   | 'UPLOAD_COMPLETE'
   | 'SHOW_TOOLBAR'
   | 'HIDE_TOOLBAR'
+  | 'ENSURE_TOOLBAR'
   | 'UPDATE_TIMER'
   | 'GET_STATE'
   | 'STATE_RESPONSE'
@@ -241,6 +245,8 @@ export interface ExtensionSettings {
   webcamPosition: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left';
   recordingQuality: RecordingQuality;
   systemAudio: boolean;
+  /** Capture console + network logs (DevTools) alongside recordings. */
+  captureDevtools: boolean;
   countdownEnabled: boolean;
   countdownSeconds: number;
   autoOpenShare: boolean;
@@ -256,8 +262,11 @@ export const DEFAULT_SETTINGS: ExtensionSettings = {
   micEnabled: true,
   webcamOverlay: false,
   webcamPosition: 'bottom-right',
-  recordingQuality: 'high',
+  // 720p @ 10fps (~146 MB/hr) — the size-optimized default; users can drop to
+  // 480p for smaller files or raise to 1080p for max clarity.
+  recordingQuality: '720p',
   systemAudio: false,
+  captureDevtools: true,
   countdownEnabled: false,
   countdownSeconds: 3,
   autoOpenShare: true,
@@ -336,10 +345,21 @@ export const AUTH_REFRESH_ALARM = 'st_token_refresh';
 
 export const QUALITY_PRESETS: Record<
   RecordingQuality,
-  { width: number; height: number; frameRate: number; videoBitrate: number }
+  { width: number; height: number; frameRate: number; videoBitrate: number; audioBitrate: number }
 > = {
-  low: { width: 1280, height: 720, frameRate: 24, videoBitrate: 1_000_000 },
-  medium: { width: 1920, height: 1080, frameRate: 30, videoBitrate: 2_500_000 },
-  high: { width: 1920, height: 1080, frameRate: 60, videoBitrate: 5_000_000 },
-  '4k': { width: 3840, height: 2160, frameRate: 30, videoBitrate: 15_000_000 },
+  // Tuned for long-duration SCREEN recordings (meetings, dashboards, code), which
+  // are mostly static — a low frame rate keeps on-screen text crisp at a fraction
+  // of the bitrate, so multi-hour captures stay small enough to upload reliably.
+  // Resolution is the user-facing knob (see the popup dropdown); each tier also
+  // dials frame rate + bitrate so lower resolutions shrink the file further.
+  // Approx output size per hour (video + audio, VP9):
+  '480p': { width: 854, height: 480, frameRate: 10, videoBitrate: 150_000, audioBitrate: 24_000 }, // ~78 MB/hr — smallest
+  '720p': { width: 1280, height: 720, frameRate: 10, videoBitrate: 300_000, audioBitrate: 24_000 }, // ~146 MB/hr — recommended (default)
+  '1080p': {
+    width: 1920,
+    height: 1080,
+    frameRate: 12,
+    videoBitrate: 600_000,
+    audioBitrate: 24_000,
+  }, // ~281 MB/hr — best clarity
 };

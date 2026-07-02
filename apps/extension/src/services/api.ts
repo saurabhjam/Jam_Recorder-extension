@@ -114,6 +114,35 @@ function getJwtExpiry(token: string): number | null {
   }
 }
 
+/**
+ * Fetch the logged-in user's profile photo and return it as a self-contained
+ * data URL (safe to store and use as an <img> src). The endpoint returns raw
+ * image bytes, not JSON, so we read it as an ArrayBuffer and base64-encode it.
+ * Returns null when the user has no photo or the request fails — callers then
+ * fall back to initials. The token is passed explicitly because during login it
+ * isn't in storage yet (so the axios interceptor can't attach it).
+ */
+async function fetchUserPhoto(accessToken: string): Promise<string | null> {
+  try {
+    const res = await axios.get<ArrayBuffer>(`${REPORTS_API_URL}/v1/data/photo`, {
+      params: { loadThumbnail: true, at: Date.now() },
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'image/*' },
+      responseType: 'arraybuffer',
+    });
+    const bytes = new Uint8Array(res.data);
+    if (bytes.byteLength === 0) return null;
+    const contentType = (res.headers['content-type'] as string | undefined) || 'image/jpeg';
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return `data:${contentType};base64,${btoa(binary)}`;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchRpUser(accessToken: string): Promise<User> {
   const res = await axios.get<RpUserResponse>(`${REPORTS_API_URL}/users`, {
     headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
@@ -124,7 +153,7 @@ async function fetchRpUser(accessToken: string): Promise<User> {
     login: r.userId,
     email: r.email,
     name: r.fullName ?? r.userId,
-    avatar: r.photoId ?? null,
+    avatar: await fetchUserPhoto(accessToken),
     role: r.userRole,
     isActive: r.active,
     assignedProjects: r.assignedProjects,
@@ -294,12 +323,14 @@ export const authApi = {
   getMe: async (): Promise<User> => {
     const res = await apiClient.get<RpUserResponse>('/users');
     const r = res.data;
+    const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
+    const accessToken = (stored[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined)?.accessToken;
     return {
       id: String(r.id),
       login: r.userId,
       email: r.email,
       name: r.fullName ?? r.userId,
-      avatar: r.photoId ?? null,
+      avatar: accessToken ? await fetchUserPhoto(accessToken) : null,
       role: r.userRole,
       isActive: r.active,
       assignedProjects: r.assignedProjects,
