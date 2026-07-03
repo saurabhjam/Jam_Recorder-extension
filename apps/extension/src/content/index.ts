@@ -367,6 +367,73 @@ function handlePageMessage(e: MessageEvent): void {
   }
 }
 
+// ─── Pre-recording Countdown ───────────────────────────────────────────────────
+
+/** Show a full-screen 3…2…1 countdown overlay that removes itself at 0. Used
+ *  before a recording starts when the user enabled "Show countdown". */
+function showCountdown(seconds: number): void {
+  document.getElementById('bestq-countdown')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'bestq-countdown';
+  overlay.setAttribute('data-bestq', 'true');
+  overlay.style.cssText = [
+    'position: fixed',
+    'inset: 0',
+    'z-index: 2147483647',
+    'display: flex',
+    'align-items: center',
+    'justify-content: center',
+    'background: rgba(0,0,0,0.45)',
+    'backdrop-filter: blur(2px)',
+    '-webkit-backdrop-filter: blur(2px)',
+    'pointer-events: none',
+  ].join('; ');
+
+  const circle = document.createElement('div');
+  circle.style.cssText = [
+    'width: 150px',
+    'height: 150px',
+    'border-radius: 50%',
+    'display: flex',
+    'align-items: center',
+    'justify-content: center',
+    'background: rgba(9,9,13,0.92)',
+    'border: 3px solid rgba(139,92,246,0.7)',
+    'box-shadow: 0 0 60px rgba(139,92,246,0.5)',
+    "font-family: 'Inter', -apple-system, sans-serif",
+    'font-size: 80px',
+    'font-weight: 800',
+    'color: white',
+    'line-height: 1',
+  ].join('; ');
+  overlay.appendChild(circle);
+  document.body.appendChild(overlay);
+
+  let n = Math.max(1, Math.floor(seconds));
+  const render = () => {
+    circle.textContent = String(n);
+    circle.animate(
+      [
+        { transform: 'scale(0.6)', opacity: 0 },
+        { transform: 'scale(1)', opacity: 1 },
+      ],
+      { duration: 260, easing: 'ease-out' },
+    );
+  };
+  render();
+
+  const timer = window.setInterval(() => {
+    n -= 1;
+    if (n <= 0) {
+      window.clearInterval(timer);
+      overlay.remove();
+      return;
+    }
+    render();
+  }, 1000);
+}
+
 // ─── Message Listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
@@ -386,6 +453,13 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     case 'HIDE_TOOLBAR': {
       stopCapture();
       unmountToolbar();
+      sendResponse({ success: true });
+      break;
+    }
+
+    case 'SHOW_COUNTDOWN': {
+      const payload = message.payload as { seconds?: number } | undefined;
+      showCountdown(payload?.seconds ?? 3);
       sendResponse({ success: true });
       break;
     }

@@ -155,6 +155,7 @@ export type MessageType =
   | 'SHOW_TOOLBAR'
   | 'HIDE_TOOLBAR'
   | 'ENSURE_TOOLBAR'
+  | 'SHOW_COUNTDOWN'
   | 'UPDATE_TIMER'
   | 'GET_STATE'
   | 'STATE_RESPONSE'

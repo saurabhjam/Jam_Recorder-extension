@@ -51,6 +51,26 @@ function saveBlobToIDB(id: string, blob: Blob): Promise<void> {
   });
 }
 
+/** Show the on-page 3…2…1 countdown on a tab and wait for it to finish before
+ *  the recording starts. Injects the content script if it isn't already there;
+ *  silently skips (no wait) if the page can't host it. */
+async function runCountdownOnTab(tabId: number, seconds: number): Promise<void> {
+  const send = () =>
+    chrome.tabs.sendMessage(tabId, { type: 'SHOW_COUNTDOWN', payload: { seconds } });
+  try {
+    await send();
+  } catch {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['src/content/index.js'] });
+      await new Promise((r) => setTimeout(r, 100));
+      await send();
+    } catch {
+      return; // couldn't show the countdown — start immediately
+    }
+  }
+  await new Promise((r) => setTimeout(r, seconds * 1000));
+}
+
 type View =
   | 'home'
   | 'library'
@@ -203,6 +223,11 @@ export function HomeView({ onNavigate }: HomeViewProps) {
       // audio for screen/window). The service worker can't resolve it reliably
       // (currentWindow:true has no window context there).
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+      // Optional pre-recording countdown (3…2…1) shown on the page.
+      if (settings.countdownEnabled && activeTab?.id && !isRestrictedPage) {
+        await runCountdownOnTab(activeTab.id, settings.countdownSeconds || 3);
+      }
 
       await startRecording({
         type: selectedRecordType,
