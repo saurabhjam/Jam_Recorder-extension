@@ -335,17 +335,19 @@ export function HomeView({ onNavigate }: HomeViewProps) {
       )}
 
       {/* ─── Scrollable Body ─── */}
+      {/* A single panel keyed by activeTab (remounts + fades on switch). Using two
+          keyed siblings inside AnimatePresence mode="wait" could deadlock — a state
+          change mid-exit left the incoming panel stuck/blank. */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden scrollbar-none">
-        <AnimatePresence mode="wait">
+        <motion.div
+          key={activeTab}
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.18 }}
+          className="px-4 pb-4 flex flex-col gap-4"
+        >
           {activeTab === 'record' ? (
-            <motion.div
-              key="record"
-              initial={{ opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.18 }}
-              className="px-4 pb-4 flex flex-col gap-4"
-            >
+            <>
               {/* Title */}
               <div className="pt-1">
                 <h2 className="text-base font-bold text-white leading-tight">Record something</h2>
@@ -465,16 +467,9 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                 )}
                 <span>{isPreparingUpload ? 'Opening editor…' : 'Upload a video'}</span>
               </motion.button>
-            </motion.div>
+            </>
           ) : (
-            <motion.div
-              key="screenshot"
-              initial={{ opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.18 }}
-              className="px-4 pb-4 flex flex-col gap-4"
-            >
+            <>
               {/* Title */}
               <div className="pt-1">
                 <h2 className="text-base font-bold text-white leading-tight">Take a screenshot</h2>
@@ -512,9 +507,9 @@ export function HomeView({ onNavigate }: HomeViewProps) {
                   <span>Take Screenshot</span>
                 </span>
               </motion.button>
-            </motion.div>
+            </>
           )}
-        </AnimatePresence>
+        </motion.div>
       </div>
 
       {/* ─── User Footer ─── */}
