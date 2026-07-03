@@ -92,15 +92,49 @@ function findScrollTarget(): HTMLElement | null {
 // ─── Toolbar Management ───────────────────────────────────────────────────────
 
 function mountToolbar(recordingId: string): void {
-  if (toolbarContainer) return; // Already mounted
+  // Already mounted AND still attached to the live DOM — just keep the id fresh.
+  if (toolbarContainer && toolbarContainer.isConnected) {
+    toolbarContainer.dataset['recordingId'] = recordingId;
+    if (!isToolbarVisible) {
+      isToolbarVisible = true;
+      renderToolbar(recordingId);
+    }
+    return;
+  }
 
-  toolbarContainer = document.createElement('div');
-  toolbarContainer.id = 'jam-toolbar-root';
-  toolbarContainer.setAttribute('data-jam', 'true');
+  // A previous mount left a dangling/detached container (e.g. mountToolbar ran at
+  // document_start before <body> existed and threw, or the page removed it). Tear
+  // it down so the `isConnected` guard above never traps us into never re-mounting.
+  if (toolbarContainer) {
+    try {
+      toolbarRoot?.unmount();
+    } catch {
+      /* ignore */
+    }
+    toolbarRoot = null;
+    toolbarContainer = null;
+    isToolbarVisible = false;
+  }
+
+  // The content script runs at document_start, so <body> may not exist yet when we
+  // try to restore. Defer until the DOM is ready rather than throwing.
+  if (!document.body) {
+    document.addEventListener('DOMContentLoaded', () => mountToolbar(recordingId), { once: true });
+    return;
+  }
+
+  // Build fully before touching the module-level ref, so a failure can't leave a
+  // non-null-but-unmounted container behind (that was the "toolbar never comes
+  // back after refresh" bug).
+  const container = document.createElement('div');
+  container.id = 'jam-toolbar-root';
+  container.setAttribute('data-jam', 'true');
+  container.dataset['recordingId'] = recordingId;
 
   // Prevent site CSS from affecting our toolbar
-  const shadow = toolbarContainer.attachShadow?.({ mode: 'open' });
+  const shadow = container.attachShadow?.({ mode: 'open' });
 
+  let root: Root;
   if (shadow) {
     // Inject styles into shadow DOM
     const style = document.createElement('style');
@@ -111,13 +145,15 @@ function mountToolbar(recordingId: string): void {
     inner.id = 'jam-toolbar-inner';
     shadow.appendChild(inner);
 
-    document.body.appendChild(toolbarContainer);
-    toolbarRoot = createRoot(inner);
+    document.body.appendChild(container);
+    root = createRoot(inner);
   } else {
-    document.body.appendChild(toolbarContainer);
-    toolbarRoot = createRoot(toolbarContainer);
+    document.body.appendChild(container);
+    root = createRoot(container);
   }
 
+  toolbarContainer = container;
+  toolbarRoot = root;
   isToolbarVisible = true;
   renderToolbar(recordingId);
 }
@@ -572,22 +608,27 @@ function getToolbarStyles(): string {
 // The mountToolbar guard (if toolbarContainer) prevents duplicates.
 
 void (async function autoRestoreToolbar() {
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: 'GET_STATE',
-    } satisfies ExtensionMessage);
-    // showToolbar is false for tabs that aren't being recorded (a tab recording
-    // only shows the toolbar on its own tab) — so we don't self-mount there.
-    if (
-      response?.isRecording &&
-      response?.showToolbar &&
-      response?.recordingId &&
-      !toolbarContainer
-    ) {
-      mountToolbar(response.recordingId as string);
-      startCapture();
+  // Retry a few times: on a page refresh the service worker may still be cold, so
+  // the first GET_STATE can fail or race the SW's own state restore. The toolbar
+  // reappearing is major, so we don't rely on a single attempt (the background
+  // navigation listener is a further backup on top of this).
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: 'GET_STATE',
+      } satisfies ExtensionMessage);
+      if (!response?.isRecording) return; // definitively not recording — stop trying
+      // showToolbar is false for tabs that aren't being recorded (a tab recording
+      // only shows the toolbar on its own tab) — so we don't self-mount there.
+      if (response?.showToolbar && response?.recordingId) {
+        mountToolbar(response.recordingId as string);
+        startCapture();
+        return;
+      }
+      return; // recording, but this tab shouldn't show the toolbar
+    } catch {
+      // SW not ready yet — wait and retry; background nav listener also covers us.
+      await new Promise((r) => setTimeout(r, 250));
     }
-  } catch {
-    // SW not ready — background navigation listener will inject instead
   }
 })();

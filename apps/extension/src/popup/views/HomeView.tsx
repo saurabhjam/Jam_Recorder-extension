@@ -178,9 +178,19 @@ export function HomeView({ onNavigate }: HomeViewProps) {
       // permission prompt, so if mic is on but not yet granted, send the user
       // to the permission tab and abort this start — they grant once, then
       // start again with the mic working.
-      if (settings.micEnabled) {
+      //
+      // IMPORTANT: `navigator.permissions.query` is unreliable in the action
+      // popup — it can keep reporting 'prompt' even after the user has granted
+      // mic access on the permission page, which trapped users in an endless
+      // loop back to that page. So we treat a previously recorded grant
+      // (settings.micPermissionGranted, written by the permission page when its
+      // getUserMedia actually succeeds) as authoritative. Only redirect when we
+      // have neither a live 'granted' state nor a stored grant. The offscreen
+      // recorder already falls back to no-mic if access is somehow missing, so
+      // this can never block a recording.
+      if (settings.micEnabled && !settings.micPermissionGranted) {
         const state = await getMicPermissionState();
-        if (state === 'prompt' || state === 'denied') {
+        if (state !== 'granted') {
           await openMicPermissionPage();
           setIsStarting(false);
           return;
@@ -697,34 +707,74 @@ interface ScreenshotCardProps {
 function ScreenshotCard({ icon, title, description, selected, onClick }: ScreenshotCardProps) {
   return (
     <motion.button
-      whileTap={{ scale: 0.96 }}
+      type="button"
+      aria-pressed={selected}
+      whileTap={{ scale: 0.95 }}
+      whileHover={{ y: -2 }}
       onClick={onClick}
       className={cn(
-        'flex flex-col items-center gap-2 px-2 py-3.5 rounded-2xl border text-center transition-all duration-200',
+        'group relative flex flex-col items-center gap-2 px-2 py-3.5 rounded-2xl border text-center overflow-hidden transition-colors duration-200',
         selected
-          ? 'bg-jam-500/12 border-jam-500/40'
-          : 'bg-dark-900/70 border-white/8 hover:bg-dark-800/80 hover:border-white/14',
+          ? 'border-jam-400/70 shadow-[0_0_0_1px_rgba(124,58,237,0.45),0_10px_28px_-8px_rgba(124,58,237,0.65)]'
+          : 'border-white/8 bg-dark-900/70 hover:bg-dark-800/80 hover:border-white/16',
       )}
     >
-      <div
+      {/* Sliding highlight — a single shared element that glides to whichever
+          card is selected (framer "magic move"), so the active choice is
+          unmistakable and the transition feels alive. */}
+      {selected && (
+        <motion.span
+          layoutId="screenshot-card-highlight"
+          transition={{ type: 'spring', stiffness: 500, damping: 34 }}
+          className="absolute inset-0 rounded-2xl bg-gradient-to-b from-jam-500/30 to-violet-500/10"
+        />
+      )}
+
+      {/* Check badge confirming the selection */}
+      <AnimatePresence>
+        {selected && (
+          <motion.span
+            initial={{ scale: 0, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0, opacity: 0 }}
+            transition={{ type: 'spring', stiffness: 600, damping: 22 }}
+            className="absolute top-1.5 right-1.5 z-10 w-4 h-4 rounded-full bg-jam-500 flex items-center justify-center shadow-md"
+          >
+            <Check size={10} strokeWidth={3.5} className="text-white" />
+          </motion.span>
+        )}
+      </AnimatePresence>
+
+      <motion.span
+        animate={selected ? { scale: 1.06 } : { scale: 1 }}
+        transition={{ type: 'spring', stiffness: 400, damping: 18 }}
         className={cn(
-          'w-8 h-8 rounded-xl flex items-center justify-center',
-          selected ? 'bg-jam-500/25 text-jam-300' : 'bg-dark-800 text-dark-400',
+          'relative z-10 w-9 h-9 rounded-xl flex items-center justify-center transition-colors duration-200',
+          selected
+            ? 'bg-jam-500 text-white shadow-jam'
+            : 'bg-dark-800 text-dark-400 group-hover:text-dark-200',
         )}
       >
         {icon}
-      </div>
-      <div>
-        <p
+      </motion.span>
+      <span className="relative z-10 block">
+        <span
           className={cn(
-            'text-[11px] font-semibold leading-tight',
+            'block text-[11px] font-semibold leading-tight transition-colors duration-200',
             selected ? 'text-white' : 'text-dark-300',
           )}
         >
           {title}
-        </p>
-        <p className="text-[10px] text-dark-600 mt-0.5 leading-snug">{description}</p>
-      </div>
+        </span>
+        <span
+          className={cn(
+            'block text-[10px] mt-0.5 leading-snug transition-colors duration-200',
+            selected ? 'text-jam-200/90' : 'text-dark-600',
+          )}
+        >
+          {description}
+        </span>
+      </span>
     </motion.button>
   );
 }

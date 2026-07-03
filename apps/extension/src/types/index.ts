@@ -241,6 +241,14 @@ export interface OffscreenMessage<T = unknown> {
 
 export interface ExtensionSettings {
   micEnabled: boolean;
+  /**
+   * Whether the user has actually granted microphone access to the extension.
+   * Set once the dedicated permission page's getUserMedia succeeds — this is the
+   * source of truth for "can we record with mic", because
+   * `navigator.permissions.query` is unreliable in the action popup and would
+   * otherwise send the user back to the permission page in a loop.
+   */
+  micPermissionGranted?: boolean;
   webcamOverlay: boolean;
   webcamPosition: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left';
   recordingQuality: RecordingQuality;

@@ -103,6 +103,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     await updateSettings({ micEnabled: enabling });
     if (!enabling) return;
 
+    // Already granted before (permission page recorded it) — no need to prompt.
+    if (settings.micPermissionGranted) return;
+
     // The popup can't surface the mic permission prompt (it closes when the
     // prompt steals focus), so when access isn't already granted we hand off
     // to a dedicated permission tab. It writes the final state back to storage.
@@ -147,7 +150,9 @@ if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
     if (message?.type === 'MIC_PERMISSION_RESULT') {
       const { granted } = (message.payload as { granted?: boolean }) ?? {};
       const { settings } = useSettingsStore.getState();
-      useSettingsStore.setState({ settings: { ...settings, micEnabled: !!granted } });
+      useSettingsStore.setState({
+        settings: { ...settings, micEnabled: !!granted, micPermissionGranted: !!granted },
+      });
     }
   });
 }

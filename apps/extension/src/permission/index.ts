@@ -55,7 +55,15 @@ renderInstanceBadge();
 async function persistMicEnabled(enabled: boolean): Promise<void> {
   const res = await chrome.storage.local.get([STORAGE_KEYS.SETTINGS]);
   const stored = (res[STORAGE_KEYS.SETTINGS] as Partial<ExtensionSettings>) ?? {};
-  const next: ExtensionSettings = { ...DEFAULT_SETTINGS, ...stored, micEnabled: enabled };
+  // getUserMedia succeeding here is the ground truth that the extension origin has
+  // mic access — record it so the start-recording gate trusts this instead of the
+  // flaky Permissions API (which was looping the user back to this page).
+  const next: ExtensionSettings = {
+    ...DEFAULT_SETTINGS,
+    ...stored,
+    micEnabled: enabled,
+    micPermissionGranted: enabled,
+  };
   await chrome.storage.local.set({ [STORAGE_KEYS.SETTINGS]: next });
   // Let an open popup update its toggle without waiting for a reopen.
   chrome.runtime
