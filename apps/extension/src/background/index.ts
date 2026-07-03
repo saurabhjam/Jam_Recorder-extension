@@ -1979,6 +1979,21 @@ async function completeGoogleLogin(accessToken: string, sourceTabId: number): Pr
       assignedProjects: rpUser.assignedProjects,
     };
 
+    // Re-apply any locally-edited name/avatar for this user so signing in again
+    // via Google doesn't revert their edits to stale server values.
+    try {
+      const ovr = await chrome.storage.local.get([STORAGE_KEYS.AUTH_PROFILE_OVERRIDES]);
+      const all =
+        (ovr[STORAGE_KEYS.AUTH_PROFILE_OVERRIDES] as Record<
+          string,
+          { name?: string; avatar?: string }
+        >) ?? {};
+      const override = all[user.login];
+      if (override) Object.assign(user, override);
+    } catch {
+      /* no overrides — use server values */
+    }
+
     const claims = decodeJwtPayload(accessToken);
     const exp = typeof claims?.exp === 'number' ? claims.exp * 1000 : null;
     const tokens = {

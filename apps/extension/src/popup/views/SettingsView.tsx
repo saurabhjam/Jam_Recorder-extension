@@ -7,7 +7,29 @@ import { Avatar } from '@/components/ui/Avatar';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { InstanceBadge } from '@/components/ui/InstanceBadge';
-import { cn } from '@/utils';
+import { cn, blobToDataUrl } from '@/utils';
+import { STORAGE_KEYS } from '@/types';
+import { API_BASE_URL } from '@/config';
+
+/** Best-effort push of a new profile photo to the portal. The local avatar is
+ *  updated instantly regardless; this keeps the server copy in sync. */
+async function uploadProfilePhoto(file: File): Promise<void> {
+  try {
+    const r = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
+    const token = (r[STORAGE_KEYS.AUTH_TOKENS] as { accessToken?: string } | undefined)
+      ?.accessToken;
+    if (!token) return;
+    const form = new FormData();
+    form.append('file', file);
+    await fetch(`${API_BASE_URL}/v1/data/photo`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+  } catch {
+    /* best-effort — the local avatar already updated */
+  }
+}
 
 interface SettingsViewProps {
   onBack: () => void;
@@ -27,7 +49,7 @@ const ITEM_VARIANTS = {
 };
 
 export function SettingsView({ onBack }: SettingsViewProps) {
-  const { user, logout } = useAuthStore();
+  const { user, logout, updateProfile } = useAuthStore();
   const { settings, updateSettings, toggleMic } = useSettingsStore();
 
   const [name, setName] = useState(user?.name ?? '');
@@ -36,16 +58,29 @@ export function SettingsView({ onBack }: SettingsViewProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleSave = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
     setIsSaving(true);
     try {
-      // In a real implementation, call the API to update user profile
-      // For now, we just simulate a save
-      await new Promise<void>((resolve) => setTimeout(resolve, 600));
+      // Persist the new name to the store + storage so it updates everywhere in
+      // the extension (footer, avatars, settings) immediately.
+      await updateProfile({ name: trimmed });
       setSavedOk(true);
       setTimeout(() => setSavedOk(false), 2000);
     } finally {
       setIsSaving(false);
     }
+  };
+
+  const handlePhotoSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-picking the same file
+    if (!file || !file.type.startsWith('image/')) return;
+    // Show the new photo instantly across the extension…
+    const dataUrl = await blobToDataUrl(file);
+    await updateProfile({ avatar: dataUrl });
+    // …then sync it to the portal in the background.
+    void uploadProfilePhoto(file);
   };
 
   const handleSignOutAll = async () => {
@@ -100,9 +135,7 @@ export function SettingsView({ onBack }: SettingsViewProps) {
                     type="file"
                     accept="image/*"
                     className="hidden"
-                    onChange={() => {
-                      /* handle file selection */
-                    }}
+                    onChange={(e) => void handlePhotoSelected(e)}
                   />
                 </div>
                 <div className="flex-1 min-w-0">

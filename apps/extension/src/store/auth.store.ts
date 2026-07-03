@@ -3,6 +3,26 @@ import { authApi } from '@/services/api';
 import type { User, AuthTokens } from '@/types';
 import { STORAGE_KEYS } from '@/types';
 
+type ProfileOverride = Partial<Pick<User, 'name' | 'avatar'>>;
+
+/** Read all per-user profile overrides ({ [login]: { name?, avatar? } }). */
+async function getProfileOverrides(): Promise<Record<string, ProfileOverride>> {
+  try {
+    const r = await chrome.storage.local.get([STORAGE_KEYS.AUTH_PROFILE_OVERRIDES]);
+    return (r[STORAGE_KEYS.AUTH_PROFILE_OVERRIDES] as Record<string, ProfileOverride>) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** Re-apply this user's locally-edited name/avatar on top of the server user so
+ *  a fresh login doesn't clobber edits with stale server values. */
+async function applyProfileOverrides(user: User): Promise<User> {
+  const all = await getProfileOverrides();
+  const override = all[user.login];
+  return override ? { ...user, ...override } : user;
+}
+
 interface AuthStore {
   user: User | null;
   accessToken: string | null;
@@ -13,6 +33,7 @@ interface AuthStore {
 
   login: (username: string, password: string) => Promise<void>;
   loginWithToken: (token: string) => Promise<void>;
+  updateProfile: (updates: Partial<Pick<User, 'name' | 'avatar'>>) => Promise<void>;
   register: (email: string, password: string, name: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshToken: () => Promise<void>;
@@ -88,7 +109,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   login: async (username: string, password: string) => {
     set({ isLoading: true, error: null });
     try {
-      const { user, tokens, sessionId } = await authApi.login(username, password);
+      const { user: serverUser, tokens, sessionId } = await authApi.login(username, password);
+      const user = await applyProfileOverrides(serverUser);
 
       await chrome.storage.local.set({
         [STORAGE_KEYS.AUTH_USER]: user,
@@ -121,7 +143,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   loginWithToken: async (token: string) => {
     set({ isLoading: true, error: null });
     try {
-      const { user, tokens, sessionId } = await authApi.loginWithToken(token);
+      const { user: serverUser, tokens, sessionId } = await authApi.loginWithToken(token);
+      const user = await applyProfileOverrides(serverUser);
 
       await chrome.storage.local.set({
         [STORAGE_KEYS.AUTH_USER]: user,
@@ -148,6 +171,23 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       set({ error: message, isLoading: false });
       throw err;
     }
+  },
+
+  updateProfile: async (updates: Partial<Pick<User, 'name' | 'avatar'>>) => {
+    const { user } = get();
+    if (!user) return;
+    const next = { ...user, ...updates };
+    // Update the store first so every popup view (footer, settings, avatars)
+    // reflects the change immediately.
+    set({ user: next });
+    // Persist the current user AND record the edit as a per-user override so it
+    // survives a fresh login (which otherwise re-fetches the old server values).
+    const overrides = await getProfileOverrides();
+    overrides[user.login] = { ...(overrides[user.login] ?? {}), ...updates };
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.AUTH_USER]: next,
+      [STORAGE_KEYS.AUTH_PROFILE_OVERRIDES]: overrides,
+    });
   },
 
   register: async (email: string, password: string, name: string) => {

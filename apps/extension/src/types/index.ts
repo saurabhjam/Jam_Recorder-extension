@@ -339,6 +339,9 @@ export const STORAGE_KEYS = {
   AUTH_TOKENS: 'st_auth_tokens',
   AUTH_SESSION_ID: 'st_auth_session_id',
   AUTH_PROJECT: 'st_auth_project',
+  // Locally-edited profile fields (name/avatar), keyed by user login, re-applied
+  // on top of the server user at every login so edits survive re-login.
+  AUTH_PROFILE_OVERRIDES: 'st_profile_overrides',
   SETTINGS: 'st_settings',
   RECORDING_STATE: 'st_recording_state',
   OFFLINE_QUEUE: 'st_offline_queue',
