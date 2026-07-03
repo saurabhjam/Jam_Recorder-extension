@@ -17,17 +17,20 @@ out/
 
 # Environment variables
 .env
-.env.qa
 .env.local
 .env.*.local
 .env.development.local
 .env.test.local
 .env.production.local
-.env.production
 .env.portaldb
 *.env.bak
 .env.bak
 !.env.example
+# Instance env files (.env.qa / .env.production) hold only public URLs — no
+# secrets — and MUST be committed so `npm run build:qa|build:prod` (e.g. on a
+# fresh clone / Jenkins) resolve real hosts instead of falling back to localhost.
+!.env.qa
+!.env.production
 
 # Logs
 logs/
