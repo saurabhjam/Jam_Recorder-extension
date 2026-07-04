@@ -17,6 +17,8 @@ import {
   AlertCircle,
   ShieldCheck,
   FlaskConical,
+  Tag,
+  X,
 } from 'lucide-react';
 import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
 import { retryWithBackoff } from '@/utils';
@@ -268,6 +270,7 @@ export function EditorApp() {
   const [data, setData] = useState<EditorData | null>(null);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [uploadPercent, setUploadPercent] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
@@ -626,6 +629,7 @@ export function EditorApp() {
         body: JSON.stringify({
           title: title || data.title,
           description: 'Recording captured with BestQ',
+          tags: tags.join(','),
           type: 'video',
           mimeType: mimeBase,
           status: 'completed',
@@ -689,6 +693,7 @@ export function EditorApp() {
     trimStart,
     trimEnd,
     videoDuration,
+    tags,
   ]);
 
   // Download the recording locally (applies the trim) without uploading — for
@@ -1164,6 +1169,9 @@ export function EditorApp() {
               }}
             />
           </FieldGroup>
+
+          {/* Tags */}
+          <TagsInput tags={tags} onChange={setTags} max={25} />
         </div>
 
         {/* ── Right: Logs panel ── */}
@@ -2216,6 +2224,213 @@ function FieldGroup({ label, children }: { label: string; children: React.ReactN
         {label}
       </label>
       {children}
+    </div>
+  );
+}
+
+// ─── Tags Input ────────────────────────────────────────────────────────────────
+// A chip-style tag editor. The API field is the comma-joined string; each
+// individual tag is capped at `max` chars (the counter + shake enforce it).
+// Chips cycle through a small palette and spring in/out for a lively feel.
+
+const TAG_COLORS = [
+  { bg: 'rgba(139,92,246,0.18)', border: 'rgba(139,92,246,0.55)', text: '#c4b5fd' },
+  { bg: 'rgba(236,72,153,0.18)', border: 'rgba(236,72,153,0.55)', text: '#f9a8d4' },
+  { bg: 'rgba(34,197,94,0.18)', border: 'rgba(34,197,94,0.55)', text: '#86efac' },
+  { bg: 'rgba(59,130,246,0.18)', border: 'rgba(59,130,246,0.55)', text: '#93c5fd' },
+  { bg: 'rgba(245,158,11,0.18)', border: 'rgba(245,158,11,0.55)', text: '#fcd34d' },
+  { bg: 'rgba(20,184,166,0.18)', border: 'rgba(20,184,166,0.55)', text: '#5eead4' },
+];
+
+function TagsInput({
+  tags,
+  onChange,
+  max,
+}: {
+  tags: string[];
+  onChange: (tags: string[]) => void;
+  max: number;
+}) {
+  const [input, setInput] = useState('');
+  const [shake, setShake] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Counter tracks the length of the tag currently being typed — each tag is
+  // capped at `max` chars (there's no cap on how many tags you add).
+  const used = input.length;
+  const remaining = max - used;
+
+  const bump = () => {
+    setShake(true);
+    window.setTimeout(() => setShake(false), 420);
+  };
+
+  const addTag = (raw: string) => {
+    const t = raw.trim().replace(/,/g, '').toLowerCase();
+    if (!t) return;
+    if (tags.includes(t)) {
+      setInput('');
+      return;
+    }
+    if (t.length > max) {
+      bump();
+      return;
+    }
+    onChange([...tags, t]);
+    setInput('');
+  };
+
+  const removeTag = (t: string) => onChange(tags.filter((x) => x !== t));
+
+  const counterColor =
+    remaining <= 0 ? '#f87171' : remaining <= 6 ? '#fbbf24' : 'rgba(148,163,184,0.55)';
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      {/* Label + live counter */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '5px',
+            fontSize: '11px',
+            fontWeight: 700,
+            letterSpacing: '0.8px',
+            color: 'rgba(148,163,184,0.6)',
+          }}
+        >
+          <Tag size={11} style={{ color: '#a78bfa' }} />
+          TAGS
+        </span>
+        <motion.span
+          key={remaining}
+          initial={{ scale: 1.3, opacity: 0.6 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ type: 'spring', stiffness: 500, damping: 20 }}
+          style={{
+            fontSize: '10px',
+            fontWeight: 700,
+            color: counterColor,
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {used}/{max}
+        </motion.span>
+      </div>
+
+      {/* Chip container */}
+      <motion.div
+        animate={shake ? { x: [0, -6, 6, -4, 4, 0] } : { x: 0 }}
+        transition={{ duration: 0.42 }}
+        onClick={() => inputRef.current?.focus()}
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          gap: '6px',
+          minHeight: '44px',
+          padding: '8px 10px',
+          borderRadius: '10px',
+          background: '#111118',
+          border: `1px solid ${
+            shake
+              ? 'rgba(239,68,68,0.6)'
+              : focused
+                ? 'rgba(139,92,246,0.5)'
+                : 'rgba(255,255,255,0.1)'
+          }`,
+          transition: 'border-color 0.15s',
+          cursor: 'text',
+        }}
+      >
+        <AnimatePresence initial={false}>
+          {tags.map((tag, i) => {
+            const c = TAG_COLORS[i % TAG_COLORS.length]!;
+            return (
+              <motion.span
+                key={tag}
+                layout
+                initial={{ scale: 0.4, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                exit={{ scale: 0.4, opacity: 0 }}
+                transition={{ type: 'spring', stiffness: 520, damping: 26 }}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '3px 5px 3px 9px',
+                  borderRadius: '7px',
+                  background: c.bg,
+                  border: `1px solid ${c.border}`,
+                  color: c.text,
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {tag}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removeTag(tag);
+                  }}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    border: 'none',
+                    background: 'transparent',
+                    color: c.text,
+                    cursor: 'pointer',
+                    padding: 0,
+                    opacity: 0.75,
+                  }}
+                >
+                  <X size={12} />
+                </button>
+              </motion.span>
+            );
+          })}
+        </AnimatePresence>
+
+        <input
+          ref={inputRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onFocus={() => setFocused(true)}
+          onBlur={() => {
+            setFocused(false);
+            if (input.trim()) addTag(input);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ',') {
+              e.preventDefault();
+              addTag(input);
+            } else if (e.key === 'Backspace' && !input && tags.length) {
+              removeTag(tags[tags.length - 1]!);
+            }
+          }}
+          placeholder={tags.length ? 'Add…' : 'e.g. smoke, payment, regression'}
+          maxLength={max}
+          style={{
+            flex: 1,
+            minWidth: '90px',
+            background: 'transparent',
+            border: 'none',
+            outline: 'none',
+            color: 'white',
+            fontSize: '13px',
+            fontFamily: 'inherit',
+          }}
+        />
+      </motion.div>
+
+      <span style={{ fontSize: '11px', color: 'rgba(148,163,184,0.45)' }}>
+        Press Enter or comma to add · {max} chars per tag
+      </span>
     </div>
   );
 }
