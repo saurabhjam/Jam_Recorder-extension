@@ -164,15 +164,58 @@ function scheduleCaptureFlush(): void {
   _captureFlushTimer = setTimeout(() => {
     _captureFlushTimer = null;
     if (!isRecordingActive) return;
+    // Trim response bodies in the persisted copy so 1000 entries stay well
+    // under the chrome.storage.session quota; in-memory entries keep full bodies.
+    const trimmedEntries = cdpNetworkEntries
+      .slice(-1000)
+      .map((e) =>
+        e.responseBody && e.responseBody.length > 5_000
+          ? { ...e, responseBody: e.responseBody.slice(0, 5_000), responseBodyTruncated: true }
+          : e,
+      );
     void chrome.storage.session
       .set({
         [CDP_SESSION_KEY]: {
           consoleLogs: cdpConsoleLogs.slice(-1000),
-          networkEntries: cdpNetworkEntries.slice(-1000),
+          networkEntries: trimmedEntries,
         },
       })
       .catch(() => {});
   }, 2000);
+}
+
+// Response bodies are only captured for text-like payloads (API responses),
+// capped per-entry so captures stay within storage/upload limits.
+const MAX_CAPTURE_BODY_CHARS = 50_000;
+const TEXT_BODY_MIME = /json|text|xml|javascript|x-www-form-urlencoded|graphql/i;
+
+function fetchCdpResponseBody(
+  tabId: number | undefined,
+  requestId: string,
+  entry: CaptureNetworkEntry,
+): void {
+  if (tabId === undefined || tabId !== cdpTabId) return;
+  if (!entry.mimeType || !TEXT_BODY_MIME.test(entry.mimeType)) return;
+  chrome.debugger
+    .sendCommand({ tabId }, 'Network.getResponseBody', { requestId })
+    .then((result) => {
+      const r = result as { body?: string; base64Encoded?: boolean } | undefined;
+      if (!r?.body) return;
+      let body = r.body;
+      if (r.base64Encoded) {
+        try {
+          body = atob(body);
+        } catch {
+          return; // not decodable text — skip
+        }
+      }
+      entry.responseBodyTruncated = body.length > MAX_CAPTURE_BODY_CHARS;
+      entry.responseBody = body.slice(0, MAX_CAPTURE_BODY_CHARS);
+      scheduleCaptureFlush();
+    })
+    .catch(() => {
+      // Body no longer available (navigation, detach, or non-cacheable) — non-fatal
+    });
 }
 
 async function attachDebugger(tabId: number): Promise<void> {
@@ -244,7 +287,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   switch (method) {
     case 'Network.requestWillBeSent': {
-      const req = p['request'] as { url: string; method: string } | undefined;
+      const req = p['request'] as
+        | {
+            url: string;
+            method: string;
+            headers?: Record<string, string>;
+            postData?: string;
+          }
+        | undefined;
       const init = p['initiator'] as { type?: string } | undefined;
       if (!req) break;
       cdpNetworkMap.set(p['requestId'] as string, {
@@ -258,6 +308,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         startedAt: Date.now(),
         size: 0,
         initiator: init?.type,
+        requestHeaders: req.headers,
+        requestBody: req.postData?.slice(0, MAX_CAPTURE_BODY_CHARS),
         source: 'cdp',
       });
       break;
@@ -265,25 +317,33 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
     case 'Network.responseReceived': {
       const res = p['response'] as
-        | { status: number; statusText: string; mimeType: string }
+        | {
+            status: number;
+            statusText: string;
+            mimeType: string;
+            headers?: Record<string, string>;
+          }
         | undefined;
       const entry = cdpNetworkMap.get(p['requestId'] as string);
       if (entry && res) {
         entry.status = res.status;
         entry.statusText = res.statusText;
         entry.mimeType = res.mimeType;
+        entry.responseHeaders = res.headers;
       }
       break;
     }
 
     case 'Network.loadingFinished': {
-      const entry = cdpNetworkMap.get(p['requestId'] as string);
+      const requestId = p['requestId'] as string;
+      const entry = cdpNetworkMap.get(requestId);
       if (entry) {
         entry.size = (p['encodedDataLength'] as number | undefined) ?? 0;
         entry.duration = Date.now() - entry.startedAt;
         cdpNetworkEntries.push(entry as CaptureNetworkEntry);
-        cdpNetworkMap.delete(p['requestId'] as string);
+        cdpNetworkMap.delete(requestId);
         scheduleCaptureFlush();
+        fetchCdpResponseBody(source.tabId, requestId, entry as CaptureNetworkEntry);
       }
       break;
     }
@@ -408,11 +468,14 @@ function captureScriptMain(): void {
 
   const _post = (data: object): void => window.postMessage({ __st: true, ...data }, '*');
 
+  const MAX_BODY = 50_000;
+  const TEXT_MIME = /json|text|xml|javascript|x-www-form-urlencoded|graphql/i;
+
   // ── XHR ──────────────────────────────────────────────────────────────────
   const _OrigXHR = w.XMLHttpRequest as typeof XMLHttpRequest;
   w.XMLHttpRequest = function (): XMLHttpRequest {
     const xhr = new _OrigXHR();
-    const meta = { url: '', method: 'GET', start: 0 };
+    const meta = { url: '', method: 'GET', start: 0, reqHeaders: {} as Record<string, string> };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const _origOpen = (xhr.open as any).bind(xhr) as (...a: unknown[]) => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -422,11 +485,44 @@ function captureScriptMain(): void {
       _origOpen(...args);
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const _origSetHeader = (xhr.setRequestHeader as any).bind(xhr) as (
+      name: string,
+      value: string,
+    ) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (xhr as any).setRequestHeader = (name: string, value: string): void => {
+      meta.reqHeaders[name] = value;
+      _origSetHeader(name, value);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const _origSend = (xhr.send as any).bind(xhr) as (...a: unknown[]) => void;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (xhr as any).send = (...args: unknown[]): void => {
       meta.start = Date.now();
+      const reqBody = typeof args[0] === 'string' ? args[0].slice(0, MAX_BODY) : undefined;
       xhr.addEventListener('loadend', () => {
+        const resHeaders: Record<string, string> = {};
+        try {
+          xhr
+            .getAllResponseHeaders()
+            .trim()
+            .split(/[\r\n]+/)
+            .forEach((line) => {
+              const idx = line.indexOf(': ');
+              if (idx > 0) resHeaders[line.slice(0, idx)] = line.slice(idx + 2);
+            });
+        } catch {
+          /* headers unavailable */
+        }
+        let resBody: string | undefined;
+        try {
+          const ct = xhr.getResponseHeader('content-type') ?? '';
+          if ((xhr.responseType === '' || xhr.responseType === 'text') && TEXT_MIME.test(ct)) {
+            resBody = xhr.responseText.slice(0, MAX_BODY);
+          }
+        } catch {
+          /* body unavailable */
+        }
         _post({
           kind: 'network',
           url: meta.url,
@@ -437,6 +533,10 @@ function captureScriptMain(): void {
           size: parseInt(xhr.getResponseHeader('content-length') ?? '0') || 0,
           timestamp: meta.start,
           failed: xhr.status === 0,
+          requestHeaders: meta.reqHeaders,
+          responseHeaders: resHeaders,
+          requestBody: reqBody,
+          responseBody: resBody,
         });
       });
       _origSend(...args);
@@ -452,24 +552,60 @@ function captureScriptMain(): void {
     const method = (
       init?.method ?? (input instanceof Request ? input.method : 'GET')
     ).toUpperCase();
+    const reqHeaders: Record<string, string> = {};
+    try {
+      const h = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+      if (h instanceof Headers) {
+        h.forEach((v, k) => {
+          reqHeaders[k] = v;
+        });
+      } else if (Array.isArray(h)) {
+        h.forEach(([k, v]) => {
+          reqHeaders[k] = v;
+        });
+      } else if (h) {
+        Object.assign(reqHeaders, h as Record<string, string>);
+      }
+    } catch {
+      /* headers unavailable */
+    }
+    const reqBody = typeof init?.body === 'string' ? init.body.slice(0, MAX_BODY) : undefined;
     const t = Date.now();
     return _origFetch(input, init).then(
       (r: Response): Response => {
+        const resHeaders: Record<string, string> = {};
+        r.headers.forEach((v, k) => {
+          resHeaders[k] = v;
+        });
+        const ct = r.headers.get('content-type') ?? '';
+        const bodyPromise: Promise<string | undefined> = TEXT_MIME.test(ct)
+          ? r
+              .clone()
+              .text()
+              .then((txt): string => txt.slice(0, MAX_BODY))
+              .catch((): undefined => undefined)
+          : Promise.resolve(undefined);
         void r
           .clone()
           .arrayBuffer()
           .catch((): ArrayBuffer => new ArrayBuffer(0))
           .then((buf: ArrayBuffer): void => {
-            _post({
-              kind: 'network',
-              url,
-              method,
-              status: r.status,
-              statusText: r.statusText,
-              duration: Date.now() - t,
-              size: buf.byteLength,
-              timestamp: t,
-              failed: false,
+            void bodyPromise.then((resBody): void => {
+              _post({
+                kind: 'network',
+                url,
+                method,
+                status: r.status,
+                statusText: r.statusText,
+                duration: Date.now() - t,
+                size: buf.byteLength,
+                timestamp: t,
+                failed: false,
+                requestHeaders: reqHeaders,
+                responseHeaders: resHeaders,
+                requestBody: reqBody,
+                responseBody: resBody,
+              });
             });
           });
         return r;

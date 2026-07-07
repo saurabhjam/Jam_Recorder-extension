@@ -689,17 +689,47 @@ async function generateThumbnail(blob: Blob): Promise<string | null> {
     });
 
     const canvas = document.createElement('canvas');
-    const width = Math.min(video.videoWidth || 1280, 960);
+    const width = Math.min(video.videoWidth || 1280, 640);
     const height = Math.round(width * (video.videoHeight / (video.videoWidth || 1)));
     canvas.width = width;
-    canvas.height = height || 540;
+    canvas.height = height || 360;
     canvas.getContext('2d')!.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     URL.revokeObjectURL(objectUrl);
-    return canvas.toDataURL('image/jpeg', 0.75);
+    return canvas.toDataURL('image/jpeg', 0.7);
   } catch {
     return null;
   }
+}
+
+/** Upload a thumbnail data URL as a JPEG file and return its URL. Falls back
+ *  to the original data URL if the upload fails, so the record never loses
+ *  its preview. NOTE: the files GET endpoint requires a Bearer token, so the
+ *  portal must fetch this URL with auth (a plain <img src> gets a 401). */
+async function uploadThumbnail(
+  dataUrl: string,
+  project: string,
+  token: string,
+  ts: number,
+): Promise<string> {
+  try {
+    const thumbBlob = await (await fetch(dataUrl)).blob();
+    const thumbFile = new File([thumbBlob], `thumb-${ts}.jpg`, { type: 'image/jpeg' });
+    const formData = new FormData();
+    formData.append('file', thumbFile);
+    const res = await fetch(`${REPORTS_URL}/v1/${project}/files/upload`, {
+      method: 'POST',
+      headers: { ...authHeaders(token), Accept: 'text/plain, application/json, */*' },
+      body: formData,
+    });
+    if (res.ok) {
+      const fileName = (await res.text()).trim();
+      if (fileName) return `${REPORTS_URL}/v1/${project}/files/${fileName}`;
+    }
+  } catch {
+    /* fall through to data URL */
+  }
+  return dataUrl;
 }
 
 function cleanup(): void {
@@ -820,6 +850,8 @@ async function saveBlobToIDB(id: string, blob: Blob): Promise<void> {
 
 interface UploadMetadata {
   title: string;
+  /** User-provided description; capped at 125 chars before upload. */
+  description?: string;
   type: RecordingOptions['type'];
   duration: number;
   mimeType: string;
@@ -876,7 +908,7 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
     const fileUrl = `${REPORTS_URL}/v1/${project}/files/${fileName}`;
     const createBody: Record<string, unknown> = {
       title: metadata.title,
-      description: 'Recording captured with BestQ',
+      description: metadata.description?.trim().slice(0, 125) || 'Recording captured with BestQ',
       type: 'video',
       mimeType: metadata.mimeType.split(';')[0],
       status: 'completed',
@@ -894,7 +926,9 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
       createdAt: isoNow,
       updatedAt: isoNow,
     };
-    if (lastThumbnailDataUrl) createBody['thumbnailUrl'] = lastThumbnailDataUrl;
+    if (lastThumbnailDataUrl) {
+      createBody['thumbnailUrl'] = await uploadThumbnail(lastThumbnailDataUrl, project, token, ts);
+    }
 
     const createRes = await fetch(`${REPORTS_URL}/v1/${project}/records`, {
       method: 'POST',

@@ -56,7 +56,17 @@ interface NetworkCapture {
   mimeType?: string;
   failed?: boolean;
   errorText?: string;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  requestBody?: string;
+  responseBody?: string;
+  responseBodyTruncated?: boolean;
   source?: 'cdp' | 'injected';
+}
+
+/** Convert a captured header map to the HAR `[{name, value}]` shape. */
+function toHarHeaders(headers?: Record<string, string>): Array<{ name: string; value: string }> {
+  return Object.entries(headers ?? {}).map(([name, value]) => ({ name, value }));
 }
 
 interface AssignedProjectInfo {
@@ -74,6 +84,7 @@ const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const AUTH_USER_KEY = 'st_auth_user';
 const IDB_NAME = 'bestq-blobs';
 const IDB_STORE = 'recordings';
+const DESCRIPTION_MAX = 125;
 
 function splitBlob(blob: Blob): Blob[] {
   const CHUNK_SIZE = 2 * 1024 * 1024;
@@ -556,17 +567,32 @@ export function EditorApp() {
               request: {
                 method: r.method,
                 url: r.url,
-                headers: [],
+                headers: toHarHeaders(r.requestHeaders),
                 queryString: [],
                 cookies: [],
                 headersSize: -1,
-                bodySize: -1,
+                bodySize: r.requestBody?.length ?? -1,
+                ...(r.requestBody
+                  ? {
+                      postData: {
+                        mimeType:
+                          r.requestHeaders?.['Content-Type'] ??
+                          r.requestHeaders?.['content-type'] ??
+                          '',
+                        text: r.requestBody,
+                      },
+                    }
+                  : {}),
               },
               response: {
                 status: r.status,
                 statusText: r.statusText ?? '',
-                headers: [],
-                content: { size: r.size, mimeType: r.mimeType ?? '' },
+                headers: toHarHeaders(r.responseHeaders),
+                content: {
+                  size: r.size,
+                  mimeType: r.mimeType ?? '',
+                  ...(r.responseBody ? { text: r.responseBody } : {}),
+                },
                 redirectURL: '',
                 headersSize: -1,
                 bodySize: r.size,
@@ -620,6 +646,35 @@ export function EditorApp() {
         /* best-effort */
       }
 
+      // Step 4b: upload thumbnail as a file → store a URL instead of inlining
+      // base64 into the record row. Falls back to the data URL on failure.
+      // NOTE: the files GET endpoint requires a Bearer token, so the portal
+      // must fetch this URL with auth (a plain <img src> gets a 401).
+      setUploadPercent(90);
+      let thumbnailUrl: string | null = data.thumbnailDataUrl ?? null;
+      if (data.thumbnailDataUrl) {
+        try {
+          const thumbBlob = await (await fetch(data.thumbnailDataUrl)).blob();
+          const thumbFile = new File([thumbBlob], `thumb-${ts}.jpg`, { type: 'image/jpeg' });
+          const tForm = new FormData();
+          tForm.append('file', thumbFile);
+          const tRes = await fetch(`${API_BASE}/v1/${project}/files/upload`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              Accept: 'text/plain, application/json, */*',
+            },
+            body: tForm,
+          });
+          if (tRes.ok) {
+            const thumbFileName = (await tRes.text()).trim();
+            if (thumbFileName) thumbnailUrl = `${API_BASE}/v1/${project}/files/${thumbFileName}`;
+          }
+        } catch {
+          /* best-effort — keep data URL fallback */
+        }
+      }
+
       // Step 5: create record with all fields
       setUploadPercent(92);
       const videoUrl = `${API_BASE}/v1/${project}/files/${videoFileName}`;
@@ -628,7 +683,7 @@ export function EditorApp() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           title: title || data.title,
-          description: 'Recording captured with BestQ',
+          description: description.trim().slice(0, 125) || 'Recording captured with BestQ',
           tags: tags.join(','),
           type: 'video',
           mimeType: mimeBase,
@@ -640,7 +695,7 @@ export function EditorApp() {
           allowDownload: true,
           viewCount: 0,
           url: videoUrl,
-          thumbnailUrl: data.thumbnailDataUrl ?? null,
+          thumbnailUrl,
           duration: Math.round((trimEnd - trimStart) * (videoDuration || data.duration || 0)),
           networkLogs: harFileName || null,
           consoleLogs: logsFileName || null,
@@ -1143,7 +1198,8 @@ export function EditorApp() {
           <FieldGroup label="DESCRIPTION">
             <textarea
               value={description}
-              onChange={(e) => setDescription(e.target.value)}
+              onChange={(e) => setDescription(e.target.value.slice(0, DESCRIPTION_MAX))}
+              maxLength={DESCRIPTION_MAX}
               placeholder="Write a description or @ to mention…"
               rows={3}
               style={{
@@ -1168,6 +1224,16 @@ export function EditorApp() {
                 e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)';
               }}
             />
+            <span
+              style={{
+                alignSelf: 'flex-end',
+                fontSize: '11px',
+                color: description.length >= DESCRIPTION_MAX ? '#fbbf24' : 'rgba(148,163,184,0.45)',
+                fontVariantNumeric: 'tabular-nums',
+              }}
+            >
+              {description.length}/{DESCRIPTION_MAX}
+            </span>
           </FieldGroup>
 
           {/* Tags */}
@@ -2494,7 +2560,38 @@ function LogRow({ time, level, message }: { time: string; level: string; message
   );
 }
 
+function HeaderList({ title, headers }: { title: string; headers?: Record<string, string> }) {
+  const entries = Object.entries(headers ?? {});
+  return (
+    <div style={{ marginBottom: '10px' }}>
+      <div
+        style={{
+          fontSize: '10px',
+          fontWeight: 700,
+          color: 'rgba(148,163,184,0.6)',
+          textTransform: 'uppercase',
+          letterSpacing: '0.05em',
+          marginBottom: '4px',
+        }}
+      >
+        {title}
+      </div>
+      {entries.length === 0 ? (
+        <div style={{ fontSize: '11px', color: 'rgba(148,163,184,0.35)' }}>No headers captured</div>
+      ) : (
+        entries.map(([name, value]) => (
+          <div key={name} style={{ fontSize: '11px', lineHeight: 1.6, wordBreak: 'break-all' }}>
+            <span style={{ color: '#a78bfa', fontWeight: 600 }}>{name}:</span>{' '}
+            <span style={{ color: 'rgba(203,213,225,0.75)' }}>{value}</span>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
 function NetworkRow({ req }: { req: NetworkCapture }) {
+  const [expanded, setExpanded] = useState(false);
   const isFailed = req.failed || req.status === 0;
   const statusColor = isFailed
     ? '#f87171'
@@ -2509,62 +2606,155 @@ function NetworkRow({ req }: { req: NetworkCapture }) {
   const shortUrl = path.length > 45 ? path.slice(0, 45) + '…' : path;
   const statusLabel = isFailed && req.status === 0 ? 'ERR' : req.status || '—';
   return (
-    <div
-      style={{
-        display: 'flex',
-        gap: '8px',
-        padding: '6px 16px',
-        fontSize: '12px',
-        borderBottom: '1px solid rgba(255,255,255,0.04)',
-        alignItems: 'center',
-        background: isFailed ? 'rgba(239,68,68,0.04)' : 'transparent',
-      }}
-    >
-      <span
+    <div style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+      <div
+        onClick={() => setExpanded((v) => !v)}
         style={{
-          color: 'rgba(148,163,184,0.5)',
-          fontVariantNumeric: 'tabular-nums',
-          flexShrink: 0,
+          display: 'flex',
+          gap: '8px',
+          padding: '6px 16px',
+          fontSize: '12px',
+          alignItems: 'center',
+          background: isFailed ? 'rgba(239,68,68,0.04)' : 'transparent',
+          cursor: 'pointer',
         }}
       >
-        {formatTime(req.timestamp)}
-      </span>
-      <span
-        style={{
-          padding: '1px 6px',
-          borderRadius: '4px',
-          background: 'rgba(139,92,246,0.15)',
-          color: '#a78bfa',
-          fontSize: '10px',
-          fontWeight: 700,
-          flexShrink: 0,
-        }}
-      >
-        {req.method}
-      </span>
-      <span style={{ color: statusColor, fontWeight: 700, flexShrink: 0, minWidth: '28px' }}>
-        {statusLabel}
-      </span>
-      <span
-        style={{
-          color: 'rgba(203,213,225,0.7)',
-          flex: 1,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-        }}
-        title={req.url}
-      >
-        {shortUrl}
-      </span>
-      {req.mimeType && (
-        <span style={{ color: 'rgba(148,163,184,0.35)', flexShrink: 0, fontSize: '10px' }}>
-          {req.mimeType.split(';')[0]}
+        <span
+          style={{
+            color: 'rgba(148,163,184,0.4)',
+            flexShrink: 0,
+            fontSize: '9px',
+            width: '10px',
+          }}
+        >
+          {expanded ? '▼' : '▶'}
         </span>
+        <span
+          style={{
+            color: 'rgba(148,163,184,0.5)',
+            fontVariantNumeric: 'tabular-nums',
+            flexShrink: 0,
+          }}
+        >
+          {formatTime(req.timestamp)}
+        </span>
+        <span
+          style={{
+            padding: '1px 6px',
+            borderRadius: '4px',
+            background: 'rgba(139,92,246,0.15)',
+            color: '#a78bfa',
+            fontSize: '10px',
+            fontWeight: 700,
+            flexShrink: 0,
+          }}
+        >
+          {req.method}
+        </span>
+        <span style={{ color: statusColor, fontWeight: 700, flexShrink: 0, minWidth: '28px' }}>
+          {statusLabel}
+        </span>
+        <span
+          style={{
+            color: 'rgba(203,213,225,0.7)',
+            flex: 1,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+          title={req.url}
+        >
+          {shortUrl}
+        </span>
+        {req.mimeType && (
+          <span style={{ color: 'rgba(148,163,184,0.35)', flexShrink: 0, fontSize: '10px' }}>
+            {req.mimeType.split(';')[0]}
+          </span>
+        )}
+        <span style={{ color: 'rgba(148,163,184,0.4)', flexShrink: 0 }}>
+          {req.duration > 0 ? `${req.duration}ms` : '—'}
+        </span>
+      </div>
+      {expanded && (
+        <div
+          style={{
+            padding: '10px 16px 12px 34px',
+            background: 'rgba(15,23,42,0.4)',
+            borderTop: '1px solid rgba(255,255,255,0.03)',
+          }}
+        >
+          <div
+            style={{
+              fontSize: '11px',
+              color: 'rgba(203,213,225,0.6)',
+              wordBreak: 'break-all',
+              marginBottom: '10px',
+            }}
+          >
+            {req.url}
+          </div>
+          <HeaderList title="Request Headers" headers={req.requestHeaders} />
+          <HeaderList title="Response Headers" headers={req.responseHeaders} />
+          {req.requestBody && (
+            <div style={{ marginBottom: '10px' }}>
+              <div
+                style={{
+                  fontSize: '10px',
+                  fontWeight: 700,
+                  color: 'rgba(148,163,184,0.6)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  marginBottom: '4px',
+                }}
+              >
+                Request Body
+              </div>
+              <pre
+                style={{
+                  fontSize: '11px',
+                  color: 'rgba(203,213,225,0.75)',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all',
+                  maxHeight: '160px',
+                  overflow: 'auto',
+                  margin: 0,
+                }}
+              >
+                {req.requestBody}
+              </pre>
+            </div>
+          )}
+          {req.responseBody && (
+            <div>
+              <div
+                style={{
+                  fontSize: '10px',
+                  fontWeight: 700,
+                  color: 'rgba(148,163,184,0.6)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  marginBottom: '4px',
+                }}
+              >
+                Response{req.responseBodyTruncated ? ' (truncated)' : ''}
+              </div>
+              <pre
+                style={{
+                  fontSize: '11px',
+                  color: 'rgba(203,213,225,0.75)',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-all',
+                  maxHeight: '240px',
+                  overflow: 'auto',
+                  margin: 0,
+                }}
+              >
+                {req.responseBody}
+              </pre>
+            </div>
+          )}
+        </div>
       )}
-      <span style={{ color: 'rgba(148,163,184,0.4)', flexShrink: 0 }}>
-        {req.duration > 0 ? `${req.duration}ms` : '—'}
-      </span>
     </div>
   );
 }

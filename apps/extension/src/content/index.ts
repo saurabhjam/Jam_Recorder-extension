@@ -354,6 +354,10 @@ function handlePageMessage(e: MessageEvent): void {
       size: e.data.size as number,
       failed: (e.data.failed as boolean) || false,
       errorText: e.data.errorText as string | undefined,
+      requestHeaders: e.data.requestHeaders as Record<string, string> | undefined,
+      responseHeaders: e.data.responseHeaders as Record<string, string> | undefined,
+      requestBody: e.data.requestBody as string | undefined,
+      responseBody: e.data.responseBody as string | undefined,
       source: 'injected',
     });
   } else if (e.data.kind === 'console') {

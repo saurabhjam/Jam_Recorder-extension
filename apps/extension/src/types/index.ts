@@ -113,6 +113,8 @@ export interface UploadProgress {
 
 export interface RecordingMetadata {
   title: string;
+  /** User-provided description; capped at 125 chars at the input and again before upload. */
+  description?: string;
   type: RecordingType;
   duration: number;
   mimeType: string;
@@ -201,6 +203,11 @@ export interface CaptureNetworkEntry {
   initiator?: string;
   failed?: boolean;
   errorText?: string;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  requestBody?: string;
+  responseBody?: string;
+  responseBodyTruncated?: boolean;
   source: 'cdp' | 'injected';
 }
 
