@@ -695,16 +695,27 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
     tabId = tab?.id;
   }
   if (!tabId) return false;
+  const targetTab = tabId;
 
   const showMsg = {
     type: 'SHOW_TOOLBAR' as const,
     payload: { recordingId: currentRecordingId },
   } satisfies ExtensionMessage;
 
+  // The content script answers with `mounted` = the toolbar is actually in the
+  // live DOM. A delivered message alone is NOT success — the mount can silently
+  // fail (no <body> yet, page evicted the node) and callers use this result to
+  // decide whether the popup may close.
+  const sendShow = async (): Promise<boolean> => {
+    const res = (await chrome.tabs.sendMessage(targetTab, showMsg)) as
+      | { mounted?: boolean }
+      | undefined;
+    return res?.mounted === true;
+  };
+
   // Try messaging first (content script already running)
   try {
-    await chrome.tabs.sendMessage(tabId, showMsg);
-    return true;
+    if (await sendShow()) return true;
   } catch {
     // Content script not ready — inject it programmatically then retry
   }
@@ -715,8 +726,7 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
       files: ['src/content/index.js'],
     });
     await new Promise<void>((r) => setTimeout(r, 150));
-    await chrome.tabs.sendMessage(tabId, showMsg);
-    return true;
+    return await sendShow();
   } catch (err) {
     console.error('[Background] Could not inject toolbar into tab', tabId, err);
     return false;

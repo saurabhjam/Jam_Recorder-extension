@@ -91,7 +91,53 @@ function findScrollTarget(): HTMLElement | null {
 
 // ─── Toolbar Management ───────────────────────────────────────────────────────
 
+// Remembered so the self-heal guard can remount after the page removes our node.
+let lastToolbarRecordingId = '';
+let toolbarGuardTimer: number | null = null;
+
+/** Watchdog while recording: heavy SPAs (Google Meet et al.) can wipe DOM nodes
+ *  they don't own, and fullscreen mode renders nothing outside the fullscreen
+ *  element. Remount if our container was removed; re-parent it into the
+ *  fullscreen element so the controls stay visible during fullscreen calls. */
+function startToolbarGuard(): void {
+  if (toolbarGuardTimer !== null) return;
+  toolbarGuardTimer = window.setInterval(() => {
+    if (!isToolbarVisible) return;
+    if (!toolbarContainer || !toolbarContainer.isConnected) {
+      if (lastToolbarRecordingId) mountToolbar(lastToolbarRecordingId);
+      return;
+    }
+    reparentToolbarForFullscreen();
+  }, 2000);
+}
+
+function stopToolbarGuard(): void {
+  if (toolbarGuardTimer !== null) {
+    clearInterval(toolbarGuardTimer);
+    toolbarGuardTimer = null;
+  }
+}
+
+function reparentToolbarForFullscreen(): void {
+  if (!toolbarContainer || !toolbarContainer.isConnected || !document.body) return;
+  const fsEl = document.fullscreenElement;
+  const desiredParent = fsEl && fsEl !== toolbarContainer ? fsEl : document.body;
+  if (toolbarContainer.parentElement !== desiredParent) {
+    try {
+      desiredParent.appendChild(toolbarContainer);
+    } catch {
+      /* fullscreen element may not accept children (e.g. <video>) — guard tick retries */
+    }
+  }
+}
+
+// React immediately when the page enters/exits fullscreen instead of waiting
+// for the next guard tick.
+document.addEventListener('fullscreenchange', reparentToolbarForFullscreen);
+
 function mountToolbar(recordingId: string): void {
+  lastToolbarRecordingId = recordingId;
+
   // Already mounted AND still attached to the live DOM — just keep the id fresh.
   if (toolbarContainer && toolbarContainer.isConnected) {
     toolbarContainer.dataset['recordingId'] = recordingId;
@@ -99,8 +145,14 @@ function mountToolbar(recordingId: string): void {
       isToolbarVisible = true;
       renderToolbar(recordingId);
     }
+    startToolbarGuard();
     return;
   }
+
+  // A stray container from a re-injected script instance (executeScript fallback
+  // runs the file again with fresh module state) — remove it so we never show two.
+  const stray = document.getElementById('jam-toolbar-root');
+  if (stray && stray !== toolbarContainer) stray.remove();
 
   // A previous mount left a dangling/detached container (e.g. mountToolbar ran at
   // document_start before <body> existed and threw, or the page removed it). Tear
@@ -156,6 +208,8 @@ function mountToolbar(recordingId: string): void {
   toolbarRoot = root;
   isToolbarVisible = true;
   renderToolbar(recordingId);
+  reparentToolbarForFullscreen();
+  startToolbarGuard();
 }
 
 function renderToolbar(recordingId: string): void {
@@ -185,6 +239,8 @@ function renderToolbar(recordingId: string): void {
 }
 
 function unmountToolbar(): void {
+  stopToolbarGuard();
+  lastToolbarRecordingId = '';
   if (toolbarRoot) {
     toolbarRoot.unmount();
     toolbarRoot = null;
@@ -450,7 +506,13 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         mountToolbar(payload.recordingId);
         startCapture();
       }
-      sendResponse({ success: true });
+      // Report whether the toolbar truly ended up in the live DOM — "message
+      // received" is not "toolbar visible". The background uses this to decide
+      // whether the popup may close or must show its in-popup controls instead.
+      sendResponse({
+        success: true,
+        mounted: !!(toolbarContainer && toolbarContainer.isConnected),
+      });
       break;
     }
 

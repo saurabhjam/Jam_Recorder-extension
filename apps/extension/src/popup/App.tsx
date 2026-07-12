@@ -73,9 +73,12 @@ export default function App() {
   }, [initAuth]);
 
   // Re-surface the floating toolbar on the current tab, then close the popup.
-  // If it can't be injected (restricted page), show the in-popup recording
-  // controls so the user can still pause/stop.
+  // If it can't be injected (restricted page) or the mount can't be verified,
+  // keep the popup open on the recording controls so the user can always
+  // pause/stop. The controls are shown immediately (not Home) so the popup
+  // never flashes an irrelevant view before closing.
   const ensureToolbarThenRoute = async () => {
+    setCurrentView('recording');
     try {
       const res = await new Promise<{ injected?: boolean } | undefined>((resolve) => {
         chrome.runtime.sendMessage({ type: 'ENSURE_TOOLBAR' }, (response) => {
@@ -83,14 +86,14 @@ export default function App() {
           else resolve(response as { injected?: boolean } | undefined);
         });
       });
+      // Close only when the background verified the toolbar is actually in the
+      // page DOM — otherwise the user would be left with no controls at all.
       if (res?.injected) {
         window.close();
-        return;
       }
     } catch {
-      // fall through to in-popup controls
+      // stay on in-popup controls
     }
-    setCurrentView('recording');
   };
 
   // Auto-route based on recording status
