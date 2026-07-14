@@ -5,3 +5,7 @@ dist
 .env.*.local
 *.log
 .DS_Store
+
+# Extension signing key (pins the extension ID — never commit or ship in the zip)
+extension-key.pem
+*.zip

@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "BestQ Recorder",
   "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvuKOh8EG3d7ZKAwNBn3dAA/mmOaGP702z41fVD4Ff3RXSbmZmTU+jvPsJlGp2CraJKRHynqGQqLsXKfg3lIAUjHAmXMPa7imlsf9foBEXncMiIHBAH6ZXzzBnP8ixa1ypWgot5YyWGd9V1NC6BD1SnD+4gAYPAsALwhfMMcZvfVzKiuzVlZ9LKcswLn8t4gg0pxSRxTYcHSQQODJ0wpGESphCSN/PIOyHCLpwV5Ck+g3eZk0cwqv6wzKn7iivRcTh6hL2ADCkQcK75Jb/jBJ/i7766rpfc9c4gstFD5dqvknumYwGp2C9TYoTH4XcYX2WDNfhu8vi+rdxnS7lF4r5QIDAQAB",
   "description": "Record your screen, capture bugs, and share instantly with BestQ",
   "permissions": [
     "storage",
