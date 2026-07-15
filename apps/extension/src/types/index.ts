@@ -159,6 +159,7 @@ export type MessageType =
   | 'ENSURE_TOOLBAR'
   | 'SHOW_COUNTDOWN'
   | 'UPDATE_TIMER'
+  | 'RECORDING_PAUSE_STATE'
   | 'GET_STATE'
   | 'STATE_RESPONSE'
   | 'OPEN_POPUP'

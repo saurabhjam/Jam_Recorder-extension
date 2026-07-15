@@ -5,6 +5,10 @@ import { formatDuration } from '@/utils';
 interface FloatingToolbarProps {
   recordingId: string;
   duration: number;
+  // Controlled by the content script (synced from the background), NOT local
+  // state: the toolbar can be remounted mid-recording (page wiped it, SW
+  // restart) and must come back showing the true pause state.
+  isPaused: boolean;
   onStop: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -12,8 +16,13 @@ interface FloatingToolbarProps {
   onAnnotate: (imageUrl: string) => void;
 }
 
-export function FloatingToolbar({ duration, onStop, onPause, onResume }: FloatingToolbarProps) {
-  const [isPaused, setIsPaused] = useState(false);
+export function FloatingToolbar({
+  duration,
+  isPaused,
+  onStop,
+  onPause,
+  onResume,
+}: FloatingToolbarProps) {
   const [isStopping, setIsStopping] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   // When hidden, the bar collapses to a small dot so it stays out of the recorded
@@ -24,7 +33,6 @@ export function FloatingToolbar({ duration, onStop, onPause, onResume }: Floatin
   const handlePauseResume = useCallback(() => {
     if (isPaused) onResume();
     else onPause();
-    setIsPaused((p) => !p);
   }, [isPaused, onPause, onResume]);
 
   const handleStop = useCallback(() => {

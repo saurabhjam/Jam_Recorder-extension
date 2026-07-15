@@ -428,8 +428,11 @@ function clearBadge(): void {
 
 // ─── Timer ────────────────────────────────────────────────────────────────────
 
+// Does NOT reset elapsedSeconds — it is also used to resume after a pause and
+// after a SW restore, where the accumulated time must be kept. Recording start
+// resets the counter explicitly.
 function startTimer(): void {
-  elapsedSeconds = 0;
+  if (timerInterval) return;
   timerInterval = setInterval(() => {
     elapsedSeconds++;
     broadcastToAll({ type: 'UPDATE_TIMER', payload: { duration: elapsedSeconds } });
@@ -975,6 +978,7 @@ async function handleStartRecording(
 
     setBadge('REC', '#ef4444');
     await injectFloatingToolbar();
+    elapsedSeconds = 0;
     startTimer();
 
     // Attach Chrome Debugger (CDP) + inject main-world capture script for
@@ -1161,6 +1165,7 @@ async function handlePauseRecording(): Promise<void> {
     isPaused = true;
     stopTimer();
     setBadge('||', '#f59e0b');
+    broadcastToAll({ type: 'RECORDING_PAUSE_STATE', payload: { isPaused: true } });
   } catch (err) {
     console.error('[Background] Pause error:', err);
   }
@@ -1173,6 +1178,7 @@ async function handleResumeRecording(): Promise<void> {
     isPaused = false;
     startTimer();
     setBadge('REC', '#ef4444');
+    broadcastToAll({ type: 'RECORDING_PAUSE_STATE', payload: { isPaused: false } });
   } catch (err) {
     console.error('[Background] Resume error:', err);
   }

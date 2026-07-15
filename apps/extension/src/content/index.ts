@@ -36,6 +36,9 @@ let screenshotPreviewContainer: HTMLElement | null = null;
 let screenshotPreviewRoot: Root | null = null;
 let currentDuration = 0;
 let isToolbarVisible = false;
+// True pause state, synced from the background (seeded on mount, updated via
+// RECORDING_PAUSE_STATE broadcasts) so a remounted toolbar shows the real state.
+let isRecordingPaused = false;
 let networkCaptures: CaptureNetworkEntry[] = [];
 let consoleLogs: CaptureConsoleLog[] = [];
 
@@ -210,6 +213,25 @@ function mountToolbar(recordingId: string): void {
   renderToolbar(recordingId);
   reparentToolbarForFullscreen();
   startToolbarGuard();
+  syncToolbarWithBackground(recordingId);
+}
+
+/** Seed timer + pause state from the background after a (re)mount, so the
+ *  toolbar never comes back at 0:00 / un-paused when the recording isn't. */
+function syncToolbarWithBackground(recordingId: string): void {
+  try {
+    chrome.runtime.sendMessage(
+      { type: 'GET_STATE' } satisfies ExtensionMessage,
+      (res: { isRecording?: boolean; isPaused?: boolean; elapsedSeconds?: number } | undefined) => {
+        if (chrome.runtime.lastError || !res?.isRecording) return;
+        isRecordingPaused = res.isPaused ?? false;
+        if (typeof res.elapsedSeconds === 'number') currentDuration = res.elapsedSeconds;
+        if (isToolbarVisible) renderToolbar(recordingId);
+      },
+    );
+  } catch {
+    /* background unreachable — next UPDATE_TIMER will correct the display */
+  }
 }
 
 function renderToolbar(recordingId: string): void {
@@ -219,13 +241,19 @@ function renderToolbar(recordingId: string): void {
     createElement(FloatingToolbar, {
       recordingId,
       duration: currentDuration,
+      isPaused: isRecordingPaused,
       onStop: () => {
         chrome.runtime.sendMessage({ type: 'STOP_RECORDING' } satisfies ExtensionMessage);
       },
       onPause: () => {
+        // Optimistic flip; the background's RECORDING_PAUSE_STATE broadcast confirms.
+        isRecordingPaused = true;
+        renderToolbar(recordingId);
         chrome.runtime.sendMessage({ type: 'PAUSE_RECORDING' } satisfies ExtensionMessage);
       },
       onResume: () => {
+        isRecordingPaused = false;
+        renderToolbar(recordingId);
         chrome.runtime.sendMessage({ type: 'RESUME_RECORDING' } satisfies ExtensionMessage);
       },
       onScreenshot: () => {
@@ -241,6 +269,7 @@ function renderToolbar(recordingId: string): void {
 function unmountToolbar(): void {
   stopToolbarGuard();
   lastToolbarRecordingId = '';
+  isRecordingPaused = false;
   if (toolbarRoot) {
     toolbarRoot.unmount();
     toolbarRoot = null;
@@ -544,6 +573,17 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         if (isToolbarVisible && toolbarRoot && toolbarContainer) {
           const recordingId = toolbarContainer.dataset['recordingId'] ?? '';
           renderToolbar(recordingId);
+        }
+      }
+      break;
+    }
+
+    case 'RECORDING_PAUSE_STATE': {
+      const payload = message.payload as { isPaused: boolean } | undefined;
+      if (payload) {
+        isRecordingPaused = payload.isPaused;
+        if (isToolbarVisible && toolbarRoot && toolbarContainer) {
+          renderToolbar(toolbarContainer.dataset['recordingId'] ?? '');
         }
       }
       break;
