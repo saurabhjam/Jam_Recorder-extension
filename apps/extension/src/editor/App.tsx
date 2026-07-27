@@ -19,6 +19,8 @@ import {
   FlaskConical,
   Tag,
   X,
+  Globe,
+  Clock,
 } from 'lucide-react';
 import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
 import { retryWithBackoff } from '@/utils';
@@ -75,16 +77,51 @@ interface AssignedProjectInfo {
   entryType: string;
 }
 
-type LogTab = 'console' | 'network' | 'info' | 'actions';
+type LogTab = 'console' | 'network' | 'info';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const EDITOR_DATA_KEY = 'st_editor_data';
 const PENDING_SHARE_KEY = 'st_pending_share';
+const SHARE_VISIBILITY_KEY = 'st_share_visibility';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const AUTH_USER_KEY = 'st_auth_user';
 const IDB_NAME = 'bestq-blobs';
 const IDB_STORE = 'recordings';
 const DESCRIPTION_MAX = 125;
+
+type Visibility = 'private' | 'public';
+
+interface ShareVisibilityState {
+  recordingId: string;
+  backendId: string;
+  project: string;
+  visibility: Visibility;
+  // epoch ms; null means "never expires" (only meaningful while visibility === 'public')
+  shareExpiresAt: number | null;
+  publicShareUrl: string | null;
+}
+
+/** Preset durations for the public-sharing dropdown. `minutes: 0` means never expires. */
+const SHARE_DURATION_PRESETS: Array<{ label: string; minutes: number }> = [
+  { label: '30 minutes', minutes: 30 },
+  { label: '6 hours', minutes: 6 * 60 },
+  { label: '7 days', minutes: 7 * 24 * 60 },
+  { label: '3 months', minutes: 90 * 24 * 60 },
+  { label: 'Always (no expiry)', minutes: 0 },
+];
+
+/** "2h 14m", "5d 3h", "Never" — for the remaining-time chip in the visibility popover. */
+function formatRemaining(expiresAt: number | null): string {
+  if (expiresAt === null) return 'Never expires';
+  const ms = expiresAt - Date.now();
+  if (ms <= 0) return 'Expired';
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return `Expires in ${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `Expires in ${hours}h ${mins % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `Expires in ${days}d ${hours % 24}h`;
+}
 
 function splitBlob(blob: Blob): Blob[] {
   const CHUNK_SIZE = 2 * 1024 * 1024;
@@ -283,6 +320,24 @@ export function EditorApp() {
   const [description, setDescription] = useState('');
   const [tags, setTags] = useState<string[]>([]);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
+  const [backendRecordId, setBackendRecordId] = useState<string | null>(null);
+  const [savedProject, setSavedProject] = useState<string | null>(null);
+  const [visibility, setVisibility] = useState<Visibility>('private');
+  const [shareExpiresAt, setShareExpiresAt] = useState<number | null>(null);
+  const [publicShareUrl, setPublicShareUrl] = useState<string | null>(null);
+  const [isVisibilityBusy, setIsVisibilityBusy] = useState(false);
+  const [visibilityError, setVisibilityError] = useState<string | null>(null);
+  // Set when the user picks "Public" before the recording has been saved (no
+  // recordId exists yet to attach a share token to). Materialized into a real
+  // token by the effect below as soon as backendRecordId becomes available.
+  const [pendingShareMinutes, setPendingShareMinutes] = useState<number | null>(null);
+  // Mirrors the record's persisted `isPublic` flag so we never issue a
+  // redundant PATCH: the record is CREATED with the right value (see handleSave),
+  // and patchRecordIsPublic only fires when the flag actually needs to change.
+  const recordIsPublicRef = useRef(false);
+  // Remote URL of the uploaded (already-trimmed) video file. Lets Download work
+  // after the local OPFS/IDB copy is reclaimed on upload — see handleDownload.
+  const [uploadedVideoUrl, setUploadedVideoUrl] = useState<string | null>(null);
   const [uploadPercent, setUploadPercent] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -311,6 +366,7 @@ export function EditorApp() {
       const result = await chrome.storage.local.get([
         EDITOR_DATA_KEY,
         PENDING_SHARE_KEY,
+        SHARE_VISIBILITY_KEY,
         AUTH_TOKENS_KEY,
         AUTH_USER_KEY,
       ]);
@@ -322,11 +378,26 @@ export function EditorApp() {
       }
 
       const pending = result[PENDING_SHARE_KEY] as
-        | { shareUrl: string; recordingId: string }
+        | { shareUrl: string; recordingId: string; videoUrl?: string }
         | undefined;
       if (pending?.shareUrl && (!recordingId || pending.recordingId === recordingId)) {
         setShareUrl(pending.shareUrl);
+        if (pending.videoUrl) setUploadedVideoUrl(pending.videoUrl);
         setUploadPercent(100);
+      }
+
+      const visState = result[SHARE_VISIBILITY_KEY] as ShareVisibilityState | undefined;
+      if (visState && visState.recordingId === recordingId) {
+        setBackendRecordId(visState.backendId);
+        setSavedProject(visState.project);
+        // Expiry is re-validated below by the dedicated effect too, but check here
+        // as well so a reload right after expiry doesn't briefly show stale "Public".
+        const stillActive =
+          visState.visibility === 'public' &&
+          (visState.shareExpiresAt === null || Date.now() < visState.shareExpiresAt);
+        setVisibility(stillActive ? 'public' : 'private');
+        setShareExpiresAt(stillActive ? visState.shareExpiresAt : null);
+        setPublicShareUrl(stillActive ? visState.publicShareUrl : null);
       }
 
       const tokens = result[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined;
@@ -405,14 +476,176 @@ export function EditorApp() {
     return () => chrome.runtime.onMessage.removeListener(listener);
   }, []);
 
+  // Flip the record's `isPublic` flag so it reflects the sharing state (the
+  // backend also uses it to allow anonymous GET of the record — see
+  // RecordController.getRecordById's anonymous path). Best-effort: the share
+  // token, not this flag, is what actually gates timed access, so a failed
+  // PATCH must not block the toggle.
+  const patchRecordIsPublic = useCallback(
+    async (isPublic: boolean) => {
+      if (!backendRecordId || !savedProject) return;
+      // Already in the desired state (e.g. the record was created public because
+      // the user chose "Public" before saving) — skip the redundant PATCH.
+      if (recordIsPublicRef.current === isPublic) return;
+      try {
+        const r = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
+        const token = (r[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)?.accessToken;
+        if (!token) return;
+        await fetch(`${API_BASE}/v1/${savedProject}/records/${backendRecordId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ isPublic }),
+        });
+        recordIsPublicRef.current = isPublic;
+      } catch {
+        /* non-fatal — sharing state is driven by the share token, not this flag */
+      }
+    },
+    [backendRecordId, savedProject],
+  );
+
+  // ── Auto-revert to Private once the share link's expiry passes ────────────
+  // The backend independently rejects an expired token on access, so this is
+  // purely cosmetic — it keeps the toggle/badge in this open tab honest without
+  // requiring a reload. Skipped entirely for "never expires" (shareExpiresAt null).
+  useEffect(() => {
+    if (visibility !== 'public' || shareExpiresAt === null) return;
+    const checkExpiry = () => {
+      if (Date.now() < shareExpiresAt) return;
+      setVisibility('private');
+      setShareExpiresAt(null);
+      setPublicShareUrl(null);
+      if (backendRecordId && savedProject) {
+        void chrome.storage.local.set({
+          [SHARE_VISIBILITY_KEY]: {
+            recordingId,
+            backendId: backendRecordId,
+            project: savedProject,
+            visibility: 'private',
+            shareExpiresAt: null,
+            publicShareUrl: null,
+          } satisfies ShareVisibilityState,
+        });
+        void patchRecordIsPublic(false);
+      }
+    };
+    checkExpiry();
+    const id = setInterval(checkExpiry, 15_000);
+    return () => clearInterval(id);
+  }, [visibility, shareExpiresAt, backendRecordId, savedProject, recordingId, patchRecordIsPublic]);
+
   const handleCopyLink = async () => {
-    if (!shareUrl) return;
-    await navigator.clipboard.writeText(shareUrl);
+    const linkToCopy = visibility === 'public' && publicShareUrl ? publicShareUrl : shareUrl;
+    if (!linkToCopy) return;
+    await navigator.clipboard.writeText(linkToCopy);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const handleOpenSignIn = () => chrome.runtime.sendMessage({ type: 'OPEN_POPUP' });
+
+  // Mints a time-scoped private share token for a record and returns the public
+  // share URL + expiry. Pure request helper — shared by handleSave (public save)
+  // and applyPublicVisibility (post-save toggle) so both produce the SAME link.
+  // `minutes: 0` requests a token that never expires.
+  const mintShareToken = useCallback(async (project: string, recordId: string, minutes: number) => {
+    const tokenResult = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
+    const token = (tokenResult[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)
+      ?.accessToken;
+    if (!token) throw new Error('Not authenticated — please sign in.');
+    const res = await fetch(`${API_BASE}/v1/${project}/records/${recordId}/share-tokens`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ expireInMinutes: minutes }),
+    });
+    if (!res.ok) throw new Error(`Failed to enable public sharing (${res.status})`);
+    const body = (await res.json()) as { shareToken: string; expiresAt: string | null };
+    const expiresAtMs = body.expiresAt ? new Date(body.expiresAt).getTime() : null;
+    // Build the share URL from RP_HOST (this build's configured portal host)
+    // rather than the server's `url` field. The server derives its URL from the
+    // incoming request, which — behind a proxy/LAN routing — comes out as an
+    // internal address like http://192.168.x.x:8080 that no external viewer can
+    // reach. RP_HOST is by definition reachable: the extension just successfully
+    // called the API at this same host to mint the token.
+    const url = `${RP_HOST}/ui/#/${project}/records/${recordId}?shareToken=${body.shareToken}`;
+    return { url, expiresAtMs };
+  }, []);
+
+  // Switches an ALREADY-SAVED recording to Public by minting a share token.
+  // (Pre-save "Public" is handled inline in handleSave so the copied link is
+  // correct immediately.) Returns the public URL, or null on failure.
+  const applyPublicVisibility = useCallback(
+    async (minutes: number): Promise<string | null> => {
+      if (!backendRecordId || !savedProject) return null;
+      setIsVisibilityBusy(true);
+      setVisibilityError(null);
+      try {
+        const { url, expiresAtMs } = await mintShareToken(savedProject, backendRecordId, minutes);
+        setVisibility('public');
+        setShareExpiresAt(expiresAtMs);
+        setPublicShareUrl(url);
+        await chrome.storage.local.set({
+          [SHARE_VISIBILITY_KEY]: {
+            recordingId,
+            backendId: backendRecordId,
+            project: savedProject,
+            visibility: 'public',
+            shareExpiresAt: expiresAtMs,
+            publicShareUrl: url,
+          } satisfies ShareVisibilityState,
+        });
+        await patchRecordIsPublic(true);
+        return url;
+      } catch (err) {
+        setVisibilityError(err instanceof Error ? err.message : 'Failed to update sharing');
+        return null;
+      } finally {
+        setIsVisibilityBusy(false);
+      }
+    },
+    [backendRecordId, savedProject, recordingId, patchRecordIsPublic, mintShareToken],
+  );
+
+  // Reverts the toggle to Private in this extension. NOTE: the backend has no
+  // token-revoke endpoint yet, so a link already generated/shared stays valid
+  // server-side until it naturally expires — this stops offering/copying it going
+  // forward, it does not retroactively kill an already-distributed link.
+  const setPrivateVisibility = useCallback(() => {
+    setVisibility('private');
+    setShareExpiresAt(null);
+    setPublicShareUrl(null);
+    setPendingShareMinutes(null);
+    if (backendRecordId && savedProject) {
+      void chrome.storage.local.set({
+        [SHARE_VISIBILITY_KEY]: {
+          recordingId,
+          backendId: backendRecordId,
+          project: savedProject,
+          visibility: 'private',
+          shareExpiresAt: null,
+          publicShareUrl: null,
+        } satisfies ShareVisibilityState,
+      });
+      void patchRecordIsPublic(false);
+    }
+  }, [backendRecordId, savedProject, recordingId, patchRecordIsPublic]);
+
+  // Entry point the dropdown calls when the user picks a duration. The recording
+  // may not be saved yet — the share-tokens API needs a real recordId, which
+  // doesn't exist pre-save — so this either applies immediately (already saved)
+  // or just remembers the choice for the effect below to apply right after save.
+  const choosePublicVisibility = useCallback(
+    (minutes: number) => {
+      setVisibilityError(null);
+      if (backendRecordId && savedProject) {
+        void applyPublicVisibility(minutes);
+      } else {
+        setVisibility('public');
+        setPendingShareMinutes(minutes);
+      }
+    },
+    [backendRecordId, savedProject, applyPublicVisibility],
+  );
 
   // Re-fetch the user's assigned projects from the API (called when the project
   // dropdown opens) so newly-granted projects show up without signing in again.
@@ -508,13 +741,16 @@ export function EditorApp() {
     [recordingId, videoDuration, data, trimStart, trimEnd],
   );
 
-  const handleSave = useCallback(async () => {
-    if (!data || !recordingId || isSaving || shareUrl) return;
+  // Returns the record's share URL on success (so callers like "Save & Copy
+  // Link" can copy it immediately), or null if the save was skipped/failed.
+  const handleSave = useCallback(async (): Promise<string | null> => {
+    if (!data || !recordingId || isSaving) return shareUrl;
+    if (shareUrl) return shareUrl;
 
     // Check if a project is selected
     if (!selectedProjectName) {
       setUploadError('Please select a project to save your recording');
-      return;
+      return null;
     }
 
     setIsSaving(true);
@@ -675,7 +911,13 @@ export function EditorApp() {
         }
       }
 
-      // Step 5: create record with all fields
+      // Step 5: create record with all fields.
+      // If the user already flipped the toggle to Public before saving, create
+      // the record public in this ONE call — avoids a second PATCH /records/{id}
+      // round-trip afterward (the share token is still minted separately, since
+      // file access requires it).
+      const createPublic = visibility === 'public';
+      recordIsPublicRef.current = createPublic;
       setUploadPercent(92);
       const videoUrl = `${API_BASE}/v1/${project}/files/${videoFileName}`;
       const createRes = await fetch(`${API_BASE}/v1/${project}/records`, {
@@ -691,7 +933,7 @@ export function EditorApp() {
           userId,
           projectId: projectId !== null ? String(projectId) : '1',
           shareId,
-          isPublic: false,
+          isPublic: createPublic,
           allowDownload: true,
           viewCount: 0,
           url: videoUrl,
@@ -720,17 +962,52 @@ export function EditorApp() {
       const createBody = (await createRes.json()) as { id: string };
       const backendId = createBody.id;
 
-      // Step 6: open RP UI record page
+      // Step 6: build the share link. The base record URL is always set; if the
+      // user chose Public before saving, mint the share token now (inline) so the
+      // link we return/copy is the SAME token URL the bottom "Copy Link" uses —
+      // no async gap where the plain URL would be copied by mistake.
       const newShareUrl = `${RP_HOST}/ui/#/${project}/records/${backendId}`;
+      let finalLink = newShareUrl;
+      let publicUrl: string | null = null;
+      let publicExpiresAt: number | null = null;
+      if (createPublic) {
+        try {
+          const minted = await mintShareToken(project, backendId, pendingShareMinutes ?? 0);
+          publicUrl = minted.url;
+          publicExpiresAt = minted.expiresAtMs;
+          finalLink = minted.url;
+        } catch {
+          /* token mint failed — record is still public; fall back to base URL */
+        }
+      }
       setShareUrl(newShareUrl);
+      setBackendRecordId(backendId);
+      setSavedProject(project);
+      setUploadedVideoUrl(videoUrl);
+      setPendingShareMinutes(null);
+      if (publicUrl) {
+        setVisibility('public');
+        setShareExpiresAt(publicExpiresAt);
+        setPublicShareUrl(publicUrl);
+      }
       setUploadPercent(100);
       await chrome.storage.local.set({
-        [PENDING_SHARE_KEY]: { shareUrl: newShareUrl, recordingId: backendId },
+        [PENDING_SHARE_KEY]: { shareUrl: newShareUrl, recordingId: backendId, videoUrl },
+        [SHARE_VISIBILITY_KEY]: {
+          recordingId,
+          backendId,
+          project,
+          visibility: publicUrl ? 'public' : 'private',
+          shareExpiresAt: publicExpiresAt,
+          publicShareUrl: publicUrl,
+        } satisfies ShareVisibilityState,
       });
       // Uploaded successfully — reclaim the local disk copy (OPFS/IDB).
       void deleteRecordingBlob(recordingId);
+      return finalLink;
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : 'Upload failed');
+      return null;
     } finally {
       setIsSaving(false);
       setSaveStage('idle');
@@ -749,7 +1026,29 @@ export function EditorApp() {
     trimEnd,
     videoDuration,
     tags,
+    description,
+    visibility,
+    pendingShareMinutes,
+    mintShareToken,
   ]);
+
+  // Header "Save & Copy Link": saves the recording first if it isn't saved yet,
+  // then copies the resulting link — one click does both.
+  const handleSaveAndCopyLink = useCallback(async () => {
+    if (isSaving) return;
+    let link = visibility === 'public' && publicShareUrl ? publicShareUrl : shareUrl;
+    if (!link) {
+      link = await handleSave();
+      if (!link) return; // save skipped or failed (e.g. no project selected)
+    }
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard blocked — the record is still saved */
+    }
+  }, [isSaving, visibility, publicShareUrl, shareUrl, handleSave]);
 
   // Download the recording locally (applies the trim) without uploading — for
   // users who just want the file. Works whether or not they're signed in.
@@ -757,20 +1056,39 @@ export function EditorApp() {
     if (!recordingId || isDownloading || isSaving) return;
     setIsDownloading(true);
     setUploadError(null);
+    const safeTitle = (title || data?.title || 'recording')
+      .replace(/[^a-z0-9-_ ]/gi, '')
+      .trim()
+      .replace(/\s+/g, '-')
+      .slice(0, 60);
+    const fileName = `${safeTitle || 'recording'}.webm`;
     try {
-      const blob = await getExportBlob();
-      const safeTitle = (title || data?.title || 'recording')
-        .replace(/[^a-z0-9-_ ]/gi, '')
-        .trim()
-        .replace(/\s+/g, '-')
-        .slice(0, 60);
-      downloadBlob(blob, `${safeTitle || 'recording'}.webm`);
+      // Prefer the local copy (applies the current trim). Once a recording is
+      // uploaded its local blob is reclaimed, so fall back to fetching the
+      // already-uploaded (already-trimmed) file from the server.
+      let blob: Blob | null = null;
+      try {
+        blob = await getExportBlob();
+      } catch {
+        blob = null;
+      }
+      if (!blob && uploadedVideoUrl) {
+        const r = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
+        const token = (r[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)?.accessToken;
+        const res = await fetch(uploadedVideoUrl, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) throw new Error(`Could not fetch uploaded video (${res.status})`);
+        blob = await res.blob();
+      }
+      if (!blob) throw new Error('Recording not found');
+      downloadBlob(blob, fileName);
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : 'Download failed');
     } finally {
       setIsDownloading(false);
     }
-  }, [recordingId, isDownloading, isSaving, getExportBlob, title, data]);
+  }, [recordingId, isDownloading, isSaving, getExportBlob, title, data, uploadedVideoUrl]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -788,7 +1106,6 @@ export function EditorApp() {
     v.currentTime = fraction * v.duration;
   }, []);
 
-  const canCopy = !!shareUrl;
   const totalDur = videoDuration || (data?.duration ?? 0);
 
   return (
@@ -889,31 +1206,55 @@ export function EditorApp() {
           disabled={!!shareUrl || isSaving}
         />
 
-        <motion.button
-          whileTap={{ scale: 0.96 }}
-          onClick={() => void handleCopyLink()}
-          disabled={!canCopy}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px',
-            padding: '8px 18px',
-            borderRadius: '10px',
-            background: canCopy
-              ? 'linear-gradient(135deg,#8b5cf6,#7c3aed)'
-              : 'rgba(139,92,246,0.2)',
-            border: canCopy ? 'none' : '1px solid rgba(139,92,246,0.3)',
-            color: canCopy ? 'white' : 'rgba(139,92,246,0.6)',
-            fontSize: '13px',
-            fontWeight: 700,
-            cursor: canCopy ? 'pointer' : 'not-allowed',
-            boxShadow: canCopy ? '0 4px 20px rgba(139,92,246,0.35)' : 'none',
-            transition: 'all 0.2s',
-          }}
-        >
-          {copied ? <Check size={14} /> : <Link2 size={14} />}
-          {copied ? 'Copied!' : 'Save & Copy Link'}
-        </motion.button>
+        <VisibilityControl
+          isSaved={!!backendRecordId}
+          visibility={visibility}
+          shareExpiresAt={shareExpiresAt}
+          isBusy={isVisibilityBusy}
+          error={visibilityError}
+          onSetPublic={choosePublicVisibility}
+          onSetPrivate={setPrivateVisibility}
+        />
+
+        {(() => {
+          // Enabled once signed in with a recording loaded — clicking saves (if
+          // needed) then copies. Only disabled while a save is mid-flight or the
+          // user isn't signed in / the recording hasn't loaded yet.
+          const canSaveCopy = isAuthenticated && !!data && !isSaving;
+          return (
+            <motion.button
+              whileTap={{ scale: 0.96 }}
+              onClick={() => void handleSaveAndCopyLink()}
+              disabled={!canSaveCopy}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '8px 18px',
+                borderRadius: '10px',
+                background: canSaveCopy
+                  ? 'linear-gradient(135deg,#8b5cf6,#7c3aed)'
+                  : 'rgba(139,92,246,0.2)',
+                border: canSaveCopy ? 'none' : '1px solid rgba(139,92,246,0.3)',
+                color: canSaveCopy ? 'white' : 'rgba(139,92,246,0.6)',
+                fontSize: '13px',
+                fontWeight: 700,
+                cursor: canSaveCopy ? 'pointer' : 'not-allowed',
+                boxShadow: canSaveCopy ? '0 4px 20px rgba(139,92,246,0.35)' : 'none',
+                transition: 'all 0.2s',
+              }}
+            >
+              {copied ? <Check size={14} /> : <Link2 size={14} />}
+              {copied
+                ? 'Copied!'
+                : isSaving
+                  ? 'Saving…'
+                  : shareUrl
+                    ? 'Copy Link'
+                    : 'Save & Copy Link'}
+            </motion.button>
+          );
+        })()}
       </div>
 
       {/* ── Body ── */}
@@ -1261,7 +1602,7 @@ export function EditorApp() {
               padding: '0 4px',
             }}
           >
-            {(['console', 'network', 'info', 'actions'] as LogTab[]).map((tab) => {
+            {(['console', 'network', 'info'] as LogTab[]).map((tab) => {
               const count =
                 tab === 'console'
                   ? (data?.consoleLogs?.length ?? 0)
@@ -1384,17 +1725,6 @@ export function EditorApp() {
                     label="Network requests"
                     value={String(data?.networkCaptures?.length ?? 0)}
                   />
-                </motion.div>
-              )}
-              {activeTab === 'actions' && (
-                <motion.div
-                  key="actions"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.12 }}
-                >
-                  <EmptyLogs label="No actions recorded" />
                 </motion.div>
               )}
             </AnimatePresence>
@@ -2047,6 +2377,324 @@ function TrimBar({
 
       {/* Spacer for time labels */}
       <div style={{ height: '8px' }} />
+    </div>
+  );
+}
+
+// ─── Visibility Control (Private / Public share toggle) ───────────────────────
+
+function VisibilityControl({
+  isSaved,
+  visibility,
+  shareExpiresAt,
+  isBusy,
+  error,
+  onSetPublic,
+  onSetPrivate,
+}: {
+  // Whether the recording has a backend recordId yet. The control is always
+  // clickable either way — a pre-save "Public" choice is just remembered and
+  // applied automatically the moment the save completes (see
+  // choosePublicVisibility / the materialize effect in EditorApp).
+  isSaved: boolean;
+  visibility: Visibility;
+  shareExpiresAt: number | null;
+  isBusy: boolean;
+  error: string | null;
+  onSetPublic: (minutes: number) => void;
+  onSetPrivate: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [showCustom, setShowCustom] = useState(false);
+  const [customValue, setCustomValue] = useState('');
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+        setShowCustom(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  const isPublic = visibility === 'public';
+
+  const applyCustom = () => {
+    if (!customValue) return;
+    const target = new Date(customValue).getTime();
+    const minutes = Math.ceil((target - Date.now()) / 60000);
+    if (!Number.isFinite(minutes) || minutes < 1) return;
+    onSetPublic(minutes);
+    setOpen(false);
+    setShowCustom(false);
+  };
+
+  // datetime-local min= needs local time with no seconds/zone, e.g. "2026-07-23T14:30"
+  const nowLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 16);
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '7px',
+          padding: '8px 14px',
+          borderRadius: '10px',
+          background: isPublic ? 'rgba(245,158,11,0.12)' : '#111118',
+          border: `1px solid ${isPublic ? 'rgba(245,158,11,0.4)' : 'rgba(255,255,255,0.1)'}`,
+          color: isPublic ? '#fbbf24' : 'rgba(203,213,225,0.8)',
+          fontSize: '13px',
+          fontWeight: 600,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+          transition: 'all 0.15s',
+        }}
+      >
+        {isPublic ? <Globe size={14} /> : <Lock size={14} />}
+        {isPublic ? 'Public' : 'Private'}
+        <ChevronDown
+          size={13}
+          style={{
+            color: 'inherit',
+            opacity: 0.6,
+            transform: open ? 'rotate(180deg)' : 'none',
+            transition: 'transform 0.15s',
+          }}
+        />
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.12 }}
+            style={{
+              position: 'absolute',
+              top: 'calc(100% + 6px)',
+              right: 0,
+              width: '260px',
+              background: '#14141c',
+              border: '1px solid rgba(255,255,255,0.1)',
+              borderRadius: '12px',
+              boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+              zIndex: 50,
+              padding: '10px',
+            }}
+          >
+            {/* Current status */}
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '6px 8px 10px',
+                fontSize: '11px',
+                color: isPublic ? '#fbbf24' : 'rgba(148,163,184,0.6)',
+                fontWeight: 600,
+              }}
+            >
+              <Clock size={11} />
+              {!isSaved
+                ? isPublic
+                  ? 'Public link will be created once you save'
+                  : 'Save the recording to enable sharing'
+                : isPublic
+                  ? formatRemaining(shareExpiresAt)
+                  : 'Only people with project access can view'}
+            </div>
+
+            {/* Private option */}
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={() => {
+                onSetPrivate();
+                setOpen(false);
+                setShowCustom(false);
+              }}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '8px 10px',
+                borderRadius: '8px',
+                background: !isPublic ? 'rgba(139,92,246,0.18)' : 'transparent',
+                border: 'none',
+                color: !isPublic ? '#c4b5fd' : 'rgba(203,213,225,0.85)',
+                fontSize: '13px',
+                fontWeight: 600,
+                cursor: isBusy ? 'default' : 'pointer',
+                textAlign: 'left',
+                fontFamily: 'inherit',
+              }}
+            >
+              <Lock size={14} />
+              Private
+            </button>
+
+            <div
+              style={{
+                margin: '8px 4px 6px',
+                fontSize: '10px',
+                fontWeight: 700,
+                color: 'rgba(148,163,184,0.45)',
+                textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+              }}
+            >
+              Make public for
+            </div>
+
+            {SHARE_DURATION_PRESETS.map((preset) => (
+              <button
+                key={preset.label}
+                type="button"
+                disabled={isBusy}
+                onClick={() => {
+                  onSetPublic(preset.minutes);
+                  setOpen(false);
+                  setShowCustom(false);
+                }}
+                style={{
+                  width: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'rgba(203,213,225,0.85)',
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  cursor: isBusy ? 'default' : 'pointer',
+                  textAlign: 'left',
+                  fontFamily: 'inherit',
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'transparent';
+                }}
+              >
+                <Globe size={14} style={{ color: '#fbbf24' }} />
+                {preset.label}
+              </button>
+            ))}
+
+            {/* Custom date & time */}
+            <button
+              type="button"
+              disabled={isBusy}
+              onClick={() => setShowCustom((v) => !v)}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '8px 10px',
+                borderRadius: '8px',
+                background: showCustom ? 'rgba(255,255,255,0.05)' : 'transparent',
+                border: 'none',
+                color: 'rgba(203,213,225,0.85)',
+                fontSize: '13px',
+                fontWeight: 600,
+                cursor: isBusy ? 'default' : 'pointer',
+                textAlign: 'left',
+                fontFamily: 'inherit',
+              }}
+            >
+              <Globe size={14} style={{ color: '#fbbf24' }} />
+              Custom date &amp; time…
+            </button>
+
+            {showCustom && (
+              <div
+                style={{
+                  padding: '8px 10px 4px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                }}
+              >
+                <input
+                  type="datetime-local"
+                  value={customValue}
+                  min={nowLocal}
+                  onChange={(e) => setCustomValue(e.target.value)}
+                  style={{
+                    padding: '7px 9px',
+                    borderRadius: '8px',
+                    background: '#0d0d14',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    color: 'white',
+                    fontSize: '12px',
+                    fontFamily: 'inherit',
+                    colorScheme: 'dark',
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={isBusy || !customValue}
+                  onClick={applyCustom}
+                  style={{
+                    padding: '7px',
+                    borderRadius: '8px',
+                    background: 'linear-gradient(135deg,#8b5cf6,#7c3aed)',
+                    border: 'none',
+                    color: 'white',
+                    fontSize: '12px',
+                    fontWeight: 700,
+                    cursor: !customValue || isBusy ? 'not-allowed' : 'pointer',
+                    opacity: !customValue || isBusy ? 0.5 : 1,
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  Set expiry
+                </button>
+              </div>
+            )}
+
+            {error && (
+              <div
+                style={{
+                  margin: '8px 4px 2px',
+                  fontSize: '11px',
+                  color: '#f87171',
+                  lineHeight: 1.4,
+                }}
+              >
+                {error}
+              </div>
+            )}
+
+            <div
+              style={{
+                margin: '10px 4px 2px',
+                fontSize: '10px',
+                color: 'rgba(148,163,184,0.4)',
+                lineHeight: 1.4,
+              }}
+            >
+              Links already shared stay accessible until they individually expire, even after
+              switching back to Private.
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
