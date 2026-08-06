@@ -18,6 +18,7 @@ import {
   X,
   Bug,
   Upload,
+  Library,
 } from 'lucide-react';
 import { useAuthStore } from '@/store/auth.store';
 import { useRecordingStore } from '@/store/recording.store';
@@ -322,12 +323,21 @@ export function HomeView({ onNavigate }: HomeViewProps) {
           </div>
         </div>
 
-        <button
-          onClick={() => onNavigate('settings')}
-          className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
-        >
-          <Settings size={15} />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => onNavigate('library')}
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
+            title="My Recordings & Drafts"
+          >
+            <Library size={15} />
+          </button>
+          <button
+            onClick={() => onNavigate('settings')}
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
+          >
+            <Settings size={15} />
+          </button>
+        </div>
       </motion.div>
 
       {/* ─── Tab Bar ─── */}

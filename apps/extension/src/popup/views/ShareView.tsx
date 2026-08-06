@@ -20,6 +20,7 @@ import { Button } from '@/components/ui/Button';
 import { InstanceBadge } from '@/components/ui/InstanceBadge';
 import { recordingsApi } from '@/services/api';
 import { formatDuration } from '@/utils';
+import { useAuthedThumbnail } from '../useAuthedThumbnail';
 import type { Recording } from '@/types';
 
 interface ShareViewProps {
@@ -39,6 +40,7 @@ export function ShareView({ onRecordAnother }: ShareViewProps) {
   const { showToast } = useToast();
 
   const [recording, setRecording] = useState<Recording | null>(null);
+  const thumbnailSrc = useAuthedThumbnail(recording?.thumbnailUrl);
   const [title, setTitle] = useState('');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [isSavingTitle, setIsSavingTitle] = useState(false);
@@ -129,10 +131,10 @@ export function ShareView({ onRecordAnother }: ShareViewProps) {
         >
           {isFetchingMeta ? (
             <Loader2 size={24} className="text-dark-500 animate-spin" />
-          ) : recording?.thumbnailUrl ? (
+          ) : thumbnailSrc ? (
             <>
               <img
-                src={recording.thumbnailUrl}
+                src={thumbnailSrc}
                 alt={recording.title}
                 className="w-full h-full object-cover"
               />

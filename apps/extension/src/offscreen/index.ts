@@ -18,7 +18,8 @@
 
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
-import { generateId, retryWithBackoff, sleep } from '@/utils';
+import { generateId, sleep, uploadBlobChunked } from '@/utils';
+import { recordingOpfsName, saveBlobToIDB } from '@/utils/blobStorage';
 import { RP_HOST, API_BASE_URL as REPORTS_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -168,11 +169,6 @@ function getSupportedMimeType(): string {
 // and shared across extension pages, so the editor can read it back without ever
 // holding the whole recording in RAM. Falls back to in-memory if OPFS is
 // unavailable (recording still works, just bounded by memory as before).
-
-/** OPFS filename for a recording's raw blob. Shared with the editor's reader. */
-export function recordingOpfsName(recordingId: string): string {
-  return `recording-${recordingId}.webm`;
-}
 
 interface RecordingSink {
   /** Storage backing — the editor decides whether to also fall back to IDB. */
@@ -818,36 +814,6 @@ async function takeScreenshot(streamId: string): Promise<void> {
 
 // ─── Upload (runs entirely in offscreen — no blob transfer needed) ─────────────
 
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB
-
-// ─── IndexedDB Blob Storage ────────────────────────────────────────────────────
-// Stores the raw recording blob so the editor window can load it for playback.
-// All extension pages share the same IDB origin.
-
-const IDB_NAME = 'bestq-blobs';
-const IDB_STORE = 'recordings';
-
-function openRecordingIDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => {
-      req.result.createObjectStore(IDB_STORE);
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function saveBlobToIDB(id: string, blob: Blob): Promise<void> {
-  const db = await openRecordingIDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, 'readwrite');
-    tx.objectStore(IDB_STORE).put(blob, id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
 interface UploadMetadata {
   title: string;
   /** User-provided description; capped at 125 chars before upload. */
@@ -878,24 +844,18 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
   let recordingId = '';
 
   try {
-    // Upload blob as a single file → get MinIO filename
-    const ext = metadata.mimeType.startsWith('image/') ? 'png' : 'webm';
-    const file = new File([blob], `${metadata.type}-${ts}.${ext}`, {
-      type: metadata.mimeType.split(';')[0],
-    });
-    const formData = new FormData();
-    formData.append('file', file);
-
-    const uploadRes = await retryWithBackoff(async () => {
-      const res = await fetch(`${REPORTS_URL}/v1/${project}/files/upload`, {
-        method: 'POST',
-        headers: { ...authHeaders(token), Accept: 'text/plain, application/json, */*' },
-        body: formData,
-      });
-      if (!res.ok) throw new Error(`File upload failed: ${res.status}`);
-      return (await res.text()).trim();
-    }, 3);
-    fileName = uploadRes;
+    // Upload blob in chunks → get MinIO filename. A dropped connection or a
+    // transient 500 only costs the current ~8MB chunk, not the whole
+    // recording — important here since this path also replays queued
+    // uploads that can be full-length videos, not just screenshots.
+    fileName = await uploadBlobChunked(
+      REPORTS_URL,
+      project,
+      token,
+      blob,
+      metadata.mimeType.split(';')[0],
+      () => {},
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Upload failed';
     sendToBackground('OFFSCREEN_ERROR', { error: msg });
@@ -959,18 +919,6 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
     const msg = err instanceof Error ? err.message : 'Create record failed';
     sendToBackground('OFFSCREEN_ERROR', { error: msg });
   }
-}
-
-// ─── Blob Utilities ───────────────────────────────────────────────────────────
-
-function splitBlob(blob: Blob): Blob[] {
-  const result: Blob[] = [];
-  let offset = 0;
-  while (offset < blob.size) {
-    result.push(blob.slice(offset, offset + CHUNK_SIZE, blob.type));
-    offset += CHUNK_SIZE;
-  }
-  return result;
 }
 
 // ─── Offline Queue ────────────────────────────────────────────────────────────

@@ -22,8 +22,12 @@ import type {
   CaptureConsoleLog,
   CaptureNetworkEntry,
   CaptureData,
+  DraftRecording,
 } from '@/types';
 import { STORAGE_KEYS } from '@/types';
+
+/** Drafts list is capped at this many entries; older ones are evicted. */
+const MAX_DRAFTS = 5;
 import { generateId, isRestrictedUrl } from '@/utils';
 import { RP_HOST, API_BASE_URL, RP_LOGIN_URL } from '@/config';
 
@@ -1752,6 +1756,34 @@ chrome.runtime.onMessage.addListener(
   },
 );
 
+// ─── Drafts index ───────────────────────────────────────────────────────────
+// Registers a finished recording in the Drafts list as soon as it's ready —
+// independent of whether the editor window ever successfully opens/loads.
+// Only chrome.storage.local is touched here (no OPFS/IDB access from a service
+// worker); blobs evicted past the 5-slot cap are queued for a DOM-context page
+// (editor or popup) to actually delete.
+
+async function registerDraft(entry: DraftRecording): Promise<void> {
+  const result = await chrome.storage.local.get([
+    STORAGE_KEYS.DRAFTS_INDEX,
+    STORAGE_KEYS.PENDING_BLOB_CLEANUP,
+  ]);
+  const existing = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
+  const deduped = existing.filter((d) => d.recordingId !== entry.recordingId);
+  const next = [entry, ...deduped];
+
+  const kept = next.slice(0, MAX_DRAFTS);
+  const evicted = next.slice(MAX_DRAFTS);
+
+  const update: Record<string, unknown> = { [STORAGE_KEYS.DRAFTS_INDEX]: kept };
+  if (evicted.length > 0) {
+    const cleanup = (result[STORAGE_KEYS.PENDING_BLOB_CLEANUP] as string[] | undefined) ?? [];
+    const evictedIds = evicted.map((d) => d.recordingId);
+    update[STORAGE_KEYS.PENDING_BLOB_CLEANUP] = [...new Set([...cleanup, ...evictedIds])];
+  }
+  await chrome.storage.local.set(update);
+}
+
 // ─── Offscreen → Background Message Handler ───────────────────────────────────
 
 function handleOffscreenMessage(message: ExtensionMessage & { target?: string }): void {
@@ -1794,6 +1826,16 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
               consoleLogs: capture.consoleLogs,
               networkCaptures: capture.networkCaptures,
             },
+          });
+          await registerDraft({
+            recordingId: editorRecordingId,
+            title: readyTitle ?? `Recording ${new Date().toLocaleString()}`,
+            thumbnailDataUrl: thumbnailDataUrl ?? null,
+            duration,
+            blobSize,
+            recordingType: readyRecordingType ?? currentRecordingOptions?.type ?? 'screen',
+            createdAt: Date.now(),
+            status: 'draft',
           });
           await chrome.windows.create({
             url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),
@@ -2202,8 +2244,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ─── Tab Cleanup ──────────────────────────────────────────────────────────────
 
-chrome.tabs.onRemoved.addListener(async () => {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (!isRecordingActive) return;
+  if (currentRecordingTabId !== tabId) return;
   const result = await chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]);
   const state = result[STORAGE_KEYS.RECORDING_STATE] as { options?: RecordingOptions } | undefined;
   if (state?.options?.type === 'tab') {

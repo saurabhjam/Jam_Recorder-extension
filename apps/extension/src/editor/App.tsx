@@ -23,7 +23,9 @@ import {
   Clock,
 } from 'lucide-react';
 import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
-import { retryWithBackoff } from '@/utils';
+import { uploadBlobChunked } from '@/utils';
+import { loadRecordingBlob, deleteRecordingBlob } from '@/utils/blobStorage';
+import { STORAGE_KEYS, type DraftRecording } from '@/types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -85,8 +87,6 @@ const PENDING_SHARE_KEY = 'st_pending_share';
 const SHARE_VISIBILITY_KEY = 'st_share_visibility';
 const AUTH_TOKENS_KEY = 'st_auth_tokens';
 const AUTH_USER_KEY = 'st_auth_user';
-const IDB_NAME = 'bestq-blobs';
-const IDB_STORE = 'recordings';
 const DESCRIPTION_MAX = 125;
 
 type Visibility = 'private' | 'public';
@@ -121,88 +121,6 @@ function formatRemaining(expiresAt: number | null): string {
   if (hours < 24) return `Expires in ${hours}h ${mins % 60}m`;
   const days = Math.floor(hours / 24);
   return `Expires in ${days}d ${hours % 24}h`;
-}
-
-function splitBlob(blob: Blob): Blob[] {
-  const CHUNK_SIZE = 2 * 1024 * 1024;
-  const parts: Blob[] = [];
-  for (let offset = 0; offset < blob.size; offset += CHUNK_SIZE) {
-    parts.push(blob.slice(offset, offset + CHUNK_SIZE));
-  }
-  return parts;
-}
-
-// ─── IDB helpers ─────────────────────────────────────────────────────────────
-
-function openRecordingIDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => {
-      req.result.createObjectStore(IDB_STORE);
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function loadBlobFromIDB(id: string): Promise<Blob | null> {
-  try {
-    const db = await openRecordingIDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(IDB_STORE, 'readonly');
-      const req = tx.objectStore(IDB_STORE).get(id);
-      req.onsuccess = () => resolve((req.result as Blob | undefined) ?? null);
-      req.onerror = () => reject(req.error);
-    });
-  } catch {
-    return null;
-  }
-}
-
-/** Filename the offscreen recorder streams the raw blob to in OPFS. */
-function recordingOpfsName(id: string): string {
-  return `recording-${id}.webm`;
-}
-
-/** Read the recording from OPFS (disk-backed; where long recordings now live). */
-async function loadBlobFromOPFS(id: string): Promise<Blob | null> {
-  try {
-    const root = await navigator.storage.getDirectory();
-    const handle = await root.getFileHandle(recordingOpfsName(id));
-    const file = await handle.getFile();
-    return file.size > 0 ? file : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Load a recording's blob, preferring the OPFS file the recorder streams to,
- * falling back to the in-memory→IDB path for older/small recordings.
- */
-async function loadRecordingBlob(id: string): Promise<Blob | null> {
-  return (await loadBlobFromOPFS(id)) ?? (await loadBlobFromIDB(id));
-}
-
-/** Free the recording's local copy once it's safely uploaded. */
-async function deleteRecordingBlob(id: string): Promise<void> {
-  try {
-    const root = await navigator.storage.getDirectory();
-    await root.removeEntry(recordingOpfsName(id));
-  } catch {
-    /* not in OPFS */
-  }
-  try {
-    const db = await openRecordingIDB();
-    await new Promise<void>((resolve) => {
-      const tx = db.transaction(IDB_STORE, 'readwrite');
-      tx.objectStore(IDB_STORE).delete(id);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
-  } catch {
-    /* ignore */
-  }
 }
 
 /**
@@ -276,6 +194,23 @@ async function trimVideoBlob(
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * Flip a Drafts-list entry from `status: 'draft'` to `'saved'` once the editor
+ * has successfully uploaded it. The entry is kept (not removed) so it still
+ * shows in Drafts, now with Download/Copy Link instead of Save/Download.
+ */
+async function promoteDraftToSaved(
+  recordingId: string,
+  saved: Pick<DraftRecording, 'title' | 'backendRecordId' | 'shareUrl' | 'videoUrl'>,
+): Promise<void> {
+  const result = await chrome.storage.local.get([STORAGE_KEYS.DRAFTS_INDEX]);
+  const drafts = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
+  const next = drafts.map((d) =>
+    d.recordingId === recordingId ? { ...d, ...saved, status: 'saved' as const } : d,
+  );
+  await chrome.storage.local.set({ [STORAGE_KEYS.DRAFTS_INDEX]: next });
 }
 
 /** Trigger a browser download of a blob under the given filename. */
@@ -359,6 +294,11 @@ export function EditorApp() {
     AssignedProjectInfo
   > | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  // A thumbnail captured from the <video> in-editor, used when the recording has
+  // none of its own — e.g. a video the user uploaded from local disk (which
+  // arrives with thumbnailDataUrl: null). Captured once on first load.
+  const [derivedThumbnail, setDerivedThumbnail] = useState<string | null>(null);
+  const thumbCaptureStartedRef = useRef(false);
 
   // ── Load editor data + blob from IDB ───────────────────────────────────────
   useEffect(() => {
@@ -429,6 +369,19 @@ export function EditorApp() {
     };
     void load();
   }, [recordingId]);
+
+  // ── Drain any drafts evicted from the 5-slot Drafts list before we got here —
+  // their local blob is still sitting in OPFS/IDB until someone with DOM access
+  // (this editor, or the popup) actually deletes it.
+  useEffect(() => {
+    void (async () => {
+      const result = await chrome.storage.local.get([STORAGE_KEYS.PENDING_BLOB_CLEANUP]);
+      const pending = (result[STORAGE_KEYS.PENDING_BLOB_CLEANUP] as string[] | undefined) ?? [];
+      if (pending.length === 0) return;
+      await Promise.all(pending.map((id) => deleteRecordingBlob(id)));
+      await chrome.storage.local.set({ [STORAGE_KEYS.PENDING_BLOB_CLEANUP]: [] });
+    })();
+  }, []);
 
   // ── Poll storage for data (editor opens before storage write in some cases) ─
   useEffect(() => {
@@ -677,52 +630,28 @@ export function EditorApp() {
   }, []);
 
   // Upload just the video file (the big, slow part) and return the MinIO
-  // filename the server assigns. Retried with backoff; a 4xx fails fast.
+  // filename the server assigns. Uploaded in ~8MB chunks (see
+  // uploadBlobChunked) so a dropped connection or a transient 500 only costs
+  // the current chunk — not a full restart of a multi-hour recording — and
+  // progress only ever moves forward.
   const uploadVideoFile = useCallback(
-    (project: string, token: string, blob: Blob, onPct: (p: number) => void): Promise<string> =>
-      retryWithBackoff(
-        () =>
-          new Promise<string>((resolve, reject) => {
-            const videoFile = new File([blob], `recording-${Date.now()}.webm`, {
-              type: (blob.type || 'video/webm').split(';')[0],
-            });
-            const formData = new FormData();
-            formData.append('file', videoFile);
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', `${API_BASE}/v1/${project}/files/upload`);
-            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-            xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
-            xhr.timeout = 30 * 60 * 1000; // 30 min ceiling for very large uploads
-            const startedAt = performance.now();
-            xhr.upload.onprogress = (e) => {
-              if (e.lengthComputable) onPct(Math.round((e.loaded / e.total) * 100));
-            };
-            xhr.onload = () => {
-              if (xhr.status >= 200 && xhr.status < 300) {
-                const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
-                console.info(`[Editor] Video uploaded (${blob.size} bytes) in ${secs}s`);
-                resolve(xhr.responseText.trim());
-              } else {
-                const err = new Error(
-                  xhr.status === 413
-                    ? 'Video is too large for the server to accept in one upload.'
-                    : `Video upload failed (${xhr.status})`,
-                ) as Error & { noRetry?: boolean };
-                if (xhr.status >= 400 && xhr.status < 500) err.noRetry = true;
-                reject(err);
-              }
-            };
-            xhr.onerror = () => {
-              // Surfaced so we can tell a real slow transfer apart from repeated
-              // reconnect attempts (the latter points at a server/proxy reset).
-              console.warn('[Editor] Video upload network error — will retry');
-              reject(new Error('Network error during video upload'));
-            };
-            xhr.ontimeout = () => reject(new Error('Video upload timed out'));
-            xhr.send(formData);
-          }),
-        3,
-      ),
+    (project: string, token: string, blob: Blob, onPct: (p: number) => void): Promise<string> => {
+      const startedAt = performance.now();
+      return uploadBlobChunked(
+        API_BASE,
+        project,
+        token,
+        blob,
+        (blob.type || 'video/webm').split(';')[0],
+        (uploaded, total) => {
+          if (total > 0) onPct(Math.round((uploaded / total) * 100));
+        },
+      ).then((fileName) => {
+        const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
+        console.info(`[Editor] Video uploaded (${blob.size} bytes) in ${secs}s`);
+        return fileName;
+      });
+    },
     [],
   );
 
@@ -887,10 +816,13 @@ export function EditorApp() {
       // NOTE: the files GET endpoint requires a Bearer token, so the portal
       // must fetch this URL with auth (a plain <img src> gets a 401).
       setUploadPercent(90);
-      let thumbnailUrl: string | null = data.thumbnailDataUrl ?? null;
-      if (data.thumbnailDataUrl) {
+      // Use the recording's own thumbnail, or the one captured in-editor from the
+      // <video> for local uploads that arrived without one.
+      const thumbSource = data.thumbnailDataUrl ?? derivedThumbnail;
+      let thumbnailUrl: string | null = thumbSource;
+      if (thumbSource) {
         try {
-          const thumbBlob = await (await fetch(data.thumbnailDataUrl)).blob();
+          const thumbBlob = await (await fetch(thumbSource)).blob();
           const thumbFile = new File([thumbBlob], `thumb-${ts}.jpg`, { type: 'image/jpeg' });
           const tForm = new FormData();
           tForm.append('file', thumbFile);
@@ -1004,6 +936,14 @@ export function EditorApp() {
       });
       // Uploaded successfully — reclaim the local disk copy (OPFS/IDB).
       void deleteRecordingBlob(recordingId);
+      // It stays in the Drafts list, just promoted to "saved" (Download/Copy
+      // Link instead of Save/Download) rather than disappearing from it.
+      void promoteDraftToSaved(recordingId, {
+        title: title || data.title,
+        backendRecordId: backendId,
+        shareUrl: newShareUrl,
+        videoUrl,
+      });
       return finalLink;
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : 'Upload failed');
@@ -1030,6 +970,7 @@ export function EditorApp() {
     visibility,
     pendingShareMinutes,
     mintShareToken,
+    derivedThumbnail,
   ]);
 
   // Header "Save & Copy Link": saves the recording first if it isn't saved yet,
@@ -1105,6 +1046,40 @@ export function EditorApp() {
     if (!v || !v.duration) return;
     v.currentTime = fraction * v.duration;
   }, []);
+
+  // When the recording carries no thumbnail of its own (e.g. a video uploaded
+  // from local disk), grab a frame from the loaded <video> so the saved record
+  // still gets one. Runs once: seek a touch past the start (frame 0 is often
+  // black), then capture on the resulting `seeked`.
+  const maybeStartThumbnailCapture = useCallback(() => {
+    if (thumbCaptureStartedRef.current) return;
+    if (data?.thumbnailDataUrl || derivedThumbnail) return;
+    const v = videoRef.current;
+    if (!v) return;
+    thumbCaptureStartedRef.current = true;
+    try {
+      v.currentTime = Math.min(0.1, (v.duration || 1) / 2);
+    } catch {
+      /* seeking unsupported — capture attempt is skipped */
+    }
+  }, [data, derivedThumbnail]);
+
+  const captureThumbnailFrame = useCallback(() => {
+    if (!thumbCaptureStartedRef.current || derivedThumbnail || data?.thumbnailDataUrl) return;
+    const v = videoRef.current;
+    if (!v || !v.videoWidth) return;
+    try {
+      const canvas = document.createElement('canvas');
+      const width = Math.min(v.videoWidth, 640);
+      const height = Math.round(width * (v.videoHeight / v.videoWidth)) || 360;
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d')!.drawImage(v, 0, 0, width, height);
+      setDerivedThumbnail(canvas.toDataURL('image/jpeg', 0.7));
+    } catch {
+      /* canvas draw failed (e.g. not decodable yet) — leave without a thumbnail */
+    }
+  }, [data, derivedThumbnail]);
 
   const totalDur = videoDuration || (data?.duration ?? 0);
 
@@ -1301,6 +1276,8 @@ export function EditorApp() {
                 src={videoUrl}
                 style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
                 onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
+                onLoadedData={maybeStartThumbnailCapture}
+                onSeeked={captureThumbnailFrame}
                 onDurationChange={() => {
                   const d = videoRef.current?.duration ?? 0;
                   if (isFinite(d) && d > 0) setVideoDuration(d);

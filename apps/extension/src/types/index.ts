@@ -98,6 +98,28 @@ export interface Recording {
   userId: string;
 }
 
+/**
+ * A local, pre-upload recording tracked in the Drafts tab so an accidentally
+ * closed or not-yet-saved recording can always be recovered. Kept in
+ * `chrome.storage.local[STORAGE_KEYS.DRAFTS_INDEX]`, newest first, capped at 5.
+ * Registered as soon as the recording finishes (independent of whether the
+ * editor window is ever opened/closed), then promoted to `status: 'saved'`
+ * once the editor uploads it — it stays in the list either way.
+ */
+export interface DraftRecording {
+  recordingId: string;
+  title: string;
+  thumbnailDataUrl: string | null;
+  duration: number;
+  blobSize: number;
+  recordingType: string;
+  createdAt: number;
+  status: 'draft' | 'saved';
+  backendRecordId?: string;
+  shareUrl?: string;
+  videoUrl?: string;
+}
+
 // ─── Upload Types ──────────────────────────────────────────────────────────────
 
 export interface UploadProgress {
@@ -356,6 +378,8 @@ export const STORAGE_KEYS = {
   OFFLINE_QUEUE: 'st_offline_queue',
   PENDING_SHARE: 'st_pending_share',
   EDITOR_DATA: 'st_editor_data',
+  DRAFTS_INDEX: 'st_drafts_index',
+  PENDING_BLOB_CLEANUP: 'st_pending_blob_cleanup',
 } as const;
 
 /** chrome.alarms name for the token refresh alarm. */
