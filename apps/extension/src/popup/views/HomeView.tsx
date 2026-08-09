@@ -78,7 +78,6 @@ type View =
   | 'settings'
   | 'recording'
   | 'upload'
-  | 'share'
   | 'login'
   | 'bug-report'
   | 'annotation';

@@ -4,17 +4,17 @@
  * in tests or manual flows).
  *
  * Upload protocol matching backend:
- *   1. POST /recordings          → create recording row, get recordingId
- *   2. POST /uploads/initiate    → open upload session
- *   3. POST /uploads/chunk?...   → multipart per chunk
- *   4. POST /uploads/complete/:id → finalize
+ *   1. POST /files/upload → single multipart request, returns the MinIO filename
+ *   2. POST /records      → create the record referencing that filename
  *
- * Recording type must be uppercase for the backend Zod schema.
+ * `/uploads/initiate` (chunked-session upload) 404s on any id the backend
+ * hasn't seen before and there's no confirmed contract for pre-registering
+ * one, so this deliberately uploads in a single request rather than chunked.
  */
 
 import type { RecordingMetadata, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS } from '@/types';
-import { generateId, sleep, uploadBlobChunked } from '@/utils';
+import { generateId, retryWithBackoff, sleep } from '@/utils';
 import { RP_HOST, API_BASE_URL } from '@/config';
 
 async function getProject(token: string): Promise<string> {
@@ -68,31 +68,45 @@ export class ChunkUploader {
     const ts = Date.now();
     const isoNow = new Date(ts).toISOString();
 
-    // Phase 1: upload file in chunks → get MinIO filename. A dropped
-    // connection or a transient 500 only costs the current ~8MB chunk, not
-    // the whole recording, and progress only ever moves forward.
+    // Phase 1: upload file → get MinIO filename
+    const ext = metadata.mimeType.startsWith('image/') ? 'png' : 'webm';
     let fileName: string;
     let recordingId = '';
     try {
-      fileName = await uploadBlobChunked(
-        API_BASE_URL,
-        project,
-        token,
-        blob,
-        metadata.mimeType.split(';')[0],
-        (uploaded, total) => {
-          onProgress({
-            recordingId: '',
-            totalChunks: 1,
-            uploadedChunks: 0,
-            totalBytes,
-            uploadedBytes: uploaded,
-            speed: 0,
-            percentComplete: total > 0 ? Math.round((uploaded / total) * 85) : 0,
-            eta: 0,
-          });
-        },
-      );
+      fileName = await retryWithBackoff(async () => {
+        const file = new File([blob], `${metadata.type ?? 'recording'}-${ts}.${ext}`, {
+          type: metadata.mimeType.split(';')[0],
+        });
+        const formData = new FormData();
+        formData.append('file', file);
+
+        return await new Promise<string>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', `${API_BASE_URL}/v1/${project}/files/upload`);
+          xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+          xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+              onProgress({
+                recordingId: '',
+                totalChunks: 1,
+                uploadedChunks: 0,
+                totalBytes,
+                uploadedBytes: e.loaded,
+                speed: 0,
+                percentComplete: Math.round((e.loaded / e.total) * 85),
+                eta: 0,
+              });
+            }
+          };
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText.trim());
+            else reject(new Error(`File upload failed: ${xhr.status}`));
+          };
+          xhr.onerror = () => reject(new Error('Network error during file upload'));
+          xhr.send(formData);
+        });
+      }, 3);
     } catch (err) {
       await this.saveToOfflineQueue(blob, metadata);
       throw new Error(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);

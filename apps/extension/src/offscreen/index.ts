@@ -18,7 +18,7 @@
 
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
-import { generateId, sleep, uploadBlobChunked } from '@/utils';
+import { generateId, retryWithBackoff, sleep } from '@/utils';
 import { recordingOpfsName, saveBlobToIDB } from '@/utils/blobStorage';
 import { RP_HOST, API_BASE_URL as REPORTS_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
 
@@ -844,18 +844,24 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
   let recordingId = '';
 
   try {
-    // Upload blob in chunks → get MinIO filename. A dropped connection or a
-    // transient 500 only costs the current ~8MB chunk, not the whole
-    // recording — important here since this path also replays queued
-    // uploads that can be full-length videos, not just screenshots.
-    fileName = await uploadBlobChunked(
-      REPORTS_URL,
-      project,
-      token,
-      blob,
-      metadata.mimeType.split(';')[0],
-      () => {},
-    );
+    // Upload blob as a single file → get MinIO filename
+    const ext = metadata.mimeType.startsWith('image/') ? 'png' : 'webm';
+    const file = new File([blob], `${metadata.type}-${ts}.${ext}`, {
+      type: metadata.mimeType.split(';')[0],
+    });
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const uploadRes = await retryWithBackoff(async () => {
+      const res = await fetch(`${REPORTS_URL}/v1/${project}/files/upload`, {
+        method: 'POST',
+        headers: { ...authHeaders(token), Accept: 'text/plain, application/json, */*' },
+        body: formData,
+      });
+      if (!res.ok) throw new Error(`File upload failed: ${res.status}`);
+      return (await res.text()).trim();
+    }, 3);
+    fileName = uploadRes;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Upload failed';
     sendToBackground('OFFSCREEN_ERROR', { error: msg });

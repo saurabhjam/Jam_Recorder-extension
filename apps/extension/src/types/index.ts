@@ -118,6 +118,7 @@ export interface DraftRecording {
   backendRecordId?: string;
   shareUrl?: string;
   videoUrl?: string;
+  isPublic?: boolean;
 }
 
 // ─── Upload Types ──────────────────────────────────────────────────────────────

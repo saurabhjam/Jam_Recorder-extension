@@ -7,7 +7,6 @@ import { LoginView } from './views/LoginView';
 import { HomeView } from './views/HomeView';
 import { RecordingView } from './views/RecordingView';
 import { UploadView } from './views/UploadView';
-import { ShareView } from './views/ShareView';
 import { LibraryView } from './views/LibraryView';
 import { BugReportView } from './views/BugReportView';
 import { AnnotationView } from './views/AnnotationView';
@@ -18,7 +17,6 @@ type View =
   | 'home'
   | 'recording'
   | 'upload'
-  | 'share'
   | 'library'
   | 'settings'
   | 'bug-report'
@@ -38,7 +36,11 @@ const PAGE_TRANSITION = {
 
 export default function App() {
   const { isAuthenticated, isLoading: authLoading, initialize: initAuth } = useAuthStore();
-  const { status: recordingStatus, initialize: initRecording } = useRecordingStore();
+  const {
+    status: recordingStatus,
+    initialize: initRecording,
+    reset: resetRecording,
+  } = useRecordingStore();
   const { initialize: initSettings } = useSettingsStore();
   const [currentView, setCurrentView] = useState<View>('home');
   const [isInitializing, setIsInitializing] = useState(true);
@@ -124,7 +126,8 @@ export default function App() {
         setCurrentView('upload');
         break;
       case 'done':
-        setCurrentView('share');
+        resetRecording();
+        setCurrentView('home');
         break;
       case 'idle':
       case 'error':
@@ -133,7 +136,7 @@ export default function App() {
         }
         break;
     }
-  }, [recordingStatus, isAuthenticated, isInitializing, authLoading]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [recordingStatus, isAuthenticated, isInitializing, authLoading, resetRecording]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (isInitializing || authLoading) {
     return (
@@ -207,20 +210,6 @@ export default function App() {
             className="flex-1 overflow-hidden"
           >
             <UploadView />
-          </motion.div>
-        )}
-
-        {currentView === 'share' && (
-          <motion.div
-            key="share"
-            variants={PAGE_VARIANTS}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            transition={PAGE_TRANSITION}
-            className="flex-1 overflow-hidden"
-          >
-            <ShareView onRecordAnother={() => navigate('home')} />
           </motion.div>
         )}
 

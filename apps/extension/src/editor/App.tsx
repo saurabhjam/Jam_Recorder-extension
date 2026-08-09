@@ -23,7 +23,7 @@ import {
   Clock,
 } from 'lucide-react';
 import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
-import { uploadBlobChunked } from '@/utils';
+import { retryWithBackoff } from '@/utils';
 import { loadRecordingBlob, deleteRecordingBlob } from '@/utils/blobStorage';
 import { STORAGE_KEYS, type DraftRecording } from '@/types';
 
@@ -197,20 +197,26 @@ async function trimVideoBlob(
 }
 
 /**
+ * Merge a partial update into a Drafts-list entry (matched by recordingId).
+ * A no-op if the entry isn't in the list (e.g. it was discarded meanwhile).
+ */
+async function patchDraftIndex(recordingId: string, patch: Partial<DraftRecording>): Promise<void> {
+  const result = await chrome.storage.local.get([STORAGE_KEYS.DRAFTS_INDEX]);
+  const drafts = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
+  const next = drafts.map((d) => (d.recordingId === recordingId ? { ...d, ...patch } : d));
+  await chrome.storage.local.set({ [STORAGE_KEYS.DRAFTS_INDEX]: next });
+}
+
+/**
  * Flip a Drafts-list entry from `status: 'draft'` to `'saved'` once the editor
  * has successfully uploaded it. The entry is kept (not removed) so it still
  * shows in Drafts, now with Download/Copy Link instead of Save/Download.
  */
 async function promoteDraftToSaved(
   recordingId: string,
-  saved: Pick<DraftRecording, 'title' | 'backendRecordId' | 'shareUrl' | 'videoUrl'>,
+  saved: Pick<DraftRecording, 'title' | 'backendRecordId' | 'shareUrl' | 'videoUrl' | 'isPublic'>,
 ): Promise<void> {
-  const result = await chrome.storage.local.get([STORAGE_KEYS.DRAFTS_INDEX]);
-  const drafts = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
-  const next = drafts.map((d) =>
-    d.recordingId === recordingId ? { ...d, ...saved, status: 'saved' as const } : d,
-  );
-  await chrome.storage.local.set({ [STORAGE_KEYS.DRAFTS_INDEX]: next });
+  await patchDraftIndex(recordingId, { ...saved, status: 'saved' });
 }
 
 /** Trigger a browser download of a blob under the given filename. */
@@ -480,12 +486,21 @@ export function EditorApp() {
           } satisfies ShareVisibilityState,
         });
         void patchRecordIsPublic(false);
+        void patchDraftIndex(recordingId, { shareUrl: shareUrl ?? undefined, isPublic: false });
       }
     };
     checkExpiry();
     const id = setInterval(checkExpiry, 15_000);
     return () => clearInterval(id);
-  }, [visibility, shareExpiresAt, backendRecordId, savedProject, recordingId, patchRecordIsPublic]);
+  }, [
+    visibility,
+    shareExpiresAt,
+    backendRecordId,
+    savedProject,
+    recordingId,
+    patchRecordIsPublic,
+    shareUrl,
+  ]);
 
   const handleCopyLink = async () => {
     const linkToCopy = visibility === 'public' && publicShareUrl ? publicShareUrl : shareUrl;
@@ -548,6 +563,7 @@ export function EditorApp() {
           } satisfies ShareVisibilityState,
         });
         await patchRecordIsPublic(true);
+        void patchDraftIndex(recordingId, { shareUrl: url, isPublic: true });
         return url;
       } catch (err) {
         setVisibilityError(err instanceof Error ? err.message : 'Failed to update sharing');
@@ -580,8 +596,9 @@ export function EditorApp() {
         } satisfies ShareVisibilityState,
       });
       void patchRecordIsPublic(false);
+      void patchDraftIndex(recordingId, { shareUrl: shareUrl ?? undefined, isPublic: false });
     }
-  }, [backendRecordId, savedProject, recordingId, patchRecordIsPublic]);
+  }, [backendRecordId, savedProject, recordingId, patchRecordIsPublic, shareUrl]);
 
   // Entry point the dropdown calls when the user picks a duration. The recording
   // may not be saved yet — the share-tokens API needs a real recordId, which
@@ -630,28 +647,50 @@ export function EditorApp() {
   }, []);
 
   // Upload just the video file (the big, slow part) and return the MinIO
-  // filename the server assigns. Uploaded in ~8MB chunks (see
-  // uploadBlobChunked) so a dropped connection or a transient 500 only costs
-  // the current chunk — not a full restart of a multi-hour recording — and
-  // progress only ever moves forward.
+  // filename the server assigns. Retried with backoff; a 4xx fails fast.
   const uploadVideoFile = useCallback(
-    (project: string, token: string, blob: Blob, onPct: (p: number) => void): Promise<string> => {
-      const startedAt = performance.now();
-      return uploadBlobChunked(
-        API_BASE,
-        project,
-        token,
-        blob,
-        (blob.type || 'video/webm').split(';')[0],
-        (uploaded, total) => {
-          if (total > 0) onPct(Math.round((uploaded / total) * 100));
-        },
-      ).then((fileName) => {
-        const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
-        console.info(`[Editor] Video uploaded (${blob.size} bytes) in ${secs}s`);
-        return fileName;
-      });
-    },
+    (project: string, token: string, blob: Blob, onPct: (p: number) => void): Promise<string> =>
+      retryWithBackoff(
+        () =>
+          new Promise<string>((resolve, reject) => {
+            const videoFile = new File([blob], `recording-${Date.now()}.webm`, {
+              type: (blob.type || 'video/webm').split(';')[0],
+            });
+            const formData = new FormData();
+            formData.append('file', videoFile);
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${API_BASE}/v1/${project}/files/upload`);
+            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+            xhr.setRequestHeader('Accept', 'text/plain, application/json, */*');
+            xhr.timeout = 30 * 60 * 1000; // 30 min ceiling for very large uploads
+            const startedAt = performance.now();
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) onPct(Math.round((e.loaded / e.total) * 100));
+            };
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                const secs = ((performance.now() - startedAt) / 1000).toFixed(1);
+                console.info(`[Editor] Video uploaded (${blob.size} bytes) in ${secs}s`);
+                resolve(xhr.responseText.trim());
+              } else {
+                const err = new Error(
+                  xhr.status === 413
+                    ? 'Video is too large for the server to accept in one upload.'
+                    : `Video upload failed (${xhr.status})`,
+                ) as Error & { noRetry?: boolean };
+                if (xhr.status >= 400 && xhr.status < 500) err.noRetry = true;
+                reject(err);
+              }
+            };
+            xhr.onerror = () => {
+              console.warn('[Editor] Video upload network error — will retry');
+              reject(new Error('Network error during video upload'));
+            };
+            xhr.ontimeout = () => reject(new Error('Video upload timed out'));
+            xhr.send(formData);
+          }),
+        3,
+      ),
     [],
   );
 
@@ -941,8 +980,9 @@ export function EditorApp() {
       void promoteDraftToSaved(recordingId, {
         title: title || data.title,
         backendRecordId: backendId,
-        shareUrl: newShareUrl,
+        shareUrl: finalLink,
         videoUrl,
+        isPublic: createPublic,
       });
       return finalLink;
     } catch (err) {
