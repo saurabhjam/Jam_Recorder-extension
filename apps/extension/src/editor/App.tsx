@@ -1251,7 +1251,9 @@ export function EditorApp() {
                   ? 'linear-gradient(135deg,#8b5cf6,#7c3aed)'
                   : 'rgba(139,92,246,0.2)',
                 border: canSaveCopy ? 'none' : '1px solid rgba(139,92,246,0.3)',
-                color: canSaveCopy ? 'white' : 'rgba(139,92,246,0.6)',
+                // "Saving…" is active status, not a disabled state — keep it readable
+                // even though the button is disabled while the save is in flight.
+                color: canSaveCopy ? 'white' : isSaving ? '#c4b5fd' : 'rgba(139,92,246,0.6)',
                 fontSize: '13px',
                 fontWeight: 700,
                 cursor: canSaveCopy ? 'pointer' : 'not-allowed',
@@ -1813,7 +1815,9 @@ export function EditorApp() {
               <div
                 style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}
               >
-                <span style={{ fontSize: '11px', color: 'rgba(148,163,184,0.7)', fontWeight: 600 }}>
+                <span
+                  style={{ fontSize: '11px', color: 'rgba(226,232,240,0.85)', fontWeight: 600 }}
+                >
                   {saveStage === 'trimming' ? 'TRIMMING' : 'UPLOADING'}
                 </span>
                 <span style={{ fontSize: '11px', color: '#8b5cf6', fontWeight: 700 }}>
@@ -1905,7 +1909,7 @@ export function EditorApp() {
                     borderRadius: '12px',
                     background: 'rgba(139,92,246,0.15)',
                     border: '1px solid rgba(139,92,246,0.3)',
-                    color: 'rgba(139,92,246,0.6)',
+                    color: '#c4b5fd',
                     fontSize: '14px',
                     fontWeight: 700,
                     display: 'flex',

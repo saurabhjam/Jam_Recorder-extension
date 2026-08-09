@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Lock, User, Eye, EyeOff, AlertCircle, KeyRound } from 'lucide-react';
+import { AlertCircle, KeyRound } from 'lucide-react';
+// import { Lock, User, Eye, EyeOff } from 'lucide-react'; // password-mode icons — see below
 import { useAuthStore } from '@/store/auth.store';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -34,33 +35,37 @@ interface LoginViewProps {
   onSuccess: () => void;
 }
 
-type LoginMode = 'password' | 'token';
+// Username/password login is disabled — only token + Google sign-in are
+// offered right now. Kept commented (not deleted) below so it's a quick
+// restore if password login comes back.
+// type LoginMode = 'password' | 'token';
 
 export function LoginView({ onSuccess }: LoginViewProps) {
-  const { login, loginWithToken, isLoading, error, clearError } = useAuthStore();
+  const { loginWithToken, isLoading, error, clearError } = useAuthStore();
+  // const { login } = useAuthStore(); // password-mode login
 
-  const [mode, setMode] = useState<LoginMode>('password');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  // const [mode, setMode] = useState<LoginMode>('password');
+  // const [username, setUsername] = useState('');
+  // const [password, setPassword] = useState('');
   const [token, setToken] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
+  // const [showPassword, setShowPassword] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
-  const switchMode = (next: LoginMode) => {
-    if (next === mode) return;
-    clearError();
-    setFieldErrors({});
-    setMode(next);
-  };
+  // const switchMode = (next: LoginMode) => {
+  //   if (next === mode) return;
+  //   clearError();
+  //   setFieldErrors({});
+  //   setMode(next);
+  // };
 
   const validate = (): boolean => {
     const errors: Record<string, string> = {};
-    if (mode === 'password') {
-      if (!username.trim()) errors.username = 'Username is required';
-      if (!password) errors.password = 'Password is required';
-    } else {
-      if (!token.trim()) errors.token = 'Token is required';
-    }
+    // if (mode === 'password') {
+    //   if (!username.trim()) errors.username = 'Username is required';
+    //   if (!password) errors.password = 'Password is required';
+    // } else {
+    if (!token.trim()) errors.token = 'Token is required';
+    // }
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -79,11 +84,11 @@ export function LoginView({ onSuccess }: LoginViewProps) {
     clearError();
     if (!validate()) return;
     try {
-      if (mode === 'password') {
-        await login(username.trim(), password);
-      } else {
-        await loginWithToken(token.trim());
-      }
+      // if (mode === 'password') {
+      //   await login(username.trim(), password);
+      // } else {
+      await loginWithToken(token.trim());
+      // }
       onSuccess();
     } catch {
       // Error is set in the store
@@ -115,9 +120,11 @@ export function LoginView({ onSuccess }: LoginViewProps) {
         >
           <h1 className="text-xl font-bold text-white">Welcome back</h1>
           <p className="text-sm text-dark-400 mt-1">
-            {mode === 'password'
+            {
+              /* mode === 'password'
               ? 'Sign in with your ReportPortal account'
-              : 'Sign in with an access token'}
+              : */ 'Sign in with an access token'
+            }
           </p>
           <div className="flex justify-center mt-3">
             <InstanceBadge size={16} />
@@ -135,7 +142,7 @@ export function LoginView({ onSuccess }: LoginViewProps) {
           className="flex flex-col gap-3"
           noValidate
         >
-          {/* Mode toggle */}
+          {/* Mode toggle — disabled along with password login, see below.
           <div className="flex p-1 rounded-xl bg-dark-900/80 border border-jam-500/20">
             {(['password', 'token'] as const).map((m) => (
               <button
@@ -151,6 +158,7 @@ export function LoginView({ onSuccess }: LoginViewProps) {
               </button>
             ))}
           </div>
+          */}
 
           {/* Global Error */}
           <AnimatePresence>
@@ -167,55 +175,51 @@ export function LoginView({ onSuccess }: LoginViewProps) {
             )}
           </AnimatePresence>
 
-          {mode === 'password' ? (
-            <>
-              {/* Username */}
-              <Input
-                label="Username"
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="superadmin"
-                error={fieldErrors.username}
-                leftIcon={<User size={15} />}
-                autoComplete="username"
-              />
+          {/* Username/password fields — disabled, token-only for now.
+          <Input
+            label="Username"
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="superadmin"
+            error={fieldErrors.username}
+            leftIcon={<User size={15} />}
+            autoComplete="username"
+          />
 
-              {/* Password */}
-              <Input
-                label="Password"
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                error={fieldErrors.password}
-                leftIcon={<Lock size={15} />}
-                rightIcon={
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword((s) => !s)}
-                    className="text-dark-400 hover:text-dark-200 transition-colors"
-                  >
-                    {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
-                  </button>
-                }
-                autoComplete="current-password"
-              />
-            </>
-          ) : (
-            /* Access token */
-            <Input
-              label="Access Token"
-              type="text"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder="Paste your access token"
-              error={fieldErrors.token}
-              helperText="Your token is validated before sign in."
-              leftIcon={<KeyRound size={15} />}
-              autoComplete="off"
-            />
-          )}
+          <Input
+            label="Password"
+            type={showPassword ? 'text' : 'password'}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="••••••••"
+            error={fieldErrors.password}
+            leftIcon={<Lock size={15} />}
+            rightIcon={
+              <button
+                type="button"
+                onClick={() => setShowPassword((s) => !s)}
+                className="text-dark-400 hover:text-dark-200 transition-colors"
+              >
+                {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+              </button>
+            }
+            autoComplete="current-password"
+          />
+          */}
+
+          {/* Access token */}
+          <Input
+            label="Access Token"
+            type="text"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Paste your access token"
+            error={fieldErrors.token}
+            helperText="Your token is validated before sign in."
+            leftIcon={<KeyRound size={15} />}
+            autoComplete="off"
+          />
 
           {/* Submit */}
           <Button
