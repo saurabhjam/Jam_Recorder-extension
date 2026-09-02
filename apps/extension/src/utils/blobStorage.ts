@@ -14,6 +14,17 @@ export function recordingOpfsName(recordingId: string): string {
   return `recording-${recordingId}.webm`;
 }
 
+/**
+ * IDB key for a recording's separately-recorded microphone track.
+ *
+ * The mic is captured to its own blob rather than mixed into the video's audio, so
+ * the editor can mute mic and system audio independently. Recordings made before
+ * that split simply have no entry under this key.
+ */
+export function micBlobKey(recordingId: string): string {
+  return `${recordingId}::mic`;
+}
+
 export function openRecordingIDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(IDB_NAME, 1);

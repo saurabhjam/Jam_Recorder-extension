@@ -22,9 +22,14 @@ import {
   Globe,
   Clock,
 } from 'lucide-react';
-import { RP_HOST, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
+import { buildShareUrl, API_BASE_URL as API_BASE, INSTANCE_LABEL, IS_PRODUCTION } from '@/config';
 import { retryWithBackoff } from '@/utils';
-import { loadRecordingBlob, deleteRecordingBlob } from '@/utils/blobStorage';
+import {
+  loadRecordingBlob,
+  deleteRecordingBlob,
+  loadBlobFromIDB,
+  micBlobKey,
+} from '@/utils/blobStorage';
 import { STORAGE_KEYS, type DraftRecording } from '@/types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -38,6 +43,15 @@ interface EditorData {
   recordingType?: string;
   consoleLogs: ConsoleLog[];
   networkCaptures: NetworkCapture[];
+  visitedUrls?: VisitedUrl[];
+}
+
+interface VisitedUrl {
+  url: string;
+  title: string;
+  tabId: number;
+  timestamp: number;
+  favIconUrl?: string;
 }
 
 interface ConsoleLog {
@@ -79,7 +93,7 @@ interface AssignedProjectInfo {
   entryType: string;
 }
 
-type LogTab = 'console' | 'network' | 'info';
+type LogTab = 'console' | 'network' | 'links' | 'info';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const EDITOR_DATA_KEY = 'st_editor_data';
@@ -124,34 +138,83 @@ function formatRemaining(expiresAt: number | null): string {
 }
 
 /**
- * Trim a recorded video blob to [startSec, endSec] entirely in the browser.
+ * Re-encode a recorded video blob to [startSec, endSec] entirely in the browser,
+ * optionally dropping its audio.
  *
  * There's no ffmpeg here, so we re-record: play the source <video> from the trim
  * start to the trim end while capturing its stream through MediaRecorder. This is
  * real-time (a 30s clip takes ~30s) but needs no native deps and preserves audio.
  * `onProgress` reports 0–1 based on how far through the selection we are.
+ *
+ * `audio` controls the mix. The mic is recorded to its own blob (see
+ * offscreen/index.ts), so it's played back alongside the video and the two are
+ * summed here through gain-free source nodes — muting either simply omits it.
+ * Muting both yields a video-only (silent) export.
  */
 async function trimVideoBlob(
   blob: Blob,
   startSec: number,
   endSec: number,
   onProgress?: (fraction: number) => void,
+  audio: { micBlob?: Blob | null; muteSystem?: boolean; muteMic?: boolean } = {},
 ): Promise<Blob> {
+  const { micBlob = null, muteSystem = false, muteMic = false } = audio;
   const url = URL.createObjectURL(blob);
   const video = document.createElement('video');
   video.src = url;
   video.muted = true; // muted so autoplay is allowed; audio track is still captured
   video.playsInline = true;
 
+  // The mic lives in its own file, so it's played back alongside the video and the
+  // two are mixed here — that's what makes muting one without the other possible.
+  const micUrl = micBlob ? URL.createObjectURL(micBlob) : null;
+  const micEl = micUrl ? new Audio(micUrl) : null;
+  if (micEl) micEl.muted = true; // as above: keep it off the speakers, still capturable
+  let audioCtx: AudioContext | null = null;
+
   try {
     await new Promise<void>((resolve, reject) => {
       video.onloadedmetadata = () => resolve();
       video.onerror = () => reject(new Error('Could not load recording for trimming'));
     });
+    if (micEl) {
+      await new Promise<void>((resolve) => {
+        // A missing/!unreadable mic track must not block the export.
+        micEl.onloadedmetadata = () => resolve();
+        micEl.onerror = () => resolve();
+      });
+    }
 
     const capture = video as HTMLVideoElement & { captureStream?: () => MediaStream };
     const stream = capture.captureStream?.();
     if (!stream) throw new Error('captureStream unavailable — cannot trim in this browser');
+
+    // Pull the source audio out of the recorded stream so it can be re-mixed with
+    // per-source gains instead of being passed through wholesale.
+    const systemTracks = stream.getAudioTracks();
+    for (const track of systemTracks) stream.removeTrack(track);
+
+    const wantSystem = !muteSystem && systemTracks.length > 0;
+    const micCapture = micEl as (HTMLAudioElement & { captureStream?: () => MediaStream }) | null;
+    const micStreamForMix = !muteMic && micCapture ? micCapture.captureStream?.() : undefined;
+    const micTracks = micStreamForMix?.getAudioTracks() ?? [];
+    const wantMic = micTracks.length > 0;
+
+    if (wantSystem || wantMic) {
+      audioCtx = new AudioContext();
+      const dest = audioCtx.createMediaStreamDestination();
+      if (wantSystem) {
+        audioCtx.createMediaStreamSource(new MediaStream(systemTracks)).connect(dest);
+      }
+      if (wantMic) {
+        audioCtx.createMediaStreamSource(new MediaStream(micTracks)).connect(dest);
+      }
+      for (const t of dest.stream.getAudioTracks()) stream.addTrack(t);
+    }
+    // Neither wanted → the stream stays video-only, i.e. a silent export.
+
+    // Stop the discarded source tracks so they don't keep decoding in the background.
+    if (!wantSystem) for (const t of systemTracks) t.stop();
 
     // Prefer a codec the recorder actually supports; fall back to default.
     const preferred = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
@@ -170,9 +233,20 @@ async function trimVideoBlob(
     await new Promise<void>((resolve) => {
       video.onseeked = () => resolve();
     });
+    // Line the mic up with the same instant — both were recorded from t=0.
+    if (micEl && micTracks.length > 0) {
+      micEl.currentTime = Math.min(startSec, micEl.duration || startSec);
+    }
 
     recorder.start(100);
     await video.play();
+    if (micEl && micTracks.length > 0) {
+      try {
+        await micEl.play();
+      } catch {
+        /* mic playback blocked → export continues with system audio only */
+      }
+    }
 
     await new Promise<void>((resolve) => {
       const tick = () => {
@@ -188,11 +262,14 @@ async function trimVideoBlob(
     });
 
     video.pause();
+    micEl?.pause();
     recorder.stop();
     await stopped;
     return new Blob(chunks, { type: mimeType.split(';')[0] || 'video/webm' });
   } finally {
     URL.revokeObjectURL(url);
+    if (micUrl) URL.revokeObjectURL(micUrl);
+    void audioCtx?.close().catch(() => {});
   }
 }
 
@@ -294,6 +371,14 @@ export function EditorApp() {
   const [videoDuration, setVideoDuration] = useState(0);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(1); // 0–1 fractions of total duration
+  // Independent audio mutes for the saved/downloaded file. The mic is recorded to
+  // its own track (see offscreen/index.ts), so each source can be dropped on its own.
+  const [muteSystemAudio, setMuteSystemAudio] = useState(false);
+  const [muteMic, setMuteMic] = useState(false);
+  // Object URL + blob for the separately-recorded mic track, when one exists.
+  const [micUrl, setMicUrl] = useState<string | null>(null);
+  const micBlobRef = useRef<Blob | null>(null);
+  const micAudioRef = useRef<HTMLAudioElement | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
   const [assignedProjects, setAssignedProjects] = useState<Record<
     string,
@@ -426,6 +511,33 @@ export function EditorApp() {
     };
   }, [recordingId]);
 
+  // ── Load the separately-recorded mic track, when there is one ──────────────
+  // Recorded to its own blob so mic and system audio stay independently mutable.
+  // Absent for recordings made before that split (and when no mic was used) — the
+  // UI then offers only the system-audio control.
+  useEffect(() => {
+    if (!recordingId || recordingId === 'unknown') return;
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    const tryLoad = async () => {
+      const blob = await loadBlobFromIDB(micBlobKey(recordingId));
+      if (blob && blob.size > 0 && !cancelled) {
+        micBlobRef.current = blob;
+        objectUrl = URL.createObjectURL(blob);
+        setMicUrl(objectUrl);
+      }
+    };
+    void tryLoad();
+    const retryTimer = setTimeout(() => {
+      if (!micBlobRef.current) void tryLoad();
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(retryTimer);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [recordingId]);
+
   // ── Listen for auth changes ────────────────────────────────────────────────
   useEffect(() => {
     const listener = (message: { type: string }) => {
@@ -535,7 +647,7 @@ export function EditorApp() {
     // internal address like http://192.168.x.x:8080 that no external viewer can
     // reach. RP_HOST is by definition reachable: the extension just successfully
     // called the API at this same host to mint the token.
-    const url = `${RP_HOST}/ui/#/${project}/records/${recordId}?shareToken=${body.shareToken}`;
+    const url = buildShareUrl(project, recordId, body.shareToken);
     return { url, expiresAtMs };
   }, []);
 
@@ -703,10 +815,20 @@ export function EditorApp() {
       if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
       const dur = videoDuration || data?.duration || 0;
       const isFullClip = trimStart <= 0.005 && trimEnd >= 0.995;
-      if (isFullClip || dur <= 0) return blob;
-      return trimVideoBlob(blob, trimStart * dur, trimEnd * dur, onTrimProgress);
+      const micBlob = micBlobRef.current;
+      // The mic is a separate track, so it has to be mixed in during the re-encode
+      // whenever it exists — not just when trimming or muting.
+      const needsRemux = muteSystemAudio || muteMic || !!micBlob;
+      if ((isFullClip && !needsRemux) || dur <= 0) return blob;
+      const from = isFullClip ? 0 : trimStart * dur;
+      const to = isFullClip ? dur : trimEnd * dur;
+      return trimVideoBlob(blob, from, to, onTrimProgress, {
+        micBlob,
+        muteSystem: muteSystemAudio,
+        muteMic,
+      });
     },
-    [recordingId, videoDuration, data, trimStart, trimEnd],
+    [recordingId, videoDuration, data, trimStart, trimEnd, muteSystemAudio, muteMic],
   );
 
   // Returns the record's share URL on success (so callers like "Save & Copy
@@ -731,7 +853,7 @@ export function EditorApp() {
       const userId = (tokenResult[AUTH_USER_KEY] as { id?: string } | undefined)?.id ?? null;
       if (!token) {
         setUploadError('Not authenticated — please sign in.');
-        return;
+        return null;
       }
 
       // Build the export blob — applies the trim selection when the user picked a
@@ -909,9 +1031,18 @@ export function EditorApp() {
           viewCount: 0,
           url: videoUrl,
           thumbnailUrl,
+          // Size of the blob actually uploaded (post-trim), in bytes.
+          size: blob.size,
           duration: Math.round((trimEnd - trimStart) * (videoDuration || data.duration || 0)),
           networkLogs: harFileName || null,
           consoleLogs: logsFileName || null,
+          links: JSON.stringify(
+            (data.visitedUrls ?? []).map((v) => ({
+              time: formatTime(v.timestamp),
+              title: v.title,
+              url: v.url,
+            })),
+          ),
           metadata: JSON.stringify({
             browser: 'chrome',
             source: (data.recordingType ?? 'tab').toLowerCase(),
@@ -937,7 +1068,7 @@ export function EditorApp() {
       // user chose Public before saving, mint the share token now (inline) so the
       // link we return/copy is the SAME token URL the bottom "Copy Link" uses —
       // no async gap where the plain URL would be copied by mistake.
-      const newShareUrl = `${RP_HOST}/ui/#/${project}/records/${backendId}`;
+      const newShareUrl = buildShareUrl(project, backendId);
       let finalLink = newShareUrl;
       let publicUrl: string | null = null;
       let publicExpiresAt: number | null = null;
@@ -1221,6 +1352,93 @@ export function EditorApp() {
           disabled={!!shareUrl || isSaving}
         />
 
+        {/* Independent audio mutes. The mic is recorded to its own track, so each
+            source can be silenced separately. Kept in the header so they don't take
+            vertical space away from the video preview, and grouped in their own tight
+            cluster so the header's wider gap doesn't push them apart. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <AudioMuteButton
+            muted={muteMic}
+            onToggle={() => setMuteMic((v) => !v)}
+            label="Mic"
+            available={!!micUrl}
+            unavailableHint="No separate mic track in this recording (recorded before mic/system audio were split, or no mic was used)"
+            icon={
+              muteMic ? (
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                </svg>
+              ) : (
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                </svg>
+              )
+            }
+          />
+
+          <AudioMuteButton
+            muted={muteSystemAudio}
+            onToggle={() => setMuteSystemAudio((v) => !v)}
+            label="Audio"
+            available
+            icon={
+              muteSystemAudio ? (
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <line x1="23" y1="9" x2="17" y2="15" />
+                  <line x1="17" y1="9" x2="23" y2="15" />
+                </svg>
+              ) : (
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
+                </svg>
+              )
+            }
+          />
+        </div>
+
         <VisibilityControl
           isSaved={!!backendRecordId}
           visibility={visibility}
@@ -1283,9 +1501,11 @@ export function EditorApp() {
           gridTemplateColumns: '1fr 420px',
           gap: '20px',
           padding: '20px 24px 24px',
-          maxWidth: '1200px',
+          // No max-width cap: the body fills the editor window instead of being
+          // centred inside it, which previously left a wide dead margin on both
+          // sides at the current window size. The right column stays fixed, so the
+          // extra width all goes to the video preview.
           width: '100%',
-          margin: '0 auto',
           boxSizing: 'border-box',
           overflow: 'hidden',
         }}
@@ -1310,25 +1530,63 @@ export function EditorApp() {
               overflow: 'hidden',
               border: '1px solid rgba(255,255,255,0.08)',
               aspectRatio: '16/9',
+              // Without this the flex column shrinks the player to a thin strip as
+              // soon as the fields below need room — the aspect ratio alone doesn't
+              // hold its height. Let the column scroll instead of crushing the video.
+              flexShrink: 0,
             }}
           >
             {videoUrl ? (
-              <video
-                ref={videoRef}
-                src={videoUrl}
-                style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
-                onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
-                onLoadedData={maybeStartThumbnailCapture}
-                onSeeked={captureThumbnailFrame}
-                onDurationChange={() => {
-                  const d = videoRef.current?.duration ?? 0;
-                  if (isFinite(d) && d > 0) setVideoDuration(d);
-                }}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onEnded={() => setIsPlaying(false)}
-                onClick={togglePlay}
-              />
+              <>
+                <video
+                  ref={videoRef}
+                  src={videoUrl}
+                  // Preview what the saved file will sound like. The video's own
+                  // track now carries system/tab audio only — the mic plays from
+                  // the sibling <audio> below, so each mutes independently.
+                  muted={muteSystemAudio}
+                  style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+                  onTimeUpdate={() => {
+                    setCurrentTime(videoRef.current?.currentTime ?? 0);
+                    // Nudge the mic back in step if it drifts (seek, stall, etc.).
+                    const mic = micAudioRef.current;
+                    const vid = videoRef.current;
+                    if (mic && vid && Math.abs(mic.currentTime - vid.currentTime) > 0.3) {
+                      mic.currentTime = vid.currentTime;
+                    }
+                  }}
+                  onLoadedData={maybeStartThumbnailCapture}
+                  onSeeked={() => {
+                    captureThumbnailFrame();
+                    const mic = micAudioRef.current;
+                    if (mic && videoRef.current) mic.currentTime = videoRef.current.currentTime;
+                  }}
+                  onDurationChange={() => {
+                    const d = videoRef.current?.duration ?? 0;
+                    if (isFinite(d) && d > 0) setVideoDuration(d);
+                  }}
+                  onPlay={() => {
+                    setIsPlaying(true);
+                    const mic = micAudioRef.current;
+                    if (mic && videoRef.current) {
+                      mic.currentTime = videoRef.current.currentTime;
+                      void mic.play().catch(() => {});
+                    }
+                  }}
+                  onPause={() => {
+                    setIsPlaying(false);
+                    micAudioRef.current?.pause();
+                  }}
+                  onEnded={() => {
+                    setIsPlaying(false);
+                    micAudioRef.current?.pause();
+                  }}
+                  onClick={togglePlay}
+                />
+                {micUrl ? (
+                  <audio ref={micAudioRef} src={micUrl} muted={muteMic} preload="auto" />
+                ) : null}
+              </>
             ) : data?.thumbnailDataUrl ? (
               <img
                 src={data.thumbnailDataUrl}
@@ -1524,6 +1782,7 @@ export function EditorApp() {
             {data?.networkCaptures?.length ? (
               <Chip>{data.networkCaptures.length} requests</Chip>
             ) : null}
+            {data?.visitedUrls?.length ? <Chip>{data.visitedUrls.length} links</Chip> : null}
           </div>
 
           {/* Title */}
@@ -1621,13 +1880,15 @@ export function EditorApp() {
               padding: '0 4px',
             }}
           >
-            {(['console', 'network', 'info'] as LogTab[]).map((tab) => {
+            {(['console', 'network', 'links', 'info'] as LogTab[]).map((tab) => {
               const count =
                 tab === 'console'
                   ? (data?.consoleLogs?.length ?? 0)
                   : tab === 'network'
                     ? (data?.networkCaptures?.length ?? 0)
-                    : 0;
+                    : tab === 'links'
+                      ? (data?.visitedUrls?.length ?? 0)
+                      : 0;
               return (
                 <button
                   key={tab}
@@ -1712,6 +1973,21 @@ export function EditorApp() {
                   )}
                 </motion.div>
               )}
+              {activeTab === 'links' && (
+                <motion.div
+                  key="links"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.12 }}
+                >
+                  {data?.visitedUrls && data.visitedUrls.length > 0 ? (
+                    data.visitedUrls.map((entry, i) => <UrlRow key={i} entry={entry} />)
+                  ) : (
+                    <EmptyLogs label="No URLs captured for this recording" />
+                  )}
+                </motion.div>
+              )}
               {activeTab === 'info' && (
                 <motion.div
                   key="info"
@@ -1744,6 +2020,7 @@ export function EditorApp() {
                     label="Network requests"
                     value={String(data?.networkCaptures?.length ?? 0)}
                   />
+                  <InfoRow label="URLs visited" value={String(data?.visitedUrls?.length ?? 0)} />
                 </motion.div>
               )}
             </AnimatePresence>
@@ -2927,6 +3204,63 @@ function ProjectSelector({
 
 // ─── Sub-components ────────────────────────────────────────────────────────────
 
+/**
+ * Header toggle for muting one audio source in the exported recording.
+ * `available: false` renders it disabled — used when a recording has no separate
+ * mic track to mute (older recordings, or none captured).
+ */
+function AudioMuteButton({
+  muted,
+  onToggle,
+  label,
+  icon,
+  available,
+  unavailableHint,
+}: {
+  muted: boolean;
+  onToggle: () => void;
+  label: string;
+  icon: React.ReactNode;
+  available: boolean;
+  unavailableHint?: string;
+}) {
+  const title = !available
+    ? (unavailableHint ?? `No ${label.toLowerCase()} track in this recording`)
+    : muted
+      ? `${label} will be removed from the saved recording — click to keep it`
+      : `Mute ${label.toLowerCase()} in the saved recording`;
+  return (
+    <motion.button
+      whileTap={available ? { scale: 0.96 } : undefined}
+      onClick={available ? onToggle : undefined}
+      disabled={!available}
+      title={title}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '6px',
+        padding: '8px 10px',
+        borderRadius: '10px',
+        border:
+          muted && available
+            ? '1px solid rgba(239,68,68,0.45)'
+            : '1px solid rgba(255,255,255,0.12)',
+        background: muted && available ? 'rgba(239,68,68,0.15)' : 'rgba(255,255,255,0.06)',
+        color: !available ? 'rgba(148,163,184,0.45)' : muted ? '#fca5a5' : '#d1c4e9',
+        fontSize: '13px',
+        fontWeight: 600,
+        cursor: available ? 'pointer' : 'not-allowed',
+        whiteSpace: 'nowrap',
+        fontFamily: 'inherit',
+        opacity: available ? 1 : 0.6,
+      }}
+    >
+      {icon}
+      {label}
+    </motion.button>
+  );
+}
+
 function Chip({ children }: { children: React.ReactNode }) {
   return (
     <span
@@ -3424,6 +3758,80 @@ function NetworkRow({ req }: { req: NetworkCapture }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function UrlRow({ entry }: { entry: VisitedUrl }) {
+  const [faviconFailed, setFaviconFailed] = useState(false);
+  const openUrl = () => {
+    chrome.tabs.create({ url: entry.url });
+  };
+  return (
+    <div
+      onClick={openUrl}
+      title={entry.url}
+      style={{
+        display: 'flex',
+        gap: '10px',
+        padding: '8px 16px',
+        fontSize: '12px',
+        borderBottom: '1px solid rgba(255,255,255,0.04)',
+        alignItems: 'center',
+        cursor: 'pointer',
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.background = 'rgba(139,92,246,0.06)';
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.background = 'transparent';
+      }}
+    >
+      <span
+        style={{
+          color: 'rgba(148,163,184,0.5)',
+          flexShrink: 0,
+          fontVariantNumeric: 'tabular-nums',
+        }}
+      >
+        {formatTime(entry.timestamp)}
+      </span>
+      {entry.favIconUrl && !faviconFailed ? (
+        <img
+          src={entry.favIconUrl}
+          alt=""
+          onError={() => setFaviconFailed(true)}
+          style={{ width: '14px', height: '14px', flexShrink: 0, borderRadius: '3px' }}
+        />
+      ) : (
+        <Globe size={14} style={{ color: 'rgba(148,163,184,0.4)', flexShrink: 0 }} />
+      )}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: '1px' }}>
+        {entry.title && (
+          <span
+            style={{
+              color: 'rgba(226,232,240,0.85)',
+              fontWeight: 600,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {entry.title}
+          </span>
+        )}
+        <span
+          style={{
+            color: '#a78bfa',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            textDecoration: 'underline',
+          }}
+        >
+          {entry.url}
+        </span>
+      </div>
     </div>
   );
 }

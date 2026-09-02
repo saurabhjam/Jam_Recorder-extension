@@ -272,8 +272,8 @@ export function HomeView({ onNavigate }: HomeViewProps) {
       await chrome.windows.create({
         url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${id}`),
         type: 'popup',
-        width: 1200,
-        height: 800,
+        width: 1400,
+        height: 900,
         focused: true,
       });
       window.close();

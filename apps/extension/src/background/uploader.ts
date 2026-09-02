@@ -15,7 +15,7 @@
 import type { RecordingMetadata, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
-import { RP_HOST, API_BASE_URL } from '@/config';
+import { buildShareUrl, API_BASE_URL } from '@/config';
 
 async function getProject(token: string): Promise<string> {
   try {
@@ -133,6 +133,7 @@ export class ChunkUploader {
           allowDownload: true,
           viewCount: 0,
           url: fileUrl,
+          size: totalBytes,
           duration: Math.round(metadata.duration ?? 0),
           metadata: JSON.stringify({
             browser: 'chrome',
@@ -152,7 +153,7 @@ export class ChunkUploader {
       throw new Error(`Create record failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    const shareUrl = `${RP_HOST}/ui/#/${project}/records/${recordingId}`;
+    const shareUrl = buildShareUrl(project, recordingId);
 
     onProgress({
       recordingId,

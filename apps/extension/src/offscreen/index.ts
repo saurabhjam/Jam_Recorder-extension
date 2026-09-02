@@ -19,8 +19,13 @@
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
-import { recordingOpfsName, saveBlobToIDB } from '@/utils/blobStorage';
-import { RP_HOST, API_BASE_URL as REPORTS_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
+import { recordingOpfsName, saveBlobToIDB, micBlobKey } from '@/utils/blobStorage';
+import {
+  buildShareUrl,
+  API_BASE_URL as REPORTS_URL,
+  SSO_TOKEN_URL,
+  SSO_AUTH_HEADER,
+} from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -137,8 +142,12 @@ let captureStream: MediaStream | null = null; // raw screen/tab capture (video +
 let micStream: MediaStream | null = null; // raw microphone capture
 let tabAudioStreams: MediaStream[] = []; // audible-tab audio mixed into desktop recordings
 let webcamStream: MediaStream | null = null;
-let audioContext: AudioContext | null = null; // mixes mic + system audio into one track
+let audioContext: AudioContext | null = null; // mixes system/tab audio into one track
 let audioLimiter: DynamicsCompressorNode | null = null; // master bus tab-audio sources feed into
+// The mic records to its OWN blob, parallel to the main recording, so the editor can
+// mute mic and system audio independently (they can't be separated once summed).
+let micRecorder: MediaRecorder | null = null;
+let micChunks: Blob[] = [];
 let sink: RecordingSink | null = null; // streams recorder chunks to disk (OPFS) or memory
 let mimeType = 'video/webm';
 let isRecordingActive = false;
@@ -397,7 +406,6 @@ async function acquireMicStream(options: RecordingOptions): Promise<MediaStream 
 // Captured system/tab audio comes in well below mic level, so boost it.
 // A limiter after the gain prevents the boosted loud passages from clipping.
 const SYSTEM_AUDIO_GAIN = 3.0;
-const MIC_GAIN = 1.0;
 
 /**
  * Capture a tab's audio via its tab-capture stream id. Used to fold meeting
@@ -436,10 +444,8 @@ async function createRecordingStream(
 
   const videoTrack = captureStream.getVideoTracks()[0];
   const captureAudioTracks = captureStream.getAudioTracks();
-  const micAudioTracks = micStream?.getAudioTracks() ?? [];
 
   const hasCaptureAudio = captureAudioTracks.length > 0;
-  const hasMic = micAudioTracks.length > 0;
 
   // For screen/window shares with system audio enabled, when getDisplayMedia
   // itself produced no audio track (always the case on macOS), the recording's
@@ -452,15 +458,14 @@ async function createRecordingStream(
   const tracks: MediaStreamTrack[] = [];
   if (videoTrack) tracks.push(videoTrack);
 
-  // Nothing to mix and nothing coming later → record the capture stream untouched.
-  if (!hasCaptureAudio && !hasMic && !needsDynamicTabAudio) {
-    return captureStream;
-  }
+  // NOTE: the mic is deliberately NOT mixed into this stream. It is recorded to its
+  // own blob by `startMicRecorder`, so the editor can mute mic and system audio
+  // independently. Summing them here would fuse them into one track and make that
+  // impossible after the fact — which is exactly the bug this split fixes.
 
-  // Mic only, with no capture audio and no tabs coming → no graph needed.
-  if (hasMic && !hasCaptureAudio && !needsDynamicTabAudio) {
-    tracks.push(...micAudioTracks);
-    return new MediaStream(tracks);
+  // No system audio to mix and none coming later → record the capture stream as-is.
+  if (!hasCaptureAudio && !needsDynamicTabAudio) {
+    return videoTrack ? new MediaStream(tracks) : captureStream;
   }
 
   // Build a persistent Web Audio graph: every audio source (capture audio, mic,
@@ -491,14 +496,8 @@ async function createRecordingStream(
     if (monitorCaptureAudio) src.connect(audioContext.destination);
   }
 
-  if (hasMic) {
-    const micGain = audioContext.createGain();
-    micGain.gain.value = MIC_GAIN;
-    audioContext
-      .createMediaStreamSource(new MediaStream(micAudioTracks))
-      .connect(micGain)
-      .connect(limiter);
-  }
+  // Mic intentionally omitted from this graph — see the note above; it goes to its
+  // own recorder so it stays independently mutable in the editor.
 
   // The offscreen document has no user gesture, so the AudioContext starts
   // suspended and the graph outputs silence. With a mic, getUserMedia happens
@@ -593,17 +592,82 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
 
   // 1-second timeslices for consistent chunking
   recorder.start(1000);
+
+  startMicRecorder();
+}
+
+/**
+ * Record the microphone to its own blob, in parallel with the main recording.
+ *
+ * Both recorders are started back-to-back off the same live streams, so the two
+ * files line up on playback. Keeping them separate is what lets the editor offer
+ * independent "mute mic" and "mute system audio" — mixing at record time would
+ * collapse them into one inseparable track.
+ */
+function startMicRecorder(): void {
+  micChunks = [];
+  micRecorder = null;
+
+  const micTracks = micStream?.getAudioTracks() ?? [];
+  if (micTracks.length === 0) return;
+
+  try {
+    const micOnly = new MediaStream(micTracks);
+    const preferred = ['audio/webm;codecs=opus', 'audio/webm'];
+    const micMime = preferred.find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
+    micRecorder = new MediaRecorder(micOnly, micMime ? { mimeType: micMime } : undefined);
+    micRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) micChunks.push(e.data);
+    };
+    micRecorder.onerror = (e) => {
+      // Non-fatal: the main recording continues; the mic track is simply absent.
+      console.warn('[Offscreen] Mic recorder error:', e.error);
+    };
+    micRecorder.start(1000);
+  } catch (err) {
+    console.warn('[Offscreen] Could not start mic recorder:', err);
+    micRecorder = null;
+  }
+}
+
+/** Stop the mic recorder and return its blob (null when no mic was recorded). */
+async function finalizeMicRecording(): Promise<Blob | null> {
+  const rec = micRecorder;
+  if (!rec) return null;
+  try {
+    if (rec.state !== 'inactive') {
+      await new Promise<void>((resolve) => {
+        rec.onstop = () => resolve();
+        rec.stop();
+      });
+    }
+    if (micChunks.length === 0) return null;
+    return new Blob(micChunks, { type: rec.mimeType || 'audio/webm' });
+  } catch (err) {
+    console.warn('[Offscreen] Could not finalize mic recording:', err);
+    return null;
+  } finally {
+    micRecorder = null;
+    micChunks = [];
+  }
 }
 
 function pauseRecording(): void {
   if (recorder?.state === 'recording') {
     recorder.pause();
   }
+  // Keep the mic track in lockstep, or the two files drift out of sync.
+  if (micRecorder?.state === 'recording') {
+    micRecorder.pause();
+  }
 }
 
 function resumeRecording(): void {
   if (recorder?.state === 'paused') {
     recorder.resume();
+  }
+  if (micRecorder?.state === 'paused') {
+    micRecorder.resume();
   }
 }
 
@@ -631,6 +695,9 @@ async function stopRecording(metadata: {
     }
   });
 
+  // Grab the parallel mic track before cleanup() tears the streams down.
+  const micBlob = await finalizeMicRecording();
+
   const activeSink = sink;
   const finalBlob = await (activeSink?.finalize() ??
     Promise.resolve(new Blob([], { type: mimeType })));
@@ -648,6 +715,17 @@ async function stopRecording(metadata: {
       await saveBlobToIDB(metadata.recordingId, finalBlob);
     } catch (err) {
       console.warn('[Offscreen] Could not save blob to IDB:', err);
+    }
+  }
+
+  // Persist the mic track under a sibling key so the editor can load it alongside
+  // the video and toggle it independently. Failing here is non-fatal: the editor
+  // simply finds no mic track and offers only the system-audio control.
+  if (micBlob && micBlob.size > 0) {
+    try {
+      await saveBlobToIDB(micBlobKey(metadata.recordingId), micBlob);
+    } catch (err) {
+      console.warn('[Offscreen] Could not save mic blob to IDB:', err);
     }
   }
 
@@ -884,6 +962,7 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
       allowDownload: true,
       viewCount: 0,
       url: fileUrl,
+      size: blob.size,
       duration: Math.round(metadata.duration ?? 0),
       metadata: JSON.stringify({
         browser: 'chrome',
@@ -919,7 +998,7 @@ async function uploadBlob(blob: Blob, metadata: UploadMetadata): Promise<void> {
       eta: 0,
     } satisfies UploadProgress);
 
-    const shareUrl = `${RP_HOST}/ui/#/${project}/records/${recordingId}`;
+    const shareUrl = buildShareUrl(project, recordingId);
     sendToBackground('OFFSCREEN_UPLOAD_COMPLETE', { shareUrl, recordingId });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Create record failed';

@@ -60,8 +60,8 @@ export function useDrafts() {
     void chrome.windows.create({
       url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${recordingId}`),
       type: 'popup',
-      width: 1200,
-      height: 800,
+      width: 1400,
+      height: 900,
       focused: true,
     });
   }, []);

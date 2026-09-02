@@ -193,6 +193,9 @@ export type MessageType =
   | 'CAPTURE_FLUSH'
   // Screenshot workflow messages (background ↔ content script)
   | 'SCREENSHOT_GET_DIMENSIONS'
+  | 'SCREENSHOT_EXPAND_SCROLLERS'
+  | 'SCREENSHOT_RESTORE_SCROLLERS'
+  | 'SCREENSHOT_WAIT_SETTLED'
   | 'SCREENSHOT_SCROLL_TO'
   | 'SCREENSHOT_RESTORE_SCROLL'
   | 'SCREENSHOT_SHOW_SELECTOR'
@@ -235,9 +238,19 @@ export interface CaptureNetworkEntry {
   source: 'cdp' | 'injected';
 }
 
+/** A URL the recorded tab (or, for screen shares, the focused tab) navigated to. */
+export interface CaptureUrlEntry {
+  url: string;
+  title: string;
+  tabId: number;
+  timestamp: number;
+  favIconUrl?: string;
+}
+
 export interface CaptureData {
   consoleLogs: CaptureConsoleLog[];
   networkCaptures: CaptureNetworkEntry[];
+  visitedUrls: CaptureUrlEntry[];
 }
 
 export type OffscreenMessageType =

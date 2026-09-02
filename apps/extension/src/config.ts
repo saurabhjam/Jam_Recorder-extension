@@ -55,6 +55,21 @@ export const INSTANCE_LABEL: string = import.meta.env.VITE_INSTANCE_LABEL || '';
 /** True when this build targets the production instance. */
 export const IS_PRODUCTION: boolean = /prod/i.test(INSTANCE_LABEL);
 
+/**
+ * Builds a recording share link pointing at the portal's viewer route.
+ *
+ * NOTE: this must stay on the `/ui/#/...` SPA path — that is the only route the
+ * deployed portal actually serves. A server-visible `/share/:project/:id` path
+ * would be needed for link-preview crawlers (Slack/WhatsApp show no thumbnail
+ * for a `#` fragment link, since the fragment never reaches the server), but no
+ * such route exists on RP_HOST today, so using one produces links that 404.
+ * Only switch shapes here once that route is actually deployed.
+ */
+export function buildShareUrl(project: string, recordId: string, shareToken?: string): string {
+  const base = `${RP_HOST}/ui/#/${project}/records/${recordId}`;
+  return shareToken ? `${base}?shareToken=${shareToken}` : base;
+}
+
 /** Hostname of the configured frontend host — used to match the OAuth callback tab. */
 export const RP_HOSTNAME: string = (() => {
   try {

@@ -2,12 +2,15 @@ import { useState, useCallback } from 'react';
 
 interface ScreenshotPreviewProps {
   dataUrl: string;
+  warnings?: string[];
   onClose: () => void;
 }
 
-export function ScreenshotPreview({ dataUrl, onClose }: ScreenshotPreviewProps) {
+export function ScreenshotPreview({ dataUrl, warnings, onClose }: ScreenshotPreviewProps) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
+  const [warningsExpanded, setWarningsExpanded] = useState(false);
+  const hasWarnings = Boolean(warnings && warnings.length > 0);
 
   const handleCopy = useCallback(async () => {
     try {
@@ -137,6 +140,62 @@ export function ScreenshotPreview({ dataUrl, onClose }: ScreenshotPreviewProps) 
             Close
           </button>
         </div>
+
+        {/* Capture warnings — surfaces a partial/incomplete full-page capture
+            directly, so it's visible without opening devtools. */}
+        {hasWarnings && (
+          <div
+            style={{
+              background: 'rgba(239,68,68,0.12)',
+              border: '1px solid rgba(239,68,68,0.35)',
+              borderRadius: 10,
+              padding: '10px 12px',
+              fontSize: 12,
+              color: '#fca5a5',
+            }}
+          >
+            <button
+              onClick={() => setWarningsExpanded((v) => !v)}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: 'inherit',
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: 'pointer',
+                padding: 0,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                width: '100%',
+                textAlign: 'left',
+                fontFamily: 'inherit',
+              }}
+            >
+              <span>⚠</span>
+              This capture may be incomplete — {warnings!.length} issue
+              {warnings!.length === 1 ? '' : 's'} occurred ({warningsExpanded ? 'hide' : 'show'}{' '}
+              details)
+            </button>
+            {warningsExpanded && (
+              <ul
+                style={{
+                  margin: '8px 0 0',
+                  paddingLeft: 18,
+                  color: '#fecaca',
+                  maxHeight: 160,
+                  overflow: 'auto',
+                }}
+              >
+                {warnings!.map((w, i) => (
+                  <li key={i} style={{ marginBottom: 4, wordBreak: 'break-word' }}>
+                    {w}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
 
         {/* Image */}
         <div
