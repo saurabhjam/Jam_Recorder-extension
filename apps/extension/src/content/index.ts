@@ -22,6 +22,17 @@ declare global {
   interface Window {
     __bestqCaptureInitialized?: boolean;
     __bestqEpoch?: number;
+    /** Teardown hooks published by every live instance — see the epoch comment. */
+    __bestqShutdown?: Array<() => void>;
+    /** Set by HIDE_TOOLBAR: no instance may (re)mount the toolbar on this page
+     *  until a fresh SHOW_TOOLBAR arrives. Lives on `window` rather than in module
+     *  state so it survives — and applies to — a later re-injection. */
+    __bestqToolbarSuppressed?: boolean;
+    /** The one live toolbar container + React root for this page, published so a
+     *  re-injected instance can take the container over in place (see
+     *  adoptExistingToolbar) instead of removing it and appending its own — which
+     *  is what made the toolbar flash and duplicate. */
+    __bestqToolbar?: { container: HTMLElement; root: Root } | null;
   }
 }
 
@@ -33,8 +44,49 @@ declare global {
 // with no error — producing exactly the kind of confidently-wrong capture that's
 // impossible to explain from a single instance's logic alone. Claim a fresh epoch on
 // every injection; only the CURRENT holder is allowed to act on messages below.
+//
+// The epoch alone is NOT enough, though: it only gates the message listener, while a
+// superseded instance keeps its OWN toolbar watchdog interval running (and its own
+// `fullscreenchange` listener, and its own module-level `toolbarContainer`). Since
+// mountToolbar removes any `#jam-toolbar-root` it cannot account for, two live
+// instances each watchdogging "my container vanished — remount it" tore down and
+// re-appended the toolbar in a permanent ping-pong. That was the visible blinking, it
+// multiplied with every extra injection, and it outlived the recording entirely
+// (a superseded instance never sees HIDE_TOOLBAR, so it happily resurrects the
+// toolbar seconds after Stop). So: actively shut every earlier instance down before
+// claiming the epoch, so exactly one instance owns the page at any moment.
+for (const shutdown of window.__bestqShutdown ?? []) {
+  try {
+    shutdown();
+  } catch {
+    /* a superseded instance failing to tidy up must not block this one */
+  }
+}
 const myEpoch = (window.__bestqEpoch ?? 0) + 1;
 window.__bestqEpoch = myEpoch;
+window.__bestqShutdown = [() => shutdownInstance()];
+
+/** True only for the instance that currently owns this page. */
+function isCurrentInstance(): boolean {
+  return window.__bestqEpoch === myEpoch;
+}
+
+/**
+ * Stop everything this instance owns, without touching the DOM the *new* owner is
+ * about to take over. Called by the next injection (above) — never by ourselves.
+ *
+ * Deliberately does NOT remove the toolbar container: the incoming instance adopts
+ * whatever is already on the page, so removing it here would reintroduce the very
+ * unmount/remount flash this whole mechanism exists to prevent.
+ */
+function shutdownInstance(): void {
+  stopToolbarGuard();
+  stopCapture();
+  isToolbarVisible = false;
+  toolbarContainer = null;
+  toolbarRoot = null;
+  document.removeEventListener('fullscreenchange', reparentToolbarForFullscreen);
+}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -51,6 +103,14 @@ let isToolbarVisible = false;
 // True pause state, synced from the background (seeded on mount, updated via
 // RECORDING_PAUSE_STATE broadcasts) so a remounted toolbar shows the real state.
 let isRecordingPaused = false;
+// Set the moment Stop is clicked. Stopping is not instant — the background flushes
+// captures, detaches CDP and finalizes the file first — and with no feedback the
+// still-live toolbar read as "Stop did nothing", so users clicked it repeatedly
+// (every extra click after the first races a recording that is already tearing
+// down and just answers "No active recording"). The toolbar now shows a stopping
+// state, refuses further clicks, and force-removes itself if HIDE_TOOLBAR is late.
+let isStopping = false;
+let stopFallbackTimer: number | null = null;
 let networkCaptures: CaptureNetworkEntry[] = [];
 let consoleLogs: CaptureConsoleLog[] = [];
 
@@ -155,13 +215,56 @@ let toolbarGuardTimer: number | null = null;
 function startToolbarGuard(): void {
   if (toolbarGuardTimer !== null) return;
   toolbarGuardTimer = window.setInterval(() => {
-    if (!isToolbarVisible) return;
+    // A superseded instance must never touch the toolbar — see the epoch comment
+    // at the top of this file. `shutdownInstance` clears this timer, but an
+    // already-queued tick can still land after that, so re-check here too.
+    if (!isCurrentInstance()) {
+      stopToolbarGuard();
+      return;
+    }
+    if (!isToolbarVisible || window.__bestqToolbarSuppressed) return;
     if (!toolbarContainer || !toolbarContainer.isConnected) {
-      if (lastToolbarRecordingId) mountToolbar(lastToolbarRecordingId);
+      // Do NOT blindly remount: this watchdog used to resurrect the toolbar
+      // forever, including long after the recording had stopped (which is what
+      // made Stop look like it did nothing — the controls came straight back).
+      // Confirm with the background that a recording is genuinely still running,
+      // and that this tab is in scope for it, before putting anything back.
+      void remountToolbarIfStillRecording();
       return;
     }
     reparentToolbarForFullscreen();
   }, 2000);
+}
+
+/** Ask the background whether a recording is still live for this tab, and only
+ *  then restore the toolbar. A negative/failed answer tears down instead. */
+let remountCheckInFlight = false;
+async function remountToolbarIfStillRecording(): Promise<void> {
+  if (!lastToolbarRecordingId) return;
+  // The guard fires every 2s while the container is missing; without this, a slow
+  // or hung background reply stacks up one pending GET_STATE per tick.
+  if (remountCheckInFlight) return;
+  remountCheckInFlight = true;
+  try {
+    const res = (await chrome.runtime.sendMessage({
+      type: 'GET_STATE',
+    } satisfies ExtensionMessage)) as
+      | { isRecording?: boolean; showToolbar?: boolean; recordingId?: string }
+      | undefined;
+    if (!isCurrentInstance() || window.__bestqToolbarSuppressed) return;
+    if (!res?.isRecording || !res.showToolbar) {
+      // Recording is over (or this tab is out of scope) — stop watchdogging.
+      unmountToolbar();
+      return;
+    }
+    mountToolbar((res.recordingId as string) || lastToolbarRecordingId);
+  } catch {
+    // Background unreachable (SW mid-restart). Leave the toolbar down; the next
+    // tick — or the background's own SHOW_TOOLBAR push — restores it. Guessing
+    // "still recording" here is what produced ghost toolbars after Stop.
+  } finally {
+    remountCheckInFlight = false;
+  }
 }
 
 function stopToolbarGuard(): void {
@@ -188,24 +291,66 @@ function reparentToolbarForFullscreen(): void {
 // for the next guard tick.
 document.addEventListener('fullscreenchange', reparentToolbarForFullscreen);
 
+/**
+ * Take ownership of a toolbar container a previous instance of this script left on
+ * the page, keeping the DOM node in place.
+ *
+ * The container is reused, but its React root is NOT: every injection of this file
+ * carries its OWN copy of React and react-dom, and rendering our elements into a
+ * root created by the other copy resolves hooks against the wrong dispatcher —
+ * React reports that as "Invalid hook call" and the toolbar renders nothing at all.
+ * Unmounting the old root is safe (that stays entirely inside the copy that made
+ * it), so we unmount there and build a fresh root on the same host element. The
+ * container never leaves the document, so this costs one frame instead of the
+ * remove-and-re-append the previous code did.
+ *
+ * Returns true when a container was adopted.
+ */
+function adoptExistingToolbar(): boolean {
+  const shared = window.__bestqToolbar;
+  if (!shared?.container.isConnected) return false;
+  const container = shared.container;
+
+  try {
+    shared.root.unmount();
+  } catch {
+    /* the other instance's root may already be gone */
+  }
+
+  const host = container.shadowRoot?.querySelector<HTMLElement>('#jam-toolbar-inner') ?? container;
+  host.replaceChildren(); // drop anything React left behind before re-rooting
+
+  toolbarContainer = container;
+  toolbarRoot = createRoot(host);
+  window.__bestqToolbar = { container, root: toolbarRoot };
+  isToolbarVisible = true;
+  return true;
+}
+
 function mountToolbar(recordingId: string): void {
+  // Only the current owner of the page may mount — otherwise two instances fight
+  // over the same node (see the epoch comment at the top of this file).
+  if (!isCurrentInstance()) return;
+
   lastToolbarRecordingId = recordingId;
+  // A fresh mount request means the toolbar is wanted again.
+  window.__bestqToolbarSuppressed = false;
+
+  // Take over the toolbar a previous instance built, rather than removing its node
+  // and appending our own — that remove/append is what the user sees as a flash.
+  const adopted = !toolbarContainer && adoptExistingToolbar();
 
   // Already mounted AND still attached to the live DOM — just keep the id fresh.
   if (toolbarContainer && toolbarContainer.isConnected) {
     toolbarContainer.dataset['recordingId'] = recordingId;
-    if (!isToolbarVisible) {
-      isToolbarVisible = true;
-      renderToolbar(recordingId);
-    }
+    if (!isToolbarVisible) isToolbarVisible = true;
+    renderToolbar(recordingId);
     startToolbarGuard();
+    // An adopted toolbar starts from this instance's own blank state, so it would
+    // otherwise show 0:00 (and un-paused) until the next broadcast.
+    if (adopted) syncToolbarWithBackground(recordingId);
     return;
   }
-
-  // A stray container from a re-injected script instance (executeScript fallback
-  // runs the file again with fresh module state) — remove it so we never show two.
-  const stray = document.getElementById('jam-toolbar-root');
-  if (stray && stray !== toolbarContainer) stray.remove();
 
   // A previous mount left a dangling/detached container (e.g. mountToolbar ran at
   // document_start before <body> existed and threw, or the page removed it). Tear
@@ -219,6 +364,13 @@ function mountToolbar(recordingId: string): void {
     toolbarRoot = null;
     toolbarContainer = null;
     isToolbarVisible = false;
+  }
+  window.__bestqToolbar = null;
+
+  // Any stray container left behind by an instance whose root we could not adopt
+  // (detached, or already unmounted above) — remove it so we never show two.
+  for (const stray of Array.from(document.querySelectorAll('#jam-toolbar-root'))) {
+    stray.remove();
   }
 
   // The content script runs at document_start, so <body> may not exist yet when we
@@ -259,7 +411,10 @@ function mountToolbar(recordingId: string): void {
 
   toolbarContainer = container;
   toolbarRoot = root;
+  // Publish so a future re-injection adopts these instead of rebuilding them.
+  window.__bestqToolbar = { container, root };
   isToolbarVisible = true;
+  isStopping = false;
   renderToolbar(recordingId);
   reparentToolbarForFullscreen();
   startToolbarGuard();
@@ -292,21 +447,44 @@ function renderToolbar(recordingId: string): void {
       recordingId,
       duration: currentDuration,
       isPaused: isRecordingPaused,
+      isStopping,
       onStop: () => {
-        chrome.runtime.sendMessage({ type: 'STOP_RECORDING' } satisfies ExtensionMessage);
+        if (isStopping) return; // already stopping — extra clicks only race the teardown
+        isStopping = true;
+        renderToolbar(recordingId);
+        // Nothing may resurrect the toolbar from here on: the recording is ending.
+        window.__bestqToolbarSuppressed = true;
+        stopToolbarGuard();
+        // Backstop for a stop that never reports back (service worker killed
+        // mid-teardown on a long recording, page unable to receive HIDE_TOOLBAR).
+        // The recording itself is finalized by the offscreen document either way,
+        // so leaving the controls on screen only makes a saved recording look lost.
+        if (stopFallbackTimer !== null) clearTimeout(stopFallbackTimer);
+        stopFallbackTimer = window.setTimeout(() => {
+          stopFallbackTimer = null;
+          if (isStopping) unmountToolbar();
+        }, 8000);
+        chrome.runtime.sendMessage({ type: 'STOP_RECORDING' } satisfies ExtensionMessage, () => {
+          // Swallow "no receiving end" — the stop may well have gone through and
+          // taken the service worker down with it.
+          void chrome.runtime.lastError;
+        });
       },
       onPause: () => {
+        if (isStopping) return;
         // Optimistic flip; the background's RECORDING_PAUSE_STATE broadcast confirms.
         isRecordingPaused = true;
         renderToolbar(recordingId);
         chrome.runtime.sendMessage({ type: 'PAUSE_RECORDING' } satisfies ExtensionMessage);
       },
       onResume: () => {
+        if (isStopping) return;
         isRecordingPaused = false;
         renderToolbar(recordingId);
         chrome.runtime.sendMessage({ type: 'RESUME_RECORDING' } satisfies ExtensionMessage);
       },
       onScreenshot: () => {
+        if (isStopping) return;
         chrome.runtime.sendMessage({ type: 'TAKE_SCREENSHOT' } satisfies ExtensionMessage);
       },
       onAnnotate: (imageUrl: string) => {
@@ -320,13 +498,29 @@ function unmountToolbar(): void {
   stopToolbarGuard();
   lastToolbarRecordingId = '';
   isRecordingPaused = false;
-  if (toolbarRoot) {
-    toolbarRoot.unmount();
-    toolbarRoot = null;
+  isStopping = false;
+  if (stopFallbackTimer !== null) {
+    clearTimeout(stopFallbackTimer);
+    stopFallbackTimer = null;
   }
-  if (toolbarContainer) {
-    toolbarContainer.remove();
-    toolbarContainer = null;
+  // Unmount the page's toolbar even when it belongs to another instance's refs:
+  // a teardown must be total, or the node it left behind becomes a ghost toolbar
+  // that no live instance considers its own and therefore nobody ever removes.
+  const shared = window.__bestqToolbar;
+  const root = toolbarRoot ?? shared?.root ?? null;
+  if (root) {
+    try {
+      root.unmount();
+    } catch {
+      /* already unmounted */
+    }
+  }
+  toolbarRoot = null;
+  toolbarContainer = null;
+  window.__bestqToolbar = null;
+  // Every container with our id, not just the one we hold a reference to.
+  for (const node of Array.from(document.querySelectorAll('#jam-toolbar-root'))) {
+    node.remove();
   }
   isToolbarVisible = false;
 }
@@ -578,10 +772,23 @@ function showCountdown(seconds: number): void {
 // ─── Message Listener ─────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
+  // HIDE_TOOLBAR is handled by EVERY instance, current or not. It is pure
+  // teardown — running it twice is harmless, whereas skipping it in a superseded
+  // instance is exactly how a toolbar survived Stop: the instance that still held
+  // the live DOM node never heard that the recording had ended. The window-level
+  // suppression flag also makes it stick across a later re-injection.
+  if (message.type === 'HIDE_TOOLBAR') {
+    window.__bestqToolbarSuppressed = true;
+    stopCapture();
+    unmountToolbar();
+    sendResponse({ success: true });
+    return false;
+  }
+
   // A stale prior injection of this same script — see the epoch comment above.
   // Silently ignore; the current instance (the one that set the latest epoch)
   // will handle it.
-  if (window.__bestqEpoch !== myEpoch) return false;
+  if (!isCurrentInstance()) return false;
 
   console.log('[Content Script] Received message:', message.type);
 
@@ -602,10 +809,15 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       break;
     }
 
-    case 'HIDE_TOOLBAR': {
-      stopCapture();
-      unmountToolbar();
-      sendResponse({ success: true });
+    case 'TOOLBAR_STATUS': {
+      // Read-only probe: reports whether the toolbar is genuinely in the live DOM
+      // WITHOUT mounting anything. The background's per-second poll uses this so
+      // it stops firing a mount request (and, on failure, a full content-script
+      // re-injection) at a tab that already has a perfectly good toolbar.
+      sendResponse({
+        mounted: !!(toolbarContainer && toolbarContainer.isConnected),
+        epoch: myEpoch,
+      });
       break;
     }
 
@@ -1063,11 +1275,20 @@ void (async function autoRestoreToolbar() {
   // reappearing is major, so we don't rely on a single attempt (the background
   // navigation listener is a further backup on top of this).
   for (let attempt = 0; attempt < 4; attempt++) {
+    // A newer injection has taken over the page — it runs its own restore; ours
+    // would only mount a second toolbar it doesn't know about.
+    if (!isCurrentInstance()) return;
     try {
       const response = await chrome.runtime.sendMessage({
         type: 'GET_STATE',
       } satisfies ExtensionMessage);
       if (!response?.isRecording) return; // definitively not recording — stop trying
+      if (!isCurrentInstance()) return;
+      // A HIDE_TOOLBAR arrived while we were waiting for this answer — the stop
+      // teardown is under way and `isRecording` above is simply stale. Mounting now
+      // would plant a toolbar on a page the background has already finished
+      // cleaning up, and nothing would ever come back to remove it.
+      if (window.__bestqToolbarSuppressed) return;
       // showToolbar is false for tabs that aren't being recorded (a tab recording
       // only shows the toolbar on its own tab) — so we don't self-mount there.
       if (response?.showToolbar && response?.recordingId) {

@@ -9,6 +9,10 @@ interface FloatingToolbarProps {
   // state: the toolbar can be remounted mid-recording (page wiped it, SW
   // restart) and must come back showing the true pause state.
   isPaused: boolean;
+  // Also owned by the content script, for the same reason: once Stop is clicked
+  // the teardown must survive a re-render/remount, or the button becomes live
+  // again and every extra click races a recording that is already stopping.
+  isStopping?: boolean;
   onStop: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -19,11 +23,11 @@ interface FloatingToolbarProps {
 export function FloatingToolbar({
   duration,
   isPaused,
+  isStopping = false,
   onStop,
   onPause,
   onResume,
 }: FloatingToolbarProps) {
-  const [isStopping, setIsStopping] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   // When hidden, the bar collapses to a small dot so it stays out of the recorded
   // video. The user clicks the dot to bring the pause/stop controls back.
@@ -36,9 +40,9 @@ export function FloatingToolbar({
   }, [isPaused, onPause, onResume]);
 
   const handleStop = useCallback(() => {
-    setIsStopping(true);
+    if (isStopping) return;
     onStop();
-  }, [onStop]);
+  }, [isStopping, onStop]);
 
   return (
     <>
@@ -159,7 +163,7 @@ export function FloatingToolbar({
                 textAlign: 'center',
               }}
             >
-              {formatDuration(duration)}
+              {isStopping ? 'Saving…' : formatDuration(duration)}
             </span>
 
             {/* Divider */}
@@ -178,6 +182,7 @@ export function FloatingToolbar({
               title={isPaused ? 'Resume' : 'Pause'}
               color="rgba(255,255,255,0.1)"
               hoverColor="rgba(255,255,255,0.18)"
+              disabled={isStopping}
             >
               {isPaused ? <PlaySvg /> : <PauseSvg />}
             </PillButton>

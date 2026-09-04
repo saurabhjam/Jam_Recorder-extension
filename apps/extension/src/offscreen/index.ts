@@ -186,6 +186,9 @@ interface RecordingSink {
   write(chunk: Blob): void;
   /** Flush all pending writes and return the full recording as a Blob. */
   finalize(): Promise<Blob>;
+  /** Best-effort salvage after finalize() failed: whatever did get stored, with no
+   *  further writing or closing. Never throws — returns an empty Blob at worst. */
+  recover(): Promise<Blob>;
   /** Abandon the recording and free any partial data (on error paths). */
   discard(): Promise<void>;
 }
@@ -221,6 +224,18 @@ async function createRecordingSink(recordingId: string, mime: string): Promise<R
         // Re-tag with the recorder's MIME type (OPFS files have no media type).
         return file.slice(0, file.size, mime);
       },
+      async recover() {
+        // Read the file back without touching the writable again — it may be the
+        // very thing that failed. Everything written before the failure is intact
+        // and, WebM being a streaming container, plays up to that point.
+        try {
+          const file = await handle.getFile();
+          return file.slice(0, file.size, mime);
+        } catch (err) {
+          console.error('[Offscreen] OPFS recovery failed:', err);
+          return new Blob([], { type: mime });
+        }
+      },
       async discard() {
         try {
           await queue;
@@ -244,6 +259,9 @@ async function createRecordingSink(recordingId: string, mime: string): Promise<R
         mem.push(chunk);
       },
       finalize() {
+        return Promise.resolve(new Blob(mem, { type: mime }));
+      },
+      recover() {
         return Promise.resolve(new Blob(mem, { type: mime }));
       },
       discard() {
@@ -594,6 +612,36 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
   recorder.start(1000);
 
   startMicRecorder();
+  watchForCaptureEnd();
+}
+
+/**
+ * Finish the recording when the captured surface goes away on its own.
+ *
+ * A screen/window share can end without any involvement from our UI: the browser
+ * renders its OWN "Stop sharing" bar for getDisplayMedia and the user clicks that,
+ * or the shared window is closed, or the display is disconnected. The video track
+ * fires `ended`, and until now nothing listened for it — so the extension carried
+ * on believing it was recording. The floating toolbar kept counting up over a dead
+ * stream, and whatever the user did next (waiting, then pressing our Stop) produced
+ * a file that ended whenever the track had actually died. This is the single most
+ * likely way a recording "doesn't record" or comes back short.
+ *
+ * A capture that has ended is a stop, so treat it as one: hand it to the background,
+ * which runs the normal teardown and saves everything captured up to that point.
+ */
+function watchForCaptureEnd(): void {
+  const tracks = captureStream?.getTracks() ?? [];
+  for (const track of tracks) {
+    // Audio-only tracks ending is not fatal (a tab going silent, a mixed source
+    // dropping out) — only the video surface disappearing ends the recording.
+    if (track.kind !== 'video') continue;
+    track.addEventListener('ended', () => {
+      if (!isRecordingActive) return;
+      console.warn('[Offscreen] Captured surface ended — finalizing recording');
+      sendToBackground('OFFSCREEN_CAPTURE_ENDED');
+    });
+  }
 }
 
 /**
@@ -683,15 +731,48 @@ async function stopRecording(metadata: {
   if (!recorder || !isRecordingActive) {
     throw new Error('No active recording');
   }
+  const activeRecorder = recorder;
 
   // Stopping fires a final `dataavailable` (flushed into the sink) before `stop`.
-  await new Promise<void>((resolve, reject) => {
-    recorder!.onstop = () => resolve();
-    recorder!.onerror = (e) => reject(new Error(e.error?.message ?? 'Stop error'));
-    if (recorder!.state !== 'inactive') {
-      recorder!.stop();
-    } else {
+  //
+  // Bounded, because this await used to be the last place a recording could vanish:
+  // `onstop` not arriving — a recorder wedged on a stream whose source already died,
+  // which is the common case on a long screen share — hung the stop forever. The
+  // toolbar stayed up, nothing was written out, and the user's only way out was to
+  // kill the browser, taking the recording with it. Every timeslice up to this point
+  // is already in the sink, so timing out and finalizing what we have is strictly
+  // better than waiting indefinitely for a callback that isn't coming.
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
       resolve();
+    };
+    const timeout = setTimeout(() => {
+      console.warn('[Offscreen] MediaRecorder.onstop timed out — finalizing what was captured');
+      done();
+    }, 10_000);
+    const finish = (): void => {
+      clearTimeout(timeout);
+      done();
+    };
+    activeRecorder.onstop = finish;
+    activeRecorder.onerror = (e) => {
+      // Not a rejection: an error on stop still leaves everything already written
+      // to the sink perfectly recoverable.
+      console.error('[Offscreen] MediaRecorder error while stopping:', e.error);
+      finish();
+    };
+    if (activeRecorder.state !== 'inactive') {
+      try {
+        activeRecorder.stop();
+      } catch (err) {
+        console.error('[Offscreen] MediaRecorder.stop() threw:', err);
+        finish();
+      }
+    } else {
+      finish();
     }
   });
 
@@ -699,8 +780,16 @@ async function stopRecording(metadata: {
   const micBlob = await finalizeMicRecording();
 
   const activeSink = sink;
-  const finalBlob = await (activeSink?.finalize() ??
-    Promise.resolve(new Blob([], { type: mimeType })));
+  let finalBlob: Blob;
+  try {
+    finalBlob = await (activeSink?.finalize() ?? Promise.resolve(new Blob([], { type: mimeType })));
+  } catch (err) {
+    // A chunk write failed somewhere in the recording. WebM is a streaming
+    // container, so what did land on disk is still playable up to that point —
+    // returning it beats discarding an hour of video over one bad write.
+    console.error('[Offscreen] Sink finalize failed — recovering partial recording:', err);
+    finalBlob = (await activeSink?.recover()) ?? new Blob([], { type: mimeType });
+  }
 
   cleanup();
 

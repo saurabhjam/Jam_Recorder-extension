@@ -180,6 +180,7 @@ export type MessageType =
   | 'SHOW_TOOLBAR'
   | 'HIDE_TOOLBAR'
   | 'ENSURE_TOOLBAR'
+  | 'TOOLBAR_STATUS'
   | 'SHOW_COUNTDOWN'
   | 'UPDATE_TIMER'
   | 'RECORDING_PAUSE_STATE'
@@ -266,6 +267,7 @@ export type OffscreenMessageType =
   | 'OFFSCREEN_UPLOAD_PROGRESS'
   | 'OFFSCREEN_UPLOAD_COMPLETE'
   | 'OFFSCREEN_ERROR'
+  | 'OFFSCREEN_CAPTURE_ENDED'
   | 'OFFSCREEN_RECORDING_READY';
 
 export interface ExtensionMessage<T = unknown> {

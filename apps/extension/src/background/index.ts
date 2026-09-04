@@ -98,6 +98,12 @@ let elapsedSeconds = 0;
 let timerInterval: ReturnType<typeof setInterval> | null = null;
 let isRecordingActive = false;
 let isPaused = false;
+// A stop is underway. Makes STOP_RECORDING idempotent, and — just as importantly —
+// stops restoreStateFromStorage from reading a recording back into memory while its
+// teardown is mid-flight. Worker-lifetime only, which is the correct scope: if the
+// worker dies mid-stop, the persisted record is already gone (see handleStopRecording),
+// so nothing is left to resurrect.
+let stopInFlight = false;
 
 // The Chrome window we last saw actually holding OS-level focus (kept in sync by
 // chrome.windows.onFocusChanged / chrome.tabs.onActivated AND re-derived fresh
@@ -132,6 +138,10 @@ const CDP_SESSION_KEY = 'st_cdp_captures';
 
 async function restoreStateFromStorage(): Promise<void> {
   if (isRecordingActive) return;
+  // Mid-teardown: `isRecordingActive` has already been cleared but the recording is
+  // still being finalized. Restoring here would bring the timer, the URL poll and
+  // the toolbar re-injection back up on top of a stop in progress.
+  if (stopInFlight) return;
   const [localStored, sessionStored] = await Promise.all([
     chrome.storage.local.get([STORAGE_KEYS.RECORDING_STATE]),
     chrome.storage.session.get([CDP_SESSION_KEY]),
@@ -152,6 +162,11 @@ async function restoreStateFromStorage(): Promise<void> {
   currentRecordingTabId = state.tabId ?? null;
   elapsedSeconds = Math.floor((Date.now() - state.startedAt) / 1000);
   if (!timerInterval) startTimer();
+
+  // Which tabs currently carry a toolbar — in-memory only, so it must be reloaded
+  // here or a stop after this restart leaves toolbars behind on every tab visited
+  // in an earlier worker instance.
+  await loadPersistedToolbarTabs();
 
   // Restore CDP captures that were flushed to session storage before SW suspended
   const captures = sessionStored[CDP_SESSION_KEY] as
@@ -513,7 +528,7 @@ function clearBadge(): void {
  * signal has been observed — the recording's own starting tab.
  */
 async function pollAllWindowsDuringScreenRecording(): Promise<void> {
-  if (!isRecordingActive || currentRecordingOptions?.type !== 'screen') return;
+  if (!isRecordingActive || stopInFlight || currentRecordingOptions?.type !== 'screen') return;
   try {
     const windows = await chrome.windows.getAll({ populate: true });
     const focusedWindow = windows.find((w) => w.focused) ?? null;
@@ -835,6 +850,51 @@ async function injectMainWorldCaptureScript(tabId: number): Promise<void> {
 // stuck on screen in every window but the one that started the recording.
 const toolbarShownOnTabs = new Set<number>();
 
+// Mirrored into session storage because the Set above is plain in-memory state: an
+// MV3 worker is torn down repeatedly during a long recording, and every restart
+// used to bring it back EMPTY. hideFloatingToolbar then only cleaned up the handful
+// of tabs touched since the last wake, leaving a live toolbar stuck on every other
+// tab the user had visited — with no recording behind it, and no way to dismiss it.
+const TOOLBAR_TABS_SESSION_KEY = 'st_toolbar_tabs';
+
+function persistToolbarTabs(): void {
+  void chrome.storage.session
+    .set({ [TOOLBAR_TABS_SESSION_KEY]: Array.from(toolbarShownOnTabs) })
+    .catch(() => {});
+}
+
+async function loadPersistedToolbarTabs(): Promise<void> {
+  try {
+    const stored = await chrome.storage.session.get([TOOLBAR_TABS_SESSION_KEY]);
+    for (const id of (stored[TOOLBAR_TABS_SESSION_KEY] as number[] | undefined) ?? []) {
+      toolbarShownOnTabs.add(id);
+    }
+  } catch {
+    /* session storage unavailable — the all-tabs sweep in hideFloatingToolbar covers us */
+  }
+}
+
+function markToolbarShown(tabId: number): void {
+  if (toolbarShownOnTabs.has(tabId)) return;
+  toolbarShownOnTabs.add(tabId);
+  persistToolbarTabs();
+}
+
+// Last time we programmatically re-injected the content script into a tab.
+//
+// This used to be unthrottled, and it is the engine behind the blinking toolbar:
+// pollAllWindowsDuringScreenRecording calls injectFloatingToolbar once a SECOND,
+// and any answer that wasn't `mounted: true` — including entirely transient ones,
+// like a mount deferred because <body> didn't exist yet — dropped straight through
+// to executeScript. Each of those injections spawned another live content-script
+// instance, and the instances then fought over the single toolbar node, which
+// produced *more* not-mounted answers, which triggered *more* injections. A
+// self-accelerating loop, which is exactly why it got worse the longer a recording
+// ran. Injection is now both throttled and reserved for the one case that actually
+// needs it: no content script listening in that tab at all.
+const lastInjectionAtByTab = new Map<number, number>();
+const REINJECT_COOLDOWN_MS = 10_000;
+
 async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
   let tabId = targetTabId;
   if (!tabId) {
@@ -842,6 +902,8 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
     tabId = tab?.id;
   }
   if (!tabId) return false;
+  // Last line of defence: never mount for a recording that is being torn down.
+  if (!isRecordingActive || stopInFlight || !currentRecordingId) return false;
   const targetTab = tabId;
 
   const showMsg = {
@@ -852,23 +914,41 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
   // The content script answers with `mounted` = the toolbar is actually in the
   // live DOM. A delivered message alone is NOT success — the mount can silently
   // fail (no <body> yet, page evicted the node) and callers use this result to
-  // decide whether the popup may close.
-  const sendShow = async (): Promise<boolean> => {
-    const res = (await chrome.tabs.sendMessage(targetTab, showMsg)) as
-      | { mounted?: boolean }
-      | undefined;
-    return res?.mounted === true;
+  // decide whether the popup may close. `delivered` separates "the content script
+  // answered, it just hasn't mounted yet" from "nothing is listening in this tab";
+  // only the latter justifies re-injecting the script.
+  const sendShow = async (): Promise<{ mounted: boolean; delivered: boolean }> => {
+    try {
+      const res = (await chrome.tabs.sendMessage(targetTab, showMsg)) as
+        | { mounted?: boolean }
+        | undefined;
+      return { mounted: res?.mounted === true, delivered: true };
+    } catch {
+      return { mounted: false, delivered: false };
+    }
   };
 
   // Try messaging first (content script already running)
-  try {
-    if (await sendShow()) {
-      toolbarShownOnTabs.add(targetTab);
-      return true;
-    }
-  } catch {
-    // Content script not ready — inject it programmatically then retry
+  const first = await sendShow();
+  if (first.mounted) {
+    markToolbarShown(targetTab);
+    return true;
   }
+  if (first.delivered) {
+    // The content script is alive and has the request; the mount is just pending
+    // (deferred to DOMContentLoaded, or racing a page that just wiped the node).
+    // Its own watchdog completes it — re-injecting here would only add a rival
+    // instance. Still tracked, so the tab is swept on stop.
+    markToolbarShown(targetTab);
+    return false;
+  }
+
+  // Nothing listening in this tab. Inject the script — but not more often than the
+  // cooldown, so a page where injection can never succeed (restricted URL, a
+  // sandboxed frame) can't be hammered once a second for the whole recording.
+  const lastInjection = lastInjectionAtByTab.get(targetTab) ?? 0;
+  if (Date.now() - lastInjection < REINJECT_COOLDOWN_MS) return false;
+  lastInjectionAtByTab.set(targetTab, Date.now());
 
   try {
     await chrome.scripting.executeScript({
@@ -876,19 +956,57 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
       files: ['src/content/index.js'],
     });
     await new Promise<void>((r) => setTimeout(r, 150));
-    const mounted = await sendShow();
-    if (mounted) toolbarShownOnTabs.add(targetTab);
-    return mounted;
+    const retry = await sendShow();
+    if (retry.delivered) markToolbarShown(targetTab);
+    return retry.mounted;
   } catch (err) {
     console.error('[Background] Could not inject toolbar into tab', tabId, err);
     return false;
   }
 }
 
+/** Is the toolbar genuinely in the live DOM of this tab? Read-only — never mounts,
+ *  never injects. Lets the poll skip tabs that are already fine. */
+async function isToolbarLiveOnTab(tabId: number): Promise<boolean> {
+  try {
+    const res = (await chrome.tabs.sendMessage(tabId, {
+      type: 'TOOLBAR_STATUS',
+    } satisfies ExtensionMessage)) as { mounted?: boolean } | undefined;
+    return res?.mounted === true;
+  } catch {
+    return false; // no content script listening
+  }
+}
+
+/**
+ * Remove the toolbar from every tab except `keepTabId`.
+ *
+ * A screen/entire-screen recording surfaces the controls on whatever tab the user
+ * switches to, but nothing ever took them off the tab they left — so after moving
+ * through a few tabs the stop/pause bar was sitting on all of them at once, each
+ * with its own timer. Only the tab actually in front of the user needs it.
+ */
+async function pruneToolbarsExcept(keepTabId: number): Promise<void> {
+  const stale = Array.from(toolbarShownOnTabs).filter((id) => id !== keepTabId);
+  if (stale.length === 0) return;
+  const hideMsg = { type: 'HIDE_TOOLBAR' } satisfies ExtensionMessage;
+  await Promise.all(
+    stale.map(async (tabId) => {
+      try {
+        await chrome.tabs.sendMessage(tabId, hideMsg);
+      } catch {
+        /* tab closed or has no content script — nothing to hide */
+      }
+      toolbarShownOnTabs.delete(tabId);
+    }),
+  );
+  persistToolbarTabs();
+}
+
 // Re-inject toolbar after navigation (page reload, SPA route change, etc.)
 async function reinjectToolbarIntoTab(tabId: number): Promise<void> {
   await ensureRecordingStateRestored();
-  if (!isRecordingActive) return;
+  if (!isRecordingActive || stopInFlight) return;
 
   // A tab recording captures only its own tab, so the toolbar stays pinned there
   // and is never pushed onto other tabs. A screen/window share captures whatever
@@ -918,9 +1036,22 @@ async function reinjectToolbarIntoTab(tabId: number): Promise<void> {
 // (injecting the content script first if it isn't there). Toolbar only: capture
 // stays where it is (a tab recording keeps capturing its tab; a screen recording
 // re-attaches CDP through the navigation handler).
+// Serialises the "which tab should hold the toolbar" decision. The poll tick,
+// tabs.onActivated and windows.onFocusChanged can all answer that question at once
+// while the user is switching tabs quickly — and two overlapping runs would each
+// prune the other's tab, briefly leaving no toolbar anywhere. Latest caller wins.
+let toolbarPlacementToken = 0;
+
 async function ensureToolbarOnActiveTab(tabId: number): Promise<void> {
+  const token = ++toolbarPlacementToken;
+  const isStillCurrent = (): boolean => token === toolbarPlacementToken;
+
   await ensureRecordingStateRestored();
-  if (!isRecordingActive) {
+  // `stopInFlight` matters as much as `isRecordingActive` here: the teardown holds
+  // `isRecordingActive` true across several awaits, and a poll tick landing in that
+  // window would put the toolbar straight back onto the tab hideFloatingToolbar had
+  // just cleared — the "controls survive Stop" symptom.
+  if (!isRecordingActive || stopInFlight) {
     console.log(`[URL-DEBUG] ensureToolbarOnActiveTab(${tabId}) — not recording, skipping`);
     return;
   }
@@ -933,10 +1064,30 @@ async function ensureToolbarOnActiveTab(tabId: number): Promise<void> {
     );
     return;
   }
+  // Cheap read-only probe first. The toolbar is already up on this tab the vast
+  // majority of ticks, and asking it to mount again every second — with a
+  // content-script re-injection waiting behind any imperfect answer — is what made
+  // the controls flicker and multiply. Nothing to do when it's already live.
+  if (await isToolbarLiveOnTab(tabId)) {
+    markToolbarShown(tabId);
+    if (currentRecordingOptions?.type === 'screen' && isStillCurrent()) {
+      await pruneToolbarsExcept(tabId);
+    }
+    return;
+  }
+
+  if (!isStillCurrent()) return; // the user has already moved on to another tab
+
   const injected = await injectFloatingToolbar(tabId);
   console.log(
     `[URL-DEBUG] ensureToolbarOnActiveTab(${tabId}) — injectFloatingToolbar → ${injected}`,
   );
+
+  // Keep the controls on the tab in front of the user only — a screen recording
+  // used to leave a live toolbar behind on every tab it had ever passed through.
+  if (currentRecordingOptions?.type === 'screen' && isStillCurrent()) {
+    await pruneToolbarsExcept(tabId);
+  }
 }
 
 // ─── Visited URL Tracking ─────────────────────────────────────────────────────
@@ -945,7 +1096,7 @@ async function ensureToolbarOnActiveTab(tabId: number): Promise<void> {
 // whatever tab they switch to is visible on screen.
 
 function tabInUrlScope(tabId: number): boolean {
-  if (!isRecordingActive) return false;
+  if (!isRecordingActive || stopInFlight) return false;
   return currentRecordingOptions?.type === 'screen' || currentRecordingTabId === tabId;
 }
 
@@ -995,20 +1146,29 @@ async function recordVisitedUrl(tabId: number, urlHint?: string): Promise<void> 
   scheduleCaptureFlush();
 }
 
+/**
+ * Take the toolbar down everywhere.
+ *
+ * Sweeps EVERY open tab, not just the ones we believe carry a toolbar. Our
+ * bookkeeping is not trustworthy enough to scope this: `toolbarShownOnTabs` is
+ * in-memory (so it's thinner than reality after any worker restart, even with the
+ * session-storage mirror), and a tab can end up with a toolbar we never recorded —
+ * the content script self-mounts on load via GET_STATE, entirely without us. A tab
+ * with no toolbar simply no-ops on HIDE_TOOLBAR, so over-sending costs nothing,
+ * while under-sending is precisely how a recording ends with stop/pause controls
+ * still floating on half the user's tabs.
+ */
 async function hideFloatingToolbar(): Promise<void> {
   const hideMsg = { type: 'HIDE_TOOLBAR' } satisfies ExtensionMessage;
   const tabIds = new Set(toolbarShownOnTabs);
   if (currentRecordingTabId) tabIds.add(currentRecordingTabId);
 
-  if (tabIds.size === 0) {
-    // Fallback for the (rare) case the toolbar's mount was never confirmed —
-    // best-effort hide on whatever tab is currently active.
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (tab?.id) tabIds.add(tab.id);
-    } catch {
-      /* ignore */
+  try {
+    for (const tab of await chrome.tabs.query({})) {
+      if (tab.id != null) tabIds.add(tab.id);
     }
+  } catch {
+    /* fall back to the tracked set below */
   }
 
   await Promise.all(
@@ -1019,6 +1179,8 @@ async function hideFloatingToolbar(): Promise<void> {
     ),
   );
   toolbarShownOnTabs.clear();
+  lastInjectionAtByTab.clear();
+  void chrome.storage.session.remove([TOOLBAR_TABS_SESSION_KEY]).catch(() => {});
 }
 
 // ─── desktopCapture Stream ID ─────────────────────────────────────────────────
@@ -1147,6 +1309,14 @@ async function handleStartRecording(
     sendResponse({ error: 'A recording is already in progress' });
     return;
   }
+  if (stopInFlight) {
+    sendResponse({ error: 'The previous recording is still being saved — try again in a moment' });
+    return;
+  }
+
+  // A new recording starts from a clean slate: any leftover toolbar on any tab is
+  // from a previous recording and would otherwise sit there showing a dead timer.
+  await hideFloatingToolbar();
 
   currentRecordingId = generateId();
   currentRecordingOptions = options;
@@ -1199,6 +1369,8 @@ async function handleStartRecording(
     visitedUrls = [];
     lastUrlByTab.clear();
     toolbarShownOnTabs.clear();
+    lastInjectionAtByTab.clear();
+    persistToolbarTabs();
     if (currentRecordingTabId) void recordVisitedUrl(currentRecordingTabId, activeTab?.url);
 
     // For screen/window shares that produced no direct audio (macOS), start
@@ -1258,10 +1430,30 @@ async function handleStartRecording(
 
 // ─── STOP RECORDING ───────────────────────────────────────────────────────────
 
+/**
+ * Entry point for every stop: the toolbar, the popup, the keyboard shortcut, and the
+ * offscreen document reporting that the captured surface died.
+ *
+ * Owns the `stopInFlight` latch so the teardown below can never run twice
+ * concurrently — and, just as importantly, can never leave the latch stuck. A stuck
+ * latch would block every future recording for the life of the worker, so it is
+ * released in a `finally` that no failure path can skip.
+ */
 async function handleStopRecording(
   sendResponse: (r: unknown) => void,
   cancel = false,
 ): Promise<void> {
+  // A stop already running. The teardown yields many times, so a second Stop
+  // (another click, the keyboard shortcut, the popup) lands in the middle of it —
+  // and used to run a whole second teardown concurrently, both calling
+  // OFFSCREEN_STOP_RECORDING. The second call rejects out of an offscreen document
+  // that is already finalizing the file, which surfaced as a recording-failed error
+  // on a recording that had in fact saved fine. Report the stop that is underway.
+  if (stopInFlight) {
+    sendResponse({ success: true, alreadyStopping: true });
+    return;
+  }
+
   // SW may have restarted — restore FULL in-memory state from storage, including
   // currentRecordingTabId and the CDP/URL captures accumulated before suspension
   // (chrome.storage.session[CDP_SESSION_KEY]). A long screen/window/entire-screen
@@ -1273,16 +1465,73 @@ async function handleStopRecording(
   // earlier, now-dead worker instances.
   await ensureRecordingStateRestored();
   if (!isRecordingActive) {
-    sendResponse({ error: 'No active recording' });
+    // Nothing to stop — but a Stop click landing here means the user is looking at
+    // controls for a recording that no longer exists (a ghost toolbar left behind
+    // on some tab). Answering "No active recording" and leaving it on screen is
+    // what made Stop look permanently broken: the bar never went away, so the user
+    // kept clicking it. Clean the page up instead, and report success.
+    void chrome.alarms.clear(URL_POLL_ALARM);
+    stopTimer();
+    clearBadge();
+    await hideFloatingToolbar();
+    sendResponse({ success: true, alreadyStopped: true });
     return;
   }
 
+  stopInFlight = true;
+  let responded = false;
+  const respondOnce = (r: unknown): void => {
+    if (responded) return;
+    responded = true;
+    sendResponse(r);
+  };
+  try {
+    await performStopRecording(respondOnce, cancel);
+  } catch (err) {
+    // Any unexpected failure mid-teardown. The recording itself may well have been
+    // written out already, so report rather than swallow — and make sure the user
+    // is not left with a live toolbar over a recording that has ended.
+    console.error('[Background] Stop teardown failed:', err);
+    isRecordingActive = false;
+    isPaused = false;
+    stopTimer();
+    void chrome.alarms.clear(URL_POLL_ALARM);
+    clearBadge();
+    await hideFloatingToolbar().catch(() => {});
+    broadcastToAll({ type: 'RECORDING_ERROR', error: 'Failed to finalize recording' });
+    respondOnce({ error: 'Failed to finalize recording' });
+  } finally {
+    stopInFlight = false;
+  }
+}
+
+async function performStopRecording(
+  sendResponse: (r: unknown) => void,
+  cancel: boolean,
+): Promise<void> {
+  // Drop the persisted record now, not at the end of the teardown. Any listener
+  // that fires during one of the awaits below runs ensureRecordingStateRestored,
+  // and while `isRecordingActive` is still true that's a no-op — but the moment we
+  // clear it mid-teardown, a restore would read this record back and resurrect the
+  // whole recording (timer, poll, toolbar re-injection) on top of a stop already in
+  // progress. `stopInFlight` blocks that too; removing the record makes it moot.
+  await chrome.storage.local.remove([STORAGE_KEYS.RECORDING_STATE]);
+
   // ── Flush content-script captures before hiding toolbar ──────────────────
+  // Bounded: this talks to a page that may be wedged (a heavy SPA at the end of a
+  // long recording), and chrome.tabs.sendMessage has no timeout of its own. An
+  // unbounded await here stalls the whole stop — including hiding the toolbar and
+  // telling the offscreen document to finalize — for as long as the page stays
+  // unresponsive, which reads exactly like "Stop does nothing". CDP data covers
+  // the same ground, so a skipped flush costs little.
   const flushTabId = currentRecordingTabId ?? cdpTabId;
   let contentCaptures: CaptureData = { consoleLogs: [], networkCaptures: [], visitedUrls: [] };
   if (flushTabId) {
     try {
-      const flushed = (await chrome.tabs.sendMessage(flushTabId, { type: 'CAPTURE_FLUSH' })) as
+      const flushed = (await Promise.race([
+        chrome.tabs.sendMessage(flushTabId, { type: 'CAPTURE_FLUSH' }),
+        new Promise((resolve) => setTimeout(() => resolve(undefined), 2000)),
+      ])) as
         | { consoleLogs: CaptureConsoleLog[]; networkCaptures: CaptureNetworkEntry[] }
         | undefined;
       if (flushed) {
@@ -1352,7 +1601,8 @@ async function handleStopRecording(
   clearBadge();
   teardownDynamicTabAudio();
   await hideFloatingToolbar();
-  await chrome.storage.local.remove([STORAGE_KEYS.RECORDING_STATE]);
+  // The persisted record was already removed at the top of this teardown, before
+  // the first await, so no listener firing in between could restore it.
 
   const recordingDuration = elapsedSeconds;
   const recordingType = currentRecordingOptions?.type ?? 'screen';
@@ -1398,6 +1648,9 @@ async function handleStopRecording(
     broadcastToAll({ type: 'RECORDING_ERROR', error: 'Failed to finalize recording' });
   }
   // Editor window is opened by handleOffscreenMessage when OFFSCREEN_RECORDING_READY fires
+  // `stopInFlight` is released by handleStopRecording's own `finally` — held until
+  // here on purpose, so a Stop arriving while the offscreen document is still
+  // finalizing is answered as "already stopping" rather than starting a rival teardown.
 }
 
 // ─── PAUSE / RESUME ───────────────────────────────────────────────────────────
@@ -2264,13 +2517,17 @@ chrome.runtime.onMessage.addListener(
           // screen/window share shows it on every page. Non-tab senders (the
           // popup) get `true` — they don't mount the toolbar anyway.
           const senderTabId = _sender.tab?.id;
+          // `stopInFlight` counts as not-recording here even though the flags are
+          // still set: a content script asking this question during a teardown must
+          // not self-mount a toolbar onto a page the stop has already swept.
+          const live = isRecordingActive && !stopInFlight;
           const showToolbar =
-            isRecordingActive &&
+            live &&
             (currentRecordingOptions?.type === 'screen' ||
               senderTabId == null ||
               currentRecordingTabId === senderTabId);
           sendResponse({
-            isRecording: isRecordingActive,
+            isRecording: live,
             isPaused,
             elapsedSeconds,
             recordingId: currentRecordingId,
@@ -2289,7 +2546,7 @@ chrome.runtime.onMessage.addListener(
         void (async () => {
           try {
             await ensureRecordingStateRestored();
-            if (!isRecordingActive || !currentRecordingId) {
+            if (!isRecordingActive || stopInFlight || !currentRecordingId) {
               sendResponse({ injected: false });
               return;
             }
@@ -2375,6 +2632,19 @@ async function registerDraft(entry: DraftRecording): Promise<void> {
 
 function handleOffscreenMessage(message: ExtensionMessage & { target?: string }): void {
   switch (message.type as string) {
+    case 'OFFSCREEN_CAPTURE_ENDED': {
+      // The captured surface went away on its own — the user clicked the browser's
+      // own "Stop sharing" bar, closed the shared window, or the display went away.
+      // The recording is over whether or not anyone pressed our Stop, so run the
+      // normal teardown: it saves what was captured and clears the toolbar, instead
+      // of leaving the controls counting up over a stream that is already dead.
+      console.log('[Background] Captured surface ended — stopping recording');
+      void handleStopRecording(() => {
+        /* nobody is waiting on a response for this one */
+      });
+      return;
+    }
+
     case 'OFFSCREEN_RECORDING_READY': {
       const {
         thumbnailDataUrl,
@@ -2496,7 +2766,13 @@ chrome.commands.onCommand.addListener((command) => {
       break;
     }
     case 'stop-recording': {
-      if (isRecordingActive) void handleStopRecording(() => {}, false);
+      // No `isRecordingActive` guard: this flag is in-memory, so it reads false in
+      // any freshly-woken worker — which a long recording produces constantly. The
+      // shortcut was therefore silently dead exactly when it is most needed (the
+      // user reaching for it because the toolbar is misbehaving). handleStopRecording
+      // restores state from storage itself and handles the genuinely-not-recording
+      // case, so let it decide.
+      void handleStopRecording(() => {}, false);
       break;
     }
     case 'take-screenshot': {
