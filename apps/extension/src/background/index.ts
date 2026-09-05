@@ -30,6 +30,23 @@ import { STORAGE_KEYS } from '@/types';
 /** Drafts list is capped at this many entries; older ones are evicted. */
 const MAX_DRAFTS = 5;
 import { generateId, isRestrictedUrl } from '@/utils';
+import {
+  configureMonitoringOffscreen,
+  startMonitoringSession,
+  stopMonitoringSession,
+  pauseMonitoringSession,
+  resumeMonitoringSession,
+  loadMonitoringState,
+  restoreMonitoringSession,
+  handleMonitoringAlarm,
+  handleMonitoringOffscreenMessage,
+  noteActivePage,
+  noteBrowserBlurred,
+  reconnectMonitoringCapture,
+  isMonitoringSessionLive,
+} from './monitoring.manager';
+import { MONITORING_ALARMS } from '@/types/monitoring';
+import type { MonitoringInterval } from '@/types/monitoring';
 import { RP_HOST, API_BASE_URL, RP_LOGIN_URL } from '@/config';
 
 // ─── Offscreen Management ─────────────────────────────────────────────────────
@@ -41,13 +58,32 @@ async function ensureOffscreenDocument(): Promise<void> {
   if (!existing) {
     await chrome.offscreen.createDocument({
       url: chrome.runtime.getURL(OFFSCREEN_URL),
-      reasons: [chrome.offscreen.Reason.USER_MEDIA],
-      justification: 'Screen and webcam recording requires media device access',
+      // DISPLAY_MEDIA alongside USER_MEDIA: the document captures the screen for
+      // both recording and monitoring, not just the camera and microphone.
+      reasons: [chrome.offscreen.Reason.USER_MEDIA, chrome.offscreen.Reason.DISPLAY_MEDIA],
+      justification: 'Screen recording, screen monitoring and webcam capture need media access',
     });
   }
 }
 
+/**
+ * Close the offscreen document — unless monitoring still needs it.
+ *
+ * Recording calls this from five places when a recording finishes. The
+ * offscreen document is also where a monitoring session's screen stream lives,
+ * and closing the document destroys that stream: finishing a recording would
+ * silently end screenshot capture for a monitoring session that had nothing to
+ * do with it, with the UI still reporting "Monitoring Active".
+ *
+ * The two features share the document but not its lifetime. Monitoring is the
+ * long-lived owner, so it wins — the document is left open and recording's
+ * resources have already been released by its own cleanup path by this point.
+ */
 async function closeOffscreenDocument(): Promise<void> {
+  if (isMonitoringSessionLive()) {
+    console.log('[Offscreen] keeping document open — a monitoring session is using it');
+    return;
+  }
   try {
     const exists = await chrome.offscreen.hasDocument();
     if (exists) await chrome.offscreen.closeDocument();
@@ -88,6 +124,19 @@ function sendToOffscreen(type: string, payload?: unknown): Promise<unknown> {
 
   return attempt(MAX_ATTEMPTS);
 }
+
+// Monitoring owns its own session lifecycle but has no business duplicating the
+// offscreen document's create/close bookkeeping, so it is handed the two calls
+// it needs and nothing else.
+configureMonitoringOffscreen({
+  ensureDocument: ensureOffscreenDocument,
+  send: sendToOffscreen,
+});
+
+// Run on every worker start, not only `onStartup` — the worker is woken by
+// alarms, messages and navigation events far more often than by a browser
+// launch, and a live session needs its alarm and idle listener back each time.
+void restoreMonitoringSession();
 
 // ─── Recording State ──────────────────────────────────────────────────────────
 
@@ -583,6 +632,13 @@ function stopTimer(): void {
 const URL_POLL_ALARM = 'st_url_poll_alarm';
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  // Monitoring's periodic upkeep — heartbeat, activity flush, capture watchdog.
+  // An alarm is the only timer that survives the worker being torn down, which
+  // it will be many times over an eight-hour session.
+  if (alarm.name === MONITORING_ALARMS.TICK) {
+    void handleMonitoringAlarm();
+    return;
+  }
   if (alarm.name !== URL_POLL_ALARM) return;
   void (async () => {
     await ensureRecordingStateRestored();
@@ -1184,19 +1240,13 @@ async function hideFloatingToolbar(): Promise<void> {
 }
 
 // ─── desktopCapture Stream ID ─────────────────────────────────────────────────
-
-// function chooseDesktopMedia(sources: string[]): Promise<string> {
-//   return new Promise((resolve, reject) => {
-//     // @ts-expect-error — desktopCapture types
-//     chrome.desktopCapture.chooseDesktopMedia(sources, (streamId: string) => {
-//       if (chrome.runtime.lastError || !streamId) {
-//         reject(new Error(chrome.runtime.lastError?.message ?? 'User cancelled or capture failed'));
-//         return;
-//       }
-//       resolve(streamId);
-//     });
-//   });
-// }
+//
+// A generic `chooseDesktopMedia` helper used to live here, unused: recording
+// acquires its stream through getDisplayMedia in the offscreen document, and
+// monitoring needs a *screen-only* grant with its own error handling, which
+// lives in `monitoring.capture.ts` next to the state it feeds. Keeping a second
+// general-purpose one here would invite the two features to share a picker
+// whose source list means different things to each.
 
 function getTabStreamId(tabId: number): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -2509,6 +2559,51 @@ chrome.runtime.onMessage.addListener(
         return false;
       }
 
+      // ── Screen monitoring ────────────────────────────────────────────────
+      // The popup only ever sends intents; the session itself lives in the
+      // manager, so closing the popup cannot end somebody's working day (§32).
+      case 'MONITORING_START': {
+        const { intervalSeconds, project } = (message.payload ?? {}) as {
+          intervalSeconds?: MonitoringInterval;
+          project?: string;
+        };
+        void startMonitoringSession({
+          intervalSeconds: intervalSeconds ?? 60,
+          project,
+        }).then((state) => sendResponse(state));
+        return true;
+      }
+
+      case 'MONITORING_STOP': {
+        void stopMonitoringSession().then((state) => sendResponse(state));
+        return true;
+      }
+
+      case 'MONITORING_PAUSE': {
+        void pauseMonitoringSession().then((state) => sendResponse(state));
+        return true;
+      }
+
+      case 'MONITORING_RESUME': {
+        void resumeMonitoringSession().then((state) => sendResponse(state));
+        return true;
+      }
+
+      case 'MONITORING_RECONNECT_CAPTURE': {
+        // The stream died and only the user can authorise a replacement. The
+        // session itself continues untouched, so nothing already recorded is
+        // affected by re-granting.
+        void reconnectMonitoringCapture().then((state) => sendResponse(state));
+        return true;
+      }
+
+      case 'MONITORING_GET_STATE': {
+        // Read-through: a popup opening against a freshly-woken worker must get
+        // the live session's real state, not an empty in-memory default.
+        void loadMonitoringState().then((state) => sendResponse(state));
+        return true;
+      }
+
       case 'GET_STATE': {
         void (async () => {
           await ensureRecordingStateRestored();
@@ -2632,6 +2727,12 @@ async function registerDraft(entry: DraftRecording): Promise<void> {
 
 function handleOffscreenMessage(message: ExtensionMessage & { target?: string }): void {
   switch (message.type as string) {
+    case 'OFFSCREEN_MONITORING_SNAPSHOT_STORED':
+    case 'OFFSCREEN_MONITORING_CAPTURE_ENDED': {
+      void handleMonitoringOffscreenMessage(message.type as string, message.payload);
+      return;
+    }
+
     case 'OFFSCREEN_CAPTURE_ENDED': {
       // The captured surface went away on its own — the user clicked the browser's
       // own "Stop sharing" bar, closed the shared window, or the display went away.
@@ -2809,19 +2910,53 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(({ tabId, frameId, url })
 // event, so without these the toolbar would be missing on that page — and a
 // tab switch with no navigation (e.g. an already-open tab) would otherwise
 // never get logged as a visited URL either.
+// ─── Monitoring activity listeners ────────────────────────────────────────────
+//
+// ONE listener per event, funnelling into `noteActivePage`. The previous code
+// added a second `tabs.onActivated`, a third `tabs.onUpdated` and a second
+// `windows.onFocusChanged` alongside the recording ones, so a single tab switch
+// ran the activity path several times and each pass could open and close an
+// interval — producing duplicate rows for one action.
+//
+// `noteActivePage` is itself idempotent (it compares a stable identity and
+// returns early when nothing meaningful changed), which is what makes several
+// events describing the same navigation collapse into one interval.
+
+/** Resolve the tab an event refers to, tolerating it having closed. */
+const monitoringTab = (tabId: number): Promise<chrome.tabs.Tab | undefined> =>
+  chrome.tabs.get(tabId).catch(() => undefined);
+
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
-  // The active tab within a window only changes because of user interaction
-  // with that window, so treat it as an implicit focus signal too (defense in
-  // depth alongside onFocusChanged, which is documented as occasionally unfired
-  // — see crbug 391471 — so the poll's live chrome.windows.getAll query isn't
-  // the only thing keeping this in sync).
+  // Recording's own bookkeeping (unchanged behaviour).
   lastFocusedWindowId = windowId;
   void ensureToolbarOnActiveTab(tabId);
   void recordVisitedUrl(tabId);
+  // Monitoring.
+  void monitoringTab(tabId).then((tab) => noteActivePage(tab));
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete') {
+    // Recording's visited-URL tracking, deliberately not filtered on `active`.
+    void recordVisitedUrl(tabId, tab.url);
+  }
+  // Monitoring cares only about the tab the user is actually looking at, and
+  // only once it has settled — a URL change fires repeatedly during a load.
+  if (!tab.active) return;
+  if (changeInfo.status === 'complete' || changeInfo.url || changeInfo.title) {
+    void noteActivePage(tab);
+  }
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
-  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    // Every browser window lost focus: the user is in another application.
+    // Without the native agent this is the only signal that the browser is no
+    // longer what they are using, so the page interval must close here or its
+    // time would be credited to a page nobody is looking at.
+    void noteBrowserBlurred();
+    return;
+  }
   lastFocusedWindowId = windowId;
   void (async () => {
     try {
@@ -2829,6 +2964,7 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
       if (tab?.id) {
         await ensureToolbarOnActiveTab(tab.id);
         void recordVisitedUrl(tab.id);
+        void noteActivePage(tab);
       }
     } catch {
       /* window may have closed — ignore */
@@ -2836,26 +2972,55 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
   })();
 });
 
-// Catch-all for cross-window navigation during a screen/entire-screen/window
-// recording: onFocusChanged/onActivated/a tabs.query({active:true}) filter all
-// ultimately depend on the SAME "active tab" bookkeeping, which has been
-// confirmed (by direct testing) to not reliably reflect a real cross-window OS
-// focus change — it can stay stuck reporting the previous window's tab as
-// active even while a different window is genuinely focused and being used.
-// tabs.onUpdated fires whenever ANY tab finishes loading regardless of that
-// bookkeeping, so — deliberately NOT filtered by `tab.active` — it still
-// catches the navigation. recordVisitedUrl's own per-tab dedup (lastUrlByTab)
-// is what keeps an unrelated background tab's occasional silent reload from
-// spamming the list, not this filter.
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status !== 'complete') return;
-  void recordVisitedUrl(tabId, tab.url);
-});
+/*
+ * Single-page-app route changes.
+ *
+ * `onHistoryStateUpdated` is the only signal for a Jira board → Jira issue
+ * navigation: no document loads, so `onUpdated` never reports `complete` and
+ * tab activation never fires. Without this, an afternoon of moving between
+ * pages inside one SPA collapsed into a single undifferentiated interval.
+ *
+ * `onCommitted` covers a real document navigation early, so the interval
+ * boundary lands at the navigation rather than at the end of the page load.
+ */
+const monitoringNavigation = ({ tabId, frameId }: { tabId: number; frameId: number }): void => {
+  if (frameId !== 0) return; // top-level frame only — iframes are not navigations
+  void monitoringTab(tabId).then((tab) => {
+    if (tab?.active) void noteActivePage(tab);
+  });
+};
+
+chrome.webNavigation.onCommitted.addListener(monitoringNavigation);
+chrome.webNavigation.onHistoryStateUpdated.addListener(monitoringNavigation);
+
+/*
+ * The recording-side handlers for these three events were merged into the
+ * consolidated listeners above rather than registered separately.
+ *
+ * Every behaviour they had is preserved there verbatim:
+ *  - `onActivated` still seeds `lastFocusedWindowId` as an implicit focus
+ *    signal (defence in depth alongside onFocusChanged, which is documented as
+ *    occasionally unfired — crbug 391471) and still calls
+ *    ensureToolbarOnActiveTab + recordVisitedUrl.
+ *  - `onFocusChanged` still re-derives the focused window's active tab.
+ *  - `onUpdated` still records a visited URL on `complete` for ANY tab, not
+ *    only the active one: cross-window navigation during a screen recording is
+ *    not reliably reflected in the active-tab bookkeeping, and recordVisitedUrl
+ *    has its own per-tab dedup so an unrelated background reload cannot spam
+ *    the list.
+ *
+ * They live in one place now because registering two listeners for the same
+ * event made a single tab switch run the activity path twice, which produced
+ * duplicate activity intervals for one user action.
+ */
 
 // ─── Startup / Install ────────────────────────────────────────────────────────
 
 chrome.runtime.onStartup.addListener(async () => {
   await authManager.initialize();
+  // Alarms and idle listeners do not survive a worker teardown; a session that
+  // is still open server-side needs both re-armed or it will silently expire.
+  await restoreMonitoringSession();
   void triggerOffscreenQueueProcessing();
   // A browser crash/restart mid-recording would otherwise leave this repeating
   // alarm firing forever with nothing to restore into — restoreStateFromStorage

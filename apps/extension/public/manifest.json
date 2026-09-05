@@ -17,7 +17,9 @@
     "debugger",
     "webNavigation",
     "webRequest",
-    "alarms"
+    "alarms",
+    "idle",
+    "nativeMessaging"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {

@@ -192,6 +192,15 @@ export type MessageType =
   | 'START_GOOGLE_LOGIN'
   | 'OAUTH_LOGIN_COMPLETE'
   | 'CAPTURE_FLUSH'
+  // Screen monitoring — popup ⇄ background. The popup only sends intents; the
+  // session itself is owned by the background (see monitoring.manager.ts).
+  | 'MONITORING_START'
+  | 'MONITORING_STOP'
+  | 'MONITORING_PAUSE'
+  | 'MONITORING_RESUME'
+  | 'MONITORING_GET_STATE'
+  | 'MONITORING_RECONNECT_CAPTURE'
+  | 'MONITORING_STATE_CHANGED'
   // Screenshot workflow messages (background ↔ content script)
   | 'SCREENSHOT_GET_DIMENSIONS'
   | 'SCREENSHOT_EXPAND_SCROLLERS'

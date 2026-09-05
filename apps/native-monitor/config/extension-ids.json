@@ -1,0 +1,7 @@
+{
+  "_comment": "Extension origins permitted to open the native messaging port. Chrome refuses any origin not listed here, which is the mechanism that stops another extension from driving this agent. Never use a wildcard.",
+  "production": "heogonedpcjllemcclnbedlgnnijhloi",
+  "staging": "heogonedpcjllemcclnbedlgnnijhloi",
+  "development": "heogonedpcjllemcclnbedlgnnijhloi",
+  "_note": "All three are identical today because the extension manifest pins a 'key', so an unpacked developer build gets the same id as a packed one. Split them the moment a separate staging key exists."
+}

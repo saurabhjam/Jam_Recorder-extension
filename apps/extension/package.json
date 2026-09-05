@@ -13,7 +13,8 @@
     "build:qa": "vite build --mode qa",
     "build:prod": "vite build --mode production",
     "type-check": "tsc --noEmit",
-    "lint": "eslint src --ext ts,tsx"
+    "lint": "eslint src --ext ts,tsx",
+    "test": "node test/run.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

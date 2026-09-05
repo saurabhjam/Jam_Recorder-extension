@@ -21,6 +21,14 @@ import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
 import { recordingOpfsName, saveBlobToIDB, micBlobKey } from '@/utils/blobStorage';
 import {
+  startMonitoringCapture,
+  stopMonitoringCapture,
+  pauseMonitoringCapture,
+  flushMonitoringCapture,
+  getMonitoringCaptureHealth,
+  isMonitoringCaptureActive,
+} from './monitoring.capture';
+import {
   buildShareUrl,
   API_BASE_URL as REPORTS_URL,
   SSO_TOKEN_URL,
@@ -1255,6 +1263,59 @@ chrome.runtime.onMessage.addListener((message: OffscreenIncomingMessage, _sender
         .then(() => sendResponse({ success: true }))
         .catch((err: Error) => sendResponse({ error: err.message }));
       return true;
+    }
+
+    // ── Screen monitoring ──────────────────────────────────────────────────
+    // Capture lives in this document because a service worker has no canvas and
+    // no getDisplayMedia, and because holding the stream here is what keeps it
+    // alive across the worker's constant teardowns.
+    case 'OFFSCREEN_MONITORING_START_CAPTURE': {
+      const payload = message.payload as {
+        project: string;
+        sessionId: string;
+        intervalSeconds: 30 | 60;
+        streamId: string;
+      };
+      startMonitoringCapture(payload)
+        .then((result) => sendResponse(result))
+        .catch((err: Error) =>
+          sendResponse({
+            started: false,
+            error: err.message,
+            health: getMonitoringCaptureHealth(),
+          }),
+        );
+      return true;
+    }
+
+    case 'OFFSCREEN_MONITORING_STOP_CAPTURE': {
+      stopMonitoringCapture();
+      sendResponse({ success: true });
+      return false;
+    }
+
+    case 'OFFSCREEN_MONITORING_PAUSE_CAPTURE': {
+      // Releases the stream but leaves the queue draining — frames already
+      // captured are still valid and must still be uploaded.
+      pauseMonitoringCapture();
+      sendResponse({ success: true });
+      return false;
+    }
+
+    case 'OFFSCREEN_MONITORING_FLUSH': {
+      flushMonitoringCapture()
+        .then(() => sendResponse({ success: true }))
+        .catch((err: Error) => sendResponse({ error: err.message }));
+      return true;
+    }
+
+    case 'OFFSCREEN_MONITORING_HEALTH_QUERY': {
+      // The background's watchdog. Returns the explicit capture state plus a
+      // live read of the video track — never "is there a timer object", which
+      // answers neither whether the stream is alive nor whether frames are
+      // being taken.
+      sendResponse({ health: getMonitoringCaptureHealth(), active: isMonitoringCaptureActive() });
+      return false;
     }
 
     case 'OFFSCREEN_PROCESS_QUEUE': {

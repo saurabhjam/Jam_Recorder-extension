@@ -80,7 +80,8 @@ type View =
   | 'upload'
   | 'login'
   | 'bug-report'
-  | 'annotation';
+  | 'annotation'
+  | 'monitoring';
 
 type MainTab = 'record' | 'screenshot';
 type ScreenshotType = 'full-page' | 'area' | 'visible';
@@ -323,6 +324,15 @@ export function HomeView({ onNavigate }: HomeViewProps) {
         </div>
 
         <div className="flex items-center gap-1">
+          {/* Screen monitoring is a separate product from recording, so it gets
+              its own entry rather than being folded into the record tabs. */}
+          <button
+            onClick={() => onNavigate('monitoring')}
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"
+            title="Screen Monitoring"
+          >
+            <Monitor size={15} />
+          </button>
           <button
             onClick={() => onNavigate('library')}
             className="w-7 h-7 flex items-center justify-center rounded-lg text-dark-400 hover:text-white hover:bg-white/8 transition-all"

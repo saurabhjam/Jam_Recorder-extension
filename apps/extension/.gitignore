@@ -9,3 +9,4 @@ dist
 # Extension signing key (pins the extension ID — never commit or ship in the zip)
 extension-key.pem
 *.zip
+test/.build/

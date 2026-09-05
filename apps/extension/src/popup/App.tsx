@@ -11,6 +11,7 @@ import { LibraryView } from './views/LibraryView';
 import { BugReportView } from './views/BugReportView';
 import { AnnotationView } from './views/AnnotationView';
 import { SettingsView } from './views/SettingsView';
+import { MonitoringView } from './views/MonitoringView';
 
 type View =
   | 'login'
@@ -20,7 +21,8 @@ type View =
   | 'library'
   | 'settings'
   | 'bug-report'
-  | 'annotation';
+  | 'annotation'
+  | 'monitoring';
 
 const PAGE_VARIANTS = {
   initial: { opacity: 0, x: 20 },
@@ -238,6 +240,20 @@ export default function App() {
             className="flex-1 overflow-hidden"
           >
             <SettingsView onBack={() => navigate('home')} />
+          </motion.div>
+        )}
+
+        {currentView === 'monitoring' && (
+          <motion.div
+            key="monitoring"
+            variants={PAGE_VARIANTS}
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            transition={PAGE_TRANSITION}
+            className="flex-1 overflow-hidden"
+          >
+            <MonitoringView onBack={() => navigate('home')} />
           </motion.div>
         )}
 

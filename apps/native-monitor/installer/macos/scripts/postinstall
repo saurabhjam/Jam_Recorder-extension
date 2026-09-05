@@ -1,0 +1,103 @@
+#!/bin/bash
+#
+# Registers the native messaging host after the payload is installed.
+#
+# This script is the whole reason the user never has to create a directory,
+# copy a JSON file or run chmod: Chrome will only launch a native host it has a
+# manifest for, in a browser-specific directory, and an extension cannot write
+# that itself — by design. So the installer does it.
+#
+# Runs as the *installing user* for a user-domain install, which is what we
+# want: the host must live in that user's Chrome profile directories, and the
+# agent must run in their interactive desktop session to see the foreground
+# window at all.
+set -euo pipefail
+
+HOST_NAME="com.bestq.monitoring"
+AGENT="/usr/local/bestq/bestq-monitoring-agent"
+MANIFEST_SRC="/usr/local/bestq/${HOST_NAME}.json"
+
+# `install -d` + explicit chmod: the payload's own permissions are not enough
+# because these directories may not exist at all on a fresh machine.
+chmod 755 "$AGENT" 2>/dev/null || true
+
+# Re-sign in place, every install — including upgrades.
+#
+# macOS records the code signature of the binary it granted Accessibility to.
+# Replacing that binary with one carrying a different signature makes the
+# kernel SIGKILL it the instant it launches: no output, no error, just an agent
+# that dies on every connect and a monitoring session with no application
+# activity at all. An ad-hoc signature applied after the copy gives the new
+# binary a valid identity at this path.
+#
+# This is a fallback for unsigned builds. A properly Developer ID-signed and
+# notarised payload keeps its own signature across upgrades and does not need
+# it — hence `|| true`, so a real signature is never clobbered into an ad-hoc
+# one on a machine where codesign is unavailable.
+if [ ! -s "${AGENT}.sig-preserved" ]; then
+  /usr/bin/codesign --force --sign - "$AGENT" 2>/dev/null || true
+fi
+
+# Resolve the real user even when installed via `sudo installer`.
+TARGET_USER="${USER:-}"
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
+  TARGET_USER="$(stat -f '%Su' /dev/console)"
+fi
+TARGET_HOME="$(dscl . -read "/Users/${TARGET_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+[ -z "$TARGET_HOME" ] && TARGET_HOME="/Users/${TARGET_USER}"
+
+SUPPORT="${TARGET_HOME}/Library/Application Support"
+
+# Every Chromium-family browser keeps its own directory. Registering in all of
+# them means the extension connects whichever browser the user actually runs,
+# rather than only Chrome.
+DIRS=(
+  "${SUPPORT}/Google/Chrome/NativeMessagingHosts"
+  "${SUPPORT}/Google/Chrome Beta/NativeMessagingHosts"
+  "${SUPPORT}/Google/Chrome Canary/NativeMessagingHosts"
+  "${SUPPORT}/Chromium/NativeMessagingHosts"
+  "${SUPPORT}/BraveSoftware/Brave-Browser/NativeMessagingHosts"
+  "${SUPPORT}/Microsoft Edge/NativeMessagingHosts"
+)
+
+for dir in "${DIRS[@]}"; do
+  # Only register where the browser's support directory already exists — its
+  # parent appearing later is handled by the LaunchAgent's re-registration on
+  # first run, and creating directories for browsers the user does not have
+  # would litter their Library.
+  parent="$(dirname "$dir")"
+  if [ -d "$parent" ]; then
+    /usr/bin/install -d -m 755 -o "$TARGET_USER" "$dir"
+    /usr/bin/install -m 644 -o "$TARGET_USER" "$MANIFEST_SRC" "${dir}/${HOST_NAME}.json"
+    echo "registered ${dir}/${HOST_NAME}.json"
+  fi
+done
+
+# A LaunchAgent, not a LaunchDaemon.
+#
+# A daemon runs in session 0 with no access to the user's window server, so it
+# could not read the foreground window — the one thing this agent exists to do.
+# The agent is normally launched on demand by Chrome; this LaunchAgent exists
+# only to re-run registration at login, so a browser installed after BestQ
+# still gets its manifest without the user doing anything.
+PLIST_DIR="${TARGET_HOME}/Library/LaunchAgents"
+/usr/bin/install -d -m 755 -o "$TARGET_USER" "$PLIST_DIR"
+cat > "${PLIST_DIR}/com.bestq.monitoring.register.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.bestq.monitoring.register</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bestq/register-hosts.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>${TARGET_HOME}/Library/Logs/BestQ/register.log</string>
+</dict>
+</plist>
+PLIST
+chown "$TARGET_USER" "${PLIST_DIR}/com.bestq.monitoring.register.plist" 2>/dev/null || true
+
+echo "BestQ monitoring agent installed. Restart the browser to pick up the host."
+exit 0

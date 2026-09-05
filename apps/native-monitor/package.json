@@ -1,0 +1,22 @@
+{
+  "name": "@bestq/native-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BestQ native desktop monitoring agent (Go) — reports the OS foreground application and system-wide idle time to the BestQ extension over Chrome Native Messaging",
+  "scripts": {
+    "build": "make all",
+    "build:native:windows": "make build-windows",
+    "build:native:macos": "make build-darwin",
+    "build:native:linux": "make build-linux",
+    "package:macos": "make package-macos",
+    "package:linux": "make package-linux",
+    "package:windows": "make package-windows",
+    "test": "make test",
+    "probe": "make probe",
+    "clean": "make clean"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
