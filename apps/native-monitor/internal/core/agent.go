@@ -1,6 +1,8 @@
 package core
 
 import (
+	"encoding/base64"
+	"errors"
 	"runtime"
 	"sync"
 	"time"
@@ -31,6 +33,15 @@ import (
 const (
 	// SampleInterval — see the note above.
 	SampleInterval = 2 * time.Second
+	// ScreenshotMaxEdge is the longest edge of a stored capture.
+	//
+	// 1280 keeps window titles, tab strips and ordinary application UI
+	// legible, which is the entire purpose of the image, while a 4K frame at
+	// full resolution would be several megabytes per capture.
+	ScreenshotMaxEdge = 1280
+	// ScreenshotTargetBytes is the per-frame byte budget the encoder aims at.
+	ScreenshotTargetBytes = 30 * 1024
+
 	// HeartbeatInterval — the extension treats silence past ~3x this as a dead
 	// agent, so 20s gives it room to notice without chattering.
 	HeartbeatInterval = 20 * time.Second
@@ -60,9 +71,16 @@ type Agent struct {
 
 	state     State
 	sessionID string
+	// screenshotEvery is the capture cadence the extension asked for. Zero
+	// means it does not want frames from the agent.
+	screenshotEvery time.Duration
 
 	stop chan struct{}
 	done chan struct{}
+
+	// capturing guards against overlapping screen captures, for the same
+	// reason sampling does.
+	capturing bool
 
 	// sampling guards against overlapping probes: an OS query slower than the
 	// interval (a machine under load, a permission prompt) must not stack up
@@ -157,7 +175,7 @@ func (a *Agent) Hello() {
 }
 
 // StartMonitoring binds a session and begins sampling.
-func (a *Agent) StartMonitoring(sessionID string, idleThresholdSeconds int) {
+func (a *Agent) StartMonitoring(sessionID string, idleThresholdSeconds, screenshotIntervalSeconds int) {
 	a.mu.Lock()
 	if a.state == StateMonitoring && a.sessionID == sessionID {
 		a.mu.Unlock()
@@ -173,6 +191,11 @@ func (a *Agent) StartMonitoring(sessionID string, idleThresholdSeconds int) {
 	a.mu.Lock()
 	a.state = StateStarting
 	a.sessionID = sessionID
+	if screenshotIntervalSeconds > 0 {
+		a.screenshotEvery = time.Duration(screenshotIntervalSeconds) * time.Second
+	} else {
+		a.screenshotEvery = 0
+	}
 	a.stop = make(chan struct{})
 	a.done = make(chan struct{})
 	stop, done := a.stop, a.done
@@ -322,6 +345,26 @@ func (a *Agent) loop(stop <-chan struct{}, done chan<- struct{}) {
 	heartbeatTicker := time.NewTicker(HeartbeatInterval)
 	defer heartbeatTicker.Stop()
 
+	// The capture cadence runs here, in the agent, because a native timer is
+	// the only reliable one available. A service worker is torn down every
+	// thirty seconds and an offscreen document is throttled while the browser
+	// is in the background — which, for a tool whose job is to watch what
+	// someone does in *other* applications, is most of the time.
+	a.mu.Lock()
+	every := a.screenshotEvery
+	a.mu.Unlock()
+
+	var captureTicker *time.Ticker
+	var captureTick <-chan time.Time
+	if every > 0 {
+		captureTicker = time.NewTicker(every)
+		defer captureTicker.Stop()
+		captureTick = captureTicker.C
+		// The first frame goes out immediately: a session that starts at
+		// 10:00:00 should have a 10:00:00 screenshot, not its first at 10:00:30.
+		go a.captureOnce()
+	}
+
 	a.sampleOnce()
 
 	for {
@@ -330,6 +373,11 @@ func (a *Agent) loop(stop <-chan struct{}, done chan<- struct{}) {
 			return
 		case <-sampleTicker.C:
 			a.sampleOnce()
+		case <-captureTick:
+			// On its own goroutine: encoding a frame takes longer than the
+			// two-second sampling interval, and blocking here would stall
+			// foreground detection for the duration of every capture.
+			go a.captureOnce()
 		case <-heartbeatTicker.C:
 			// Capabilities ride along with every heartbeat, not just the
 			// initial READY. A user who grants Accessibility while monitoring
@@ -344,6 +392,79 @@ func (a *Agent) loop(stop <-chan struct{}, done chan<- struct{}) {
 			a.send(beat)
 		}
 	}
+}
+
+// CaptureScreenNow serves an explicit CAPTURE_SCREEN request.
+//
+// Same path as the ticker, so an on-demand frame and a scheduled one cannot
+// differ in what they capture or how they fail.
+func (a *Agent) CaptureScreenNow() { a.captureOnce() }
+
+// captureOnce grabs the whole screen and pushes it to the extension.
+//
+// Whole screen, always. There is no window or region path, which is the point:
+// the browser picker offered those choices, no browser API could remove them,
+// and a monitoring session aimed at one tab produces a report that looks
+// complete and is not.
+//
+// A failure is reported, never substituted. If the screen cannot be read the
+// extension is told so and stops the session — it must not fall back to
+// capturing something narrower.
+func (a *Agent) captureOnce() {
+	a.mu.Lock()
+	if a.state != StateMonitoring {
+		a.mu.Unlock()
+		return
+	}
+	// Guarded like sampling: an encode slower than the interval must not stack
+	// captures behind it, which would spend the machine's CPU exactly when it
+	// is least able to spare it.
+	if a.capturing {
+		a.mu.Unlock()
+		return
+	}
+	a.capturing = true
+	session := a.sessionID
+	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		a.capturing = false
+		a.mu.Unlock()
+	}()
+
+	capturedAt := time.Now().UTC()
+	frame, err := a.monitor.CaptureScreen(ScreenshotMaxEdge, ScreenshotTargetBytes)
+	if err != nil {
+		switch {
+		case errors.Is(err, platform.ErrScreenPermission):
+			a.send(protocol.Errorf(protocol.ErrPermissionRequired,
+				"Screen Recording permission is required to capture the screen."))
+			Logf("WARN", "screen_capture_denied")
+		case errors.Is(err, platform.ErrScreenUnsupported):
+			a.send(protocol.Errorf(protocol.ErrUnsupportedPlatform,
+				"Whole-screen capture is not available on this platform."))
+			Logf("WARN", "screen_capture_unsupported")
+		default:
+			a.send(protocol.Errorf(protocol.ErrCaptureFailed, "The screen could not be captured."))
+			Logf("WARN", "screen_capture_failed", "error", err.Error())
+		}
+		return
+	}
+
+	out := protocol.NewOutbound(protocol.TypeScreenFrame)
+	out.SessionID = session
+	out.Frame = &protocol.ScreenFrame{
+		MimeType:     frame.MimeType,
+		Data:         base64.StdEncoding.EncodeToString(frame.Data),
+		Width:        frame.Width,
+		Height:       frame.Height,
+		Bytes:        len(frame.Data),
+		CapturedAt:   capturedAt.Format(time.RFC3339Nano),
+		DisplayCount: frame.DisplayCount,
+		SessionID:    session,
+	}
+	a.send(out)
 }
 
 func (a *Agent) sampleOnce() {

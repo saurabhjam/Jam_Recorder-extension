@@ -1,0 +1,25 @@
+Windows Registry Editor Version 5.00
+
+; Restricts the BestQ extension's share picker to "Entire screen".
+;
+; Read installer/chrome-policy/README.md first: the master switch below is a
+; GLOBAL deny, so any origin missing from the allowlists loses screen sharing.
+; Add every tool your team shares from to the ALLOW_FULL_CHOICE entries.
+;
+; Apply with:  reg import windows-screen-only.reg   (as Administrator)
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome]
+"ScreenCaptureAllowed"=dword:00000000
+
+; Whole-screen capture: the extension, plus anything that needs it.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ScreenCaptureAllowedByOrigins]
+"1"="chrome-extension://heogonedpcjllemcclnbedlgnnijhloi"
+"2"="https://meet.google.com"
+
+; Window capture: NOT the extension — this is what removes the "Window" tab.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\WindowCaptureAllowedByOrigins]
+"1"="https://meet.google.com"
+
+; Tab capture: NOT the extension — this removes the "Chrome tab" tab.
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\TabCaptureAllowedByOrigins]
+"1"="https://meet.google.com"

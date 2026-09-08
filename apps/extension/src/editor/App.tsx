@@ -29,6 +29,7 @@ import {
   deleteRecordingBlob,
   loadBlobFromIDB,
   micBlobKey,
+  systemBlobKey,
 } from '@/utils/blobStorage';
 import { STORAGE_KEYS, type DraftRecording } from '@/types';
 
@@ -44,6 +45,8 @@ interface EditorData {
   consoleLogs: ConsoleLog[];
   networkCaptures: NetworkCapture[];
   visitedUrls?: VisitedUrl[];
+  /** The recorded file's own audio track already carries system audio AND mic. */
+  audioMixed?: boolean;
 }
 
 interface VisitedUrl {
@@ -138,83 +141,135 @@ function formatRemaining(expiresAt: number | null): string {
 }
 
 /**
- * Re-encode a recorded video blob to [startSec, endSec] entirely in the browser,
- * optionally dropping its audio.
- *
- * There's no ffmpeg here, so we re-record: play the source <video> from the trim
- * start to the trim end while capturing its stream through MediaRecorder. This is
- * real-time (a 30s clip takes ~30s) but needs no native deps and preserves audio.
- * `onProgress` reports 0–1 based on how far through the selection we are.
- *
- * `audio` controls the mix. The mic is recorded to its own blob (see
- * offscreen/index.ts), so it's played back alongside the video and the two are
- * summed here through gain-free source nodes — muting either simply omits it.
- * Muting both yields a video-only (silent) export.
+ * How long a re-encode may run past the material it is re-encoding before we stop
+ * waiting and keep what was captured. Playback is real time, so the budget scales
+ * with the selection; the constant is the slack for load/seek/flush on top.
  */
-async function trimVideoBlob(
+const REENCODE_SLACK_MS = 20_000;
+/** No progress at all for this long means the source video is wedged (a decoder
+ *  stall, a dead blob URL). Salvage rather than wait for a tick that never comes. */
+const REENCODE_STALL_MS = 12_000;
+
+/** Await an event on a media element with a timeout, resolving `false` on timeout. */
+function waitForEvent(el: HTMLMediaElement, event: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      el.removeEventListener(event, onEvent);
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const onEvent = (): void => done(true);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    el.addEventListener(event, onEvent, { once: true });
+  });
+}
+
+/**
+ * Re-encode a recorded video blob to [startSec, endSec] entirely in the browser,
+ * optionally replacing its audio with a separately-recorded track.
+ *
+ * This is the SLOW path and it is deliberately reserved for the two things that
+ * genuinely cannot be done to a finished WebM without a muxer: trimming it, and
+ * swapping which audio source it carries. Everything else — the overwhelmingly
+ * common "just save it" — uploads the recorded file untouched (see getExportBlob).
+ * There is no ffmpeg here, so re-encoding means re-recording: play the source from
+ * the trim start to the trim end while capturing its stream through MediaRecorder,
+ * in real time (a 30s clip takes ~30s).
+ *
+ * Every wait in here is bounded, because every one of them is a way a save can hang
+ * forever with the progress bar sitting at "Trimming":
+ *   - metadata/seek events that never fire (a seek to a position we are already at
+ *     emits nothing at all, which alone was enough to wedge a full-clip export),
+ *   - `requestAnimationFrame`, which does not run while the editor tab is in the
+ *     background — switching tabs mid-save froze the export until the user came back,
+ *   - a decoder that stalls partway, leaving `ended` false and currentTime frozen.
+ * Whatever has been captured when a bound is hit is returned instead of thrown away;
+ * the caller falls back to the untouched recording if even that is unusable.
+ *
+ * `audio` decides the output's sound: `own` keeps the source's own track (a current
+ * recording already carries system + mic), `replace` swaps in `audioBlob` (a
+ * mic-only or system-only side track), `mix` sums the two — needed only for older
+ * recordings whose mic was never folded in — and `none` produces a silent video.
+ */
+type ExportAudioMode = 'own' | 'replace' | 'mix' | 'none';
+
+async function reencodeVideoBlob(
   blob: Blob,
   startSec: number,
   endSec: number,
   onProgress?: (fraction: number) => void,
-  audio: { micBlob?: Blob | null; muteSystem?: boolean; muteMic?: boolean } = {},
+  audio: { mode?: ExportAudioMode; audioBlob?: Blob | null } = {},
 ): Promise<Blob> {
-  const { micBlob = null, muteSystem = false, muteMic = false } = audio;
+  const { mode = 'own', audioBlob = null } = audio;
   const url = URL.createObjectURL(blob);
   const video = document.createElement('video');
   video.src = url;
   video.muted = true; // muted so autoplay is allowed; audio track is still captured
   video.playsInline = true;
+  video.preload = 'auto';
 
-  // The mic lives in its own file, so it's played back alongside the video and the
-  // two are mixed here — that's what makes muting one without the other possible.
-  const micUrl = micBlob ? URL.createObjectURL(micBlob) : null;
-  const micEl = micUrl ? new Audio(micUrl) : null;
-  if (micEl) micEl.muted = true; // as above: keep it off the speakers, still capturable
+  // The replacement track is a separate file, so it is played back alongside the
+  // video and captured from that element.
+  const auxUrl =
+    (mode === 'replace' || mode === 'mix') && audioBlob ? URL.createObjectURL(audioBlob) : null;
+  const auxEl = auxUrl ? new Audio(auxUrl) : null;
+  if (auxEl) {
+    auxEl.muted = true; // keep it off the speakers; captureStream still sees it
+    auxEl.preload = 'auto';
+  }
   let audioCtx: AudioContext | null = null;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => resolve();
-      video.onerror = () => reject(new Error('Could not load recording for trimming'));
-    });
-    if (micEl) {
-      await new Promise<void>((resolve) => {
-        // A missing/!unreadable mic track must not block the export.
-        micEl.onloadedmetadata = () => resolve();
-        micEl.onerror = () => resolve();
-      });
+    if (video.readyState < 1 /* HAVE_METADATA */) {
+      const loaded = await Promise.race([
+        waitForEvent(video, 'loadedmetadata', 15_000),
+        waitForEvent(video, 'error', 15_000).then(() => false),
+      ]);
+      if (!loaded && video.readyState < 1) {
+        throw new Error('Could not load the recording for re-encoding');
+      }
+    }
+    if (auxEl && auxEl.readyState < 1) {
+      // A missing/unreadable side track must not block the export.
+      await waitForEvent(auxEl, 'loadedmetadata', 5000);
     }
 
     const capture = video as HTMLVideoElement & { captureStream?: () => MediaStream };
     const stream = capture.captureStream?.();
-    if (!stream) throw new Error('captureStream unavailable — cannot trim in this browser');
+    if (!stream) throw new Error('captureStream unavailable — cannot re-encode in this browser');
 
-    // Pull the source audio out of the recorded stream so it can be re-mixed with
-    // per-source gains instead of being passed through wholesale.
-    const systemTracks = stream.getAudioTracks();
-    for (const track of systemTracks) stream.removeTrack(track);
+    // Decide the output's audio track. The source's own audio already rides along
+    // inside `stream`, so `own` needs no work at all; every other mode rebuilds the
+    // track, because MediaRecorder encodes only the FIRST audio track of a stream —
+    // two sources have to be summed through an AudioContext, not simply added.
+    const sourceAudioTracks = stream.getAudioTracks();
+    if (mode !== 'own') {
+      for (const track of sourceAudioTracks) stream.removeTrack(track);
 
-    const wantSystem = !muteSystem && systemTracks.length > 0;
-    const micCapture = micEl as (HTMLAudioElement & { captureStream?: () => MediaStream }) | null;
-    const micStreamForMix = !muteMic && micCapture ? micCapture.captureStream?.() : undefined;
-    const micTracks = micStreamForMix?.getAudioTracks() ?? [];
-    const wantMic = micTracks.length > 0;
+      const auxCapture = auxEl as (HTMLAudioElement & { captureStream?: () => MediaStream }) | null;
+      const auxTracks =
+        mode === 'replace' || mode === 'mix'
+          ? (auxCapture?.captureStream?.().getAudioTracks() ?? [])
+          : [];
+      const keepSource = mode === 'mix' && sourceAudioTracks.length > 0;
 
-    if (wantSystem || wantMic) {
-      audioCtx = new AudioContext();
-      const dest = audioCtx.createMediaStreamDestination();
-      if (wantSystem) {
-        audioCtx.createMediaStreamSource(new MediaStream(systemTracks)).connect(dest);
+      if (auxTracks.length > 0 || keepSource) {
+        audioCtx = new AudioContext();
+        const dest = audioCtx.createMediaStreamDestination();
+        if (keepSource) {
+          audioCtx.createMediaStreamSource(new MediaStream(sourceAudioTracks)).connect(dest);
+        }
+        if (auxTracks.length > 0) {
+          audioCtx.createMediaStreamSource(new MediaStream(auxTracks)).connect(dest);
+        }
+        for (const t of dest.stream.getAudioTracks()) stream.addTrack(t);
       }
-      if (wantMic) {
-        audioCtx.createMediaStreamSource(new MediaStream(micTracks)).connect(dest);
-      }
-      for (const t of dest.stream.getAudioTracks()) stream.addTrack(t);
+      // Anything dropped rather than re-routed keeps decoding until it is stopped.
+      if (!keepSource) for (const t of sourceAudioTracks) t.stop();
     }
-    // Neither wanted → the stream stays video-only, i.e. a silent export.
-
-    // Stop the discarded source tracks so they don't keep decoding in the background.
-    if (!wantSystem) for (const t of systemTracks) t.stop();
 
     // Prefer a codec the recorder actually supports; fall back to default.
     const preferred = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
@@ -226,51 +281,142 @@ async function trimVideoBlob(
     };
     const stopped = new Promise<void>((resolve) => {
       recorder.onstop = () => resolve();
+      recorder.onerror = () => resolve(); // keep what was captured before the error
     });
 
-    // Seek to the start of the selection before recording.
-    video.currentTime = startSec;
-    await new Promise<void>((resolve) => {
-      video.onseeked = () => resolve();
-    });
-    // Line the mic up with the same instant — both were recorded from t=0.
-    if (micEl && micTracks.length > 0) {
-      micEl.currentTime = Math.min(startSec, micEl.duration || startSec);
+    // Seek to the start of the selection. A seek to where we already are fires no
+    // `seeked` event at all, so this is a bounded wait, not a blocking one.
+    if (Math.abs(video.currentTime - startSec) > 0.05) {
+      video.currentTime = startSec;
+      await waitForEvent(video, 'seeked', 8000);
+    }
+    if (auxEl && isFinite(auxEl.duration)) {
+      auxEl.currentTime = Math.min(startSec, auxEl.duration);
     }
 
-    recorder.start(100);
-    await video.play();
-    if (micEl && micTracks.length > 0) {
+    recorder.start(1000);
+    try {
+      await video.play();
+    } catch (err) {
+      // Autoplay refused on a muted element is not something we can recover from,
+      // and there is nothing to salvage yet — let the caller use the original file.
+      recorder.stop();
+      throw err instanceof Error ? err : new Error('Could not play the recording back');
+    }
+    if (auxEl) {
       try {
-        await micEl.play();
+        await auxEl.play();
       } catch {
-        /* mic playback blocked → export continues with system audio only */
+        /* side-track playback blocked → export continues with what the video has */
       }
     }
 
+    const span = Math.max(0.001, endSec - startSec);
+    const deadline = Date.now() + span * 1000 + REENCODE_SLACK_MS;
     await new Promise<void>((resolve) => {
-      const tick = () => {
+      let lastTime = video.currentTime;
+      let lastProgressAt = Date.now();
+      // setInterval, NOT requestAnimationFrame: rAF is suspended while the tab is
+      // hidden, and this loop is what ends the recording. Timers are throttled in a
+      // background tab but they still fire, so a save survives the user switching
+      // away — which is exactly when these hangs were reported.
+      const timer = window.setInterval(() => {
         const t = video.currentTime;
-        onProgress?.(Math.max(0, Math.min(1, (t - startSec) / Math.max(0.001, endSec - startSec))));
-        if (t >= endSec || video.ended) {
-          resolve();
-          return;
+        onProgress?.(Math.max(0, Math.min(1, (t - startSec) / span)));
+        if (t > lastTime + 0.01) {
+          lastTime = t;
+          lastProgressAt = Date.now();
         }
-        requestAnimationFrame(tick);
-      };
-      tick();
+        const stalled = Date.now() - lastProgressAt > REENCODE_STALL_MS;
+        if (t >= endSec || video.ended || video.error || stalled || Date.now() > deadline) {
+          if (stalled || Date.now() > deadline) {
+            console.warn(
+              '[Editor] Re-encode cut short at',
+              t,
+              'of',
+              endSec,
+              '— keeping what was captured',
+            );
+          }
+          window.clearInterval(timer);
+          resolve();
+        }
+      }, 200);
     });
 
     video.pause();
-    micEl?.pause();
-    recorder.stop();
-    await stopped;
-    return new Blob(chunks, { type: mimeType.split(';')[0] || 'video/webm' });
+    auxEl?.pause();
+    if (recorder.state !== 'inactive') recorder.stop();
+    // Bounded as well: a recorder wedged on a dead source must not strand the save.
+    await Promise.race([stopped, new Promise<void>((r) => setTimeout(r, 10_000))]);
+    const out = new Blob(chunks, { type: mimeType.split(';')[0] || 'video/webm' });
+    if (out.size === 0) throw new Error('Re-encode produced an empty file');
+    return out;
   } finally {
+    // Release the decoder/network for the source before dropping the URLs, or a
+    // long recording keeps its buffers alive for the rest of the session.
+    try {
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    } catch {
+      /* element already torn down */
+    }
     URL.revokeObjectURL(url);
-    if (micUrl) URL.revokeObjectURL(micUrl);
+    if (auxUrl) URL.revokeObjectURL(auxUrl);
     void audioCtx?.close().catch(() => {});
   }
+}
+
+/**
+ * Does this recording's own audio track already carry every source (system + mic)?
+ *
+ * Answered per-recording from the Drafts entry, because EDITOR_DATA is a single slot
+ * that always holds the LATEST recording — reading the flag from there while an
+ * older draft is open would describe the wrong file. Falls back to EDITOR_DATA only
+ * when it is about this very recording, and otherwise to `false`, which is the
+ * conservative answer: it costs a re-encode, where guessing the other way would
+ * play the mic twice.
+ */
+async function readAudioMixed(recordingId: string): Promise<boolean> {
+  const result = await chrome.storage.local.get([STORAGE_KEYS.DRAFTS_INDEX, EDITOR_DATA_KEY]);
+  const drafts = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
+  const draft = drafts.find((d) => d.recordingId === recordingId);
+  if (draft) return !!draft.audioMixed;
+  const stored = result[EDITOR_DATA_KEY] as EditorData | undefined;
+  return stored?.recordingId === recordingId ? !!stored.audioMixed : false;
+}
+
+/**
+ * The editor payload for `recordingId`, or null when there is none for it.
+ *
+ * EDITOR_DATA is a single slot holding whatever was recorded LAST, so it answers for
+ * the recording it names and no other. Opening an older draft used to read it
+ * regardless — showing another recording's title and duration, and saving that
+ * recording's console/network logs against this one's video. When it isn't ours, the
+ * Drafts entry stands in: it has no captured logs, but everything it does say is
+ * about the right file.
+ */
+async function loadEditorData(recordingId: string): Promise<EditorData | null> {
+  const result = await chrome.storage.local.get([EDITOR_DATA_KEY, STORAGE_KEYS.DRAFTS_INDEX]);
+  const stored = result[EDITOR_DATA_KEY] as EditorData | undefined;
+  if (stored && (!recordingId || stored.recordingId === recordingId)) return stored;
+
+  const drafts = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
+  const draft = drafts.find((d) => d.recordingId === recordingId);
+  if (!draft) return null;
+  return {
+    recordingId: draft.recordingId,
+    thumbnailDataUrl: draft.thumbnailDataUrl,
+    duration: draft.duration,
+    blobSize: draft.blobSize,
+    title: draft.title,
+    recordingType: draft.recordingType,
+    consoleLogs: [],
+    networkCaptures: [],
+    visitedUrls: [],
+    audioMixed: draft.audioMixed,
+  };
 }
 
 /**
@@ -359,8 +505,17 @@ export function EditorApp() {
   const [uploadPercent, setUploadPercent] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  // Progress phase label shown next to the % while saving (trim → upload).
-  const [saveStage, setSaveStage] = useState<'idle' | 'trimming' | 'uploading'>('idle');
+  // Non-fatal: the recording saved, just not exactly as asked (a trim/mute that the
+  // browser could not apply). Kept apart from uploadError so a successful save is
+  // never dressed up as a failure.
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  // Progress phase label shown next to the % while saving. "Trimming" is only ever
+  // shown once a re-encode has actually started reporting progress — it used to be
+  // set before the recording was even read from disk, so every slow or stuck save
+  // looked like a trim the user never asked for.
+  const [saveStage, setSaveStage] = useState<'idle' | 'preparing' | 'trimming' | 'uploading'>(
+    'idle',
+  );
   const [isDownloading, setIsDownloading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<LogTab>('console');
@@ -371,14 +526,22 @@ export function EditorApp() {
   const [videoDuration, setVideoDuration] = useState(0);
   const [trimStart, setTrimStart] = useState(0);
   const [trimEnd, setTrimEnd] = useState(1); // 0–1 fractions of total duration
-  // Independent audio mutes for the saved/downloaded file. The mic is recorded to
-  // its own track (see offscreen/index.ts), so each source can be dropped on its own.
+  // Independent audio mutes for the saved/downloaded file. The recording's own track
+  // carries both sources summed, and each is ALSO recorded on its own (see
+  // offscreen/index.ts) — which is what lets either one be dropped after the fact.
   const [muteSystemAudio, setMuteSystemAudio] = useState(false);
   const [muteMic, setMuteMic] = useState(false);
-  // Object URL + blob for the separately-recorded mic track, when one exists.
+  // Object URLs + blobs for the audio-only side tracks, when they exist. They back
+  // the mute toggles only — the main recording already contains everything.
   const [micUrl, setMicUrl] = useState<string | null>(null);
   const micBlobRef = useRef<Blob | null>(null);
-  const micAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [systemUrl, setSystemUrl] = useState<string | null>(null);
+  const systemBlobRef = useRef<Blob | null>(null);
+  const auxAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Whether the recorded file's own audio track already holds every source. Read
+  // per-recording from the Drafts entry (EDITOR_DATA is a single slot that always
+  // holds the LATEST recording, so it can't answer this for an older draft).
+  const [audioMixed, setAudioMixed] = useState<boolean | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | null>(null);
   const [assignedProjects, setAssignedProjects] = useState<Record<
     string,
@@ -395,14 +558,13 @@ export function EditorApp() {
   useEffect(() => {
     const load = async () => {
       const result = await chrome.storage.local.get([
-        EDITOR_DATA_KEY,
         PENDING_SHARE_KEY,
         SHARE_VISIBILITY_KEY,
         AUTH_TOKENS_KEY,
         AUTH_USER_KEY,
       ]);
 
-      const stored = result[EDITOR_DATA_KEY] as EditorData | undefined;
+      const stored = await loadEditorData(recordingId);
       if (stored) {
         setData(stored);
         setTitle(stored.title);
@@ -478,8 +640,7 @@ export function EditorApp() {
   useEffect(() => {
     if (data) return;
     const id = setInterval(async () => {
-      const result = await chrome.storage.local.get([EDITOR_DATA_KEY]);
-      const stored = result[EDITOR_DATA_KEY] as EditorData | undefined;
+      const stored = await loadEditorData(recordingId);
       if (stored) {
         setData(stored);
         setTitle(stored.title);
@@ -487,7 +648,7 @@ export function EditorApp() {
       }
     }, 500);
     return () => clearInterval(id);
-  }, [data]);
+  }, [data, recordingId]);
 
   // ── Load video blob from IDB ───────────────────────────────────────────────
   useEffect(() => {
@@ -511,10 +672,25 @@ export function EditorApp() {
     };
   }, [recordingId]);
 
-  // ── Load the separately-recorded mic track, when there is one ──────────────
-  // Recorded to its own blob so mic and system audio stay independently mutable.
-  // Absent for recordings made before that split (and when no mic was used) — the
-  // UI then offers only the system-audio control.
+  // ── Does this recording's own audio track already carry every source? ──────
+  // Drafts entry first (per-recording), then EDITOR_DATA but only when it is about
+  // THIS recording, then a conservative `false` — treating a mixed recording as
+  // unmixed would double the mic, which is worse than an unnecessary re-encode.
+  useEffect(() => {
+    if (!recordingId) return;
+    let cancelled = false;
+    void (async () => {
+      const mixed = await readAudioMixed(recordingId);
+      if (!cancelled) setAudioMixed(mixed);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [recordingId]);
+
+  // ── Load the mic-only side track, when there is one ────────────────────────
+  // Used to rebuild the audio when the user mutes system audio, and as the signal
+  // for whether the mic control is offered at all. Absent when no mic was used.
   useEffect(() => {
     if (!recordingId || recordingId === 'unknown') return;
     let objectUrl: string | null = null;
@@ -530,6 +706,32 @@ export function EditorApp() {
     void tryLoad();
     const retryTimer = setTimeout(() => {
       if (!micBlobRef.current) void tryLoad();
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(retryTimer);
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [recordingId]);
+
+  // ── Load the system-audio-only side track, when there is one ───────────────
+  // Its counterpart to the mic track: written only for recordings that had both
+  // sources, and used when the user mutes the mic out of the mixed main track.
+  useEffect(() => {
+    if (!recordingId || recordingId === 'unknown') return;
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    const tryLoad = async () => {
+      const blob = await loadBlobFromIDB(systemBlobKey(recordingId));
+      if (blob && blob.size > 0 && !cancelled) {
+        systemBlobRef.current = blob;
+        objectUrl = URL.createObjectURL(blob);
+        setSystemUrl(objectUrl);
+      }
+    };
+    void tryLoad();
+    const retryTimer = setTimeout(() => {
+      if (!systemBlobRef.current) void tryLoad();
     }, 1500);
     return () => {
       cancelled = true;
@@ -806,9 +1008,16 @@ export function EditorApp() {
     [],
   );
 
-  // Load the recording and apply the current trim selection. Returns the raw blob
-  // unchanged when the whole clip is selected (skips the costly re-encode). Shared
-  // by Save (upload) and Download (local) so the trim always applies to both.
+  // Load the recording and apply the current trim/mute selection.
+  //
+  // The fast path — the whole clip, both sources audible — returns the recorded file
+  // untouched, and it is now the DEFAULT rather than a rare special case: the
+  // recorder mixes the mic into the main track, so there is nothing left to fold in
+  // at save time. Saving a two-hour recording used to mean re-playing two hours of
+  // video through a MediaRecorder first, which is what put saves behind an endless
+  // "Trimming" bar. Only an actual trim or an actual mute pays that cost now.
+  //
+  // Shared by Save (upload) and Download (local) so both honor the same selection.
   const getExportBlob = useCallback(
     async (onTrimProgress?: (f: number) => void): Promise<Blob> => {
       const blob = await loadRecordingBlob(recordingId);
@@ -816,19 +1025,59 @@ export function EditorApp() {
       const dur = videoDuration || data?.duration || 0;
       const isFullClip = trimStart <= 0.005 && trimEnd >= 0.995;
       const micBlob = micBlobRef.current;
-      // The mic is a separate track, so it has to be mixed in during the re-encode
-      // whenever it exists — not just when trimming or muting.
-      const needsRemux = muteSystemAudio || muteMic || !!micBlob;
-      if ((isFullClip && !needsRemux) || dur <= 0) return blob;
+      const systemBlob = systemBlobRef.current;
+
+      // Which audio the export should carry.
+      //  - mixed recording: its own track is already system+mic, so a mute means
+      //    swapping in the matching side track (or silence when there isn't one).
+      //  - legacy recording (mic recorded separately, never mixed): its own track is
+      //    system-only, so an audible mic still has to be mixed in by re-encoding.
+      // Never guess while the flag is still loading — re-read it instead. Guessing
+      // wrong in one direction doubles the mic, in the other it drops it.
+      const mixed = audioMixed ?? (await readAudioMixed(recordingId));
+
+      let audioMode: ExportAudioMode = 'own';
+      let audioBlob: Blob | null = null;
+      if (mixed) {
+        if (muteMic && muteSystemAudio) audioMode = 'none';
+        else if (muteMic) {
+          audioMode = systemBlob ? 'replace' : 'none';
+          audioBlob = systemBlob;
+        } else if (muteSystemAudio) {
+          audioMode = micBlob ? 'replace' : 'none';
+          audioBlob = micBlob;
+        }
+      } else {
+        const wantMic = !muteMic && !!micBlob;
+        const wantSystem = !muteSystemAudio;
+        if (wantMic && wantSystem) audioMode = 'mix';
+        else if (wantMic) audioMode = 'replace';
+        else if (!wantSystem) audioMode = 'none';
+        audioBlob = wantMic ? micBlob : null;
+      }
+
+      const needsAudioWork = audioMode !== 'own';
+      if ((isFullClip && !needsAudioWork) || dur <= 0) return blob;
+
       const from = isFullClip ? 0 : trimStart * dur;
       const to = isFullClip ? dur : trimEnd * dur;
-      return trimVideoBlob(blob, from, to, onTrimProgress, {
-        micBlob,
-        muteSystem: muteSystemAudio,
-        muteMic,
-      });
+      try {
+        return await reencodeVideoBlob(blob, from, to, onTrimProgress, {
+          mode: audioMode,
+          audioBlob,
+        });
+      } catch (err) {
+        // A save must never fail because the optional processing did. The recorded
+        // file is intact — hand that over instead of losing the recording, and say
+        // so rather than silently shipping something the user didn't ask for.
+        console.error('[Editor] Re-encode failed — saving the untouched recording:', err);
+        setExportNotice(
+          'The trim/mute could not be applied in this browser, so the full recording was kept — nothing was lost.',
+        );
+        return blob;
+      }
     },
-    [recordingId, videoDuration, data, trimStart, trimEnd, muteSystemAudio, muteMic],
+    [recordingId, videoDuration, data, trimStart, trimEnd, muteSystemAudio, muteMic, audioMixed],
   );
 
   // Returns the record's share URL on success (so callers like "Save & Copy
@@ -846,6 +1095,7 @@ export function EditorApp() {
     setIsSaving(true);
     setUploadPercent(0);
     setUploadError(null);
+    setExportNotice(null);
     try {
       const tokenResult = await chrome.storage.local.get([AUTH_TOKENS_KEY, AUTH_USER_KEY]);
       const token = (tokenResult[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)
@@ -856,10 +1106,14 @@ export function EditorApp() {
         return null;
       }
 
-      // Build the export blob — applies the trim selection when the user picked a
-      // sub-range (trim progress drives 0–15% of the bar).
-      setSaveStage('trimming');
-      const blob = await getExportBlob((f) => setUploadPercent(Math.round(f * 15)));
+      // Build the export blob. Normally this is just the recorded file, read back
+      // from disk; only an actual trim or mute re-encodes, and only then does the
+      // bar show "Trimming" (that phase drives 0–15%).
+      setSaveStage('preparing');
+      const blob = await getExportBlob((f) => {
+        setSaveStage('trimming');
+        setUploadPercent(Math.round(f * 15));
+      });
       if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
 
       const mime = blob.type || 'video/webm';
@@ -1168,6 +1422,7 @@ export function EditorApp() {
     if (!recordingId || isDownloading || isSaving) return;
     setIsDownloading(true);
     setUploadError(null);
+    setExportNotice(null);
     const safeTitle = (title || data?.title || 'recording')
       .replace(/[^a-z0-9-_ ]/gi, '')
       .trim()
@@ -1201,6 +1456,41 @@ export function EditorApp() {
       setIsDownloading(false);
     }
   }, [recordingId, isDownloading, isSaving, getExportBlob, title, data, uploadedVideoUrl]);
+
+  // ── What the preview should sound like ────────────────────────────────────
+  // The preview must match the file the user is about to save, so it is routed the
+  // same way the export is. On a current recording the video's own track carries
+  // both sources, so muting either one means muting the video and playing the
+  // matching side track instead; on an older recording the video is system-only and
+  // the mic always plays alongside it. Undecided (`null`) plays the video alone —
+  // never a side track, which on a mixed recording would double the mic.
+  const previewVideoMuted = audioMixed === true ? muteMic || muteSystemAudio : muteSystemAudio;
+  const previewAuxUrl =
+    audioMixed === null
+      ? null
+      : audioMixed
+        ? muteMic && !muteSystemAudio
+          ? systemUrl
+          : !muteMic && muteSystemAudio
+            ? micUrl
+            : null
+        : micUrl;
+  const previewAuxMuted = audioMixed === true ? false : muteMic;
+
+  // The side <audio> is swapped out when the routing changes (a mute toggled
+  // mid-playback), and a fresh element starts paused at 0 — so re-sync it here
+  // instead of waiting for the video's next play/seek event.
+  useEffect(() => {
+    const aux = auxAudioRef.current;
+    const vid = videoRef.current;
+    if (!aux) return;
+    if (vid && isPlaying && !vid.paused) {
+      aux.currentTime = vid.currentTime;
+      void aux.play().catch(() => {});
+    } else {
+      aux.pause();
+    }
+  }, [previewAuxUrl, isPlaying]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -1352,17 +1642,18 @@ export function EditorApp() {
           disabled={!!shareUrl || isSaving}
         />
 
-        {/* Independent audio mutes. The mic is recorded to its own track, so each
-            source can be silenced separately. Kept in the header so they don't take
-            vertical space away from the video preview, and grouped in their own tight
-            cluster so the header's wider gap doesn't push them apart. */}
+        {/* Independent audio mutes, backed by the per-source side tracks. Kept in the
+            header so they don't take vertical space away from the video preview, and
+            grouped in their own tight cluster so the header's wider gap doesn't push
+            them apart. Muting either one is the one thing that makes saving re-encode
+            the video, so the default (neither muted) stays a straight upload. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <AudioMuteButton
             muted={muteMic}
             onToggle={() => setMuteMic((v) => !v)}
             label="Mic"
             available={!!micUrl}
-            unavailableHint="No separate mic track in this recording (recorded before mic/system audio were split, or no mic was used)"
+            unavailableHint="This recording has no microphone track (the mic was off, or it was recorded before mic audio was captured separately)"
             icon={
               muteMic ? (
                 <svg
@@ -1541,15 +1832,15 @@ export function EditorApp() {
                 <video
                   ref={videoRef}
                   src={videoUrl}
-                  // Preview what the saved file will sound like. The video's own
-                  // track now carries system/tab audio only — the mic plays from
-                  // the sibling <audio> below, so each mutes independently.
-                  muted={muteSystemAudio}
+                  // Preview what the saved file will sound like — see the routing
+                  // derived above; the sibling <audio> supplies whichever source the
+                  // video's own track can no longer provide on its own.
+                  muted={previewVideoMuted}
                   style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
                   onTimeUpdate={() => {
                     setCurrentTime(videoRef.current?.currentTime ?? 0);
-                    // Nudge the mic back in step if it drifts (seek, stall, etc.).
-                    const mic = micAudioRef.current;
+                    // Nudge the side track back in step if it drifts (seek, stall…).
+                    const mic = auxAudioRef.current;
                     const vid = videoRef.current;
                     if (mic && vid && Math.abs(mic.currentTime - vid.currentTime) > 0.3) {
                       mic.currentTime = vid.currentTime;
@@ -1558,7 +1849,7 @@ export function EditorApp() {
                   onLoadedData={maybeStartThumbnailCapture}
                   onSeeked={() => {
                     captureThumbnailFrame();
-                    const mic = micAudioRef.current;
+                    const mic = auxAudioRef.current;
                     if (mic && videoRef.current) mic.currentTime = videoRef.current.currentTime;
                   }}
                   onDurationChange={() => {
@@ -1567,7 +1858,7 @@ export function EditorApp() {
                   }}
                   onPlay={() => {
                     setIsPlaying(true);
-                    const mic = micAudioRef.current;
+                    const mic = auxAudioRef.current;
                     if (mic && videoRef.current) {
                       mic.currentTime = videoRef.current.currentTime;
                       void mic.play().catch(() => {});
@@ -1575,16 +1866,21 @@ export function EditorApp() {
                   }}
                   onPause={() => {
                     setIsPlaying(false);
-                    micAudioRef.current?.pause();
+                    auxAudioRef.current?.pause();
                   }}
                   onEnded={() => {
                     setIsPlaying(false);
-                    micAudioRef.current?.pause();
+                    auxAudioRef.current?.pause();
                   }}
                   onClick={togglePlay}
                 />
-                {micUrl ? (
-                  <audio ref={micAudioRef} src={micUrl} muted={muteMic} preload="auto" />
+                {previewAuxUrl ? (
+                  <audio
+                    ref={auxAudioRef}
+                    src={previewAuxUrl}
+                    muted={previewAuxMuted}
+                    preload="auto"
+                  />
                 ) : null}
               </>
             ) : data?.thumbnailDataUrl ? (
@@ -2095,7 +2391,11 @@ export function EditorApp() {
                 <span
                   style={{ fontSize: '11px', color: 'rgba(226,232,240,0.85)', fontWeight: 600 }}
                 >
-                  {saveStage === 'trimming' ? 'TRIMMING' : 'UPLOADING'}
+                  {saveStage === 'trimming'
+                    ? 'TRIMMING'
+                    : saveStage === 'preparing'
+                      ? 'PREPARING'
+                      : 'UPLOADING'}
                 </span>
                 <span style={{ fontSize: '11px', color: '#8b5cf6', fontWeight: 700 }}>
                   {uploadPercent}%
@@ -2119,6 +2419,24 @@ export function EditorApp() {
                   transition={{ duration: 0.4 }}
                 />
               </div>
+            </div>
+          )}
+
+          {/* Export fell back to the untouched recording — saved, but not trimmed */}
+          {exportNotice && (
+            <div
+              style={{
+                margin: '0 12px 0',
+                padding: '10px 14px',
+                borderRadius: '10px',
+                background: 'rgba(245,158,11,0.1)',
+                border: '1px solid rgba(245,158,11,0.25)',
+                fontSize: '12px',
+                color: '#fbbf24',
+                lineHeight: 1.4,
+              }}
+            >
+              {exportNotice}
             </div>
           )}
 
@@ -2206,7 +2524,12 @@ export function EditorApp() {
                     animate={{ rotate: 360 }}
                     transition={{ duration: 0.8, repeat: Infinity, ease: 'linear' }}
                   />
-                  {saveStage === 'trimming' ? 'Trimming' : 'Uploading'} {uploadPercent}%…
+                  {saveStage === 'trimming'
+                    ? 'Trimming'
+                    : saveStage === 'preparing'
+                      ? 'Preparing'
+                      : 'Uploading'}{' '}
+                  {uploadPercent}%…
                 </div>
               ) : isAuthenticated ? (
                 /* ── Ready to save ── */

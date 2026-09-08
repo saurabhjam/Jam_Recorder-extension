@@ -25,10 +25,7 @@ import type {
   CaptureData,
   DraftRecording,
 } from '@/types';
-import { STORAGE_KEYS } from '@/types';
-
-/** Drafts list is capped at this many entries; older ones are evicted. */
-const MAX_DRAFTS = 5;
+import { STORAGE_KEYS, MAX_DRAFTS } from '@/types';
 import { generateId, isRestrictedUrl } from '@/utils';
 import {
   configureMonitoringOffscreen,
@@ -1069,7 +1066,20 @@ async function reinjectToolbarIntoTab(tabId: number): Promise<void> {
   // is on screen, so the toolbar follows the user to whatever tab they navigate.
   if (currentRecordingOptions?.type !== 'screen' && currentRecordingTabId !== tabId) return;
 
-  await injectFloatingToolbar(tabId);
+  // "Follows the user" means the tab in front of them, not every tab that happens to
+  // navigate. A background tab reloading mid-recording used to get its own copy of
+  // the controls pushed onto it, so a screen recording steadily accumulated
+  // stop/pause bars across the user's tabs (the poll pruned them a tick later, but
+  // they were mounted, visible and clickable in the meantime).
+  let isActiveTab = true;
+  if (currentRecordingOptions?.type === 'screen' && currentRecordingTabId !== tabId) {
+    try {
+      isActiveTab = (await chrome.tabs.get(tabId)).active === true;
+    } catch {
+      isActiveTab = false; // tab already gone
+    }
+  }
+  if (isActiveTab) await injectFloatingToolbar(tabId);
 
   // Capture (CDP + main-world hooks) follows only the tab being recorded:
   //  • screen/window share → follow the user across tabs (capture is global)
@@ -1555,6 +1565,11 @@ async function handleStopRecording(
   }
 }
 
+/** How long a stop waits on the offscreen document before releasing the teardown
+ *  latch. Long enough for a multi-hour recording's final flush + thumbnail, short
+ *  enough that a wedged document can't disable recording until the worker restarts. */
+const FINALIZE_TIMEOUT_MS = 90_000;
+
 async function performStopRecording(
   sendResponse: (r: unknown) => void,
   cancel: boolean,
@@ -1682,20 +1697,47 @@ async function performStopRecording(
   lastFocusedWindowId = null;
   elapsedSeconds = 0;
 
-  // Instruct offscreen to finalize blob into IndexedDB then upload
+  // Instruct offscreen to finalize the recording. Two safeguards here, both of
+  // them about not losing a recording that is sitting complete on disk:
+  //
+  //  • The document is (re)created first. If it had been torn down — an offscreen
+  //    crash, or a close racing this stop — the finalize message used to fail
+  //    outright and the recording was simply gone, even though every chunk was
+  //    already in OPFS. A fresh document picks it up from there (see
+  //    salvageRecordingFromDisk in offscreen/index.ts).
+  //  • The wait is bounded. It holds `stopInFlight`, and a finalize that never
+  //    answers left that latch stuck for the life of the worker, which blocks the
+  //    toolbar and URL tracking of every LATER recording. Timing out here doesn't
+  //    abandon anything: the offscreen document keeps finalizing and still sends
+  //    OFFSCREEN_RECORDING_READY when it's done, which is what opens the editor.
+  const FINALIZE_TIMED_OUT = Symbol('finalize-timeout');
   try {
-    await sendToOffscreen('OFFSCREEN_STOP_RECORDING', {
-      recordingId,
-      title: recordingTitle,
-      type: recordingType,
-      duration: recordingDuration,
-      quality,
-      hasAudio,
-      hasWebcam,
-    });
+    await ensureOffscreenDocument();
+    const outcome = await Promise.race([
+      sendToOffscreen('OFFSCREEN_STOP_RECORDING', {
+        recordingId,
+        title: recordingTitle,
+        type: recordingType,
+        duration: recordingDuration,
+        quality,
+        hasAudio,
+        hasWebcam,
+      }),
+      new Promise<symbol>((resolve) =>
+        setTimeout(() => resolve(FINALIZE_TIMED_OUT), FINALIZE_TIMEOUT_MS),
+      ),
+    ]);
+    if (outcome === FINALIZE_TIMED_OUT) {
+      // Not an error to report: the document is still working and will send
+      // OFFSCREEN_RECORDING_READY when it lands. We simply stop holding the latch.
+      console.warn('[Background] Finalize still running after the wait — releasing the stop');
+    }
   } catch (err) {
     console.error('[Background] Stop recording error:', err);
     broadcastToAll({ type: 'RECORDING_ERROR', error: 'Failed to finalize recording' });
+    // Nothing was salvageable and no editor will open, so don't leave the document
+    // we may have just created sitting around holding media permissions.
+    void closeOffscreenDocument();
   }
   // Editor window is opened by handleOffscreenMessage when OFFSCREEN_RECORDING_READY fires
   // `stopInFlight` is released by handleStopRecording's own `finally` — held until
@@ -2616,11 +2658,20 @@ chrome.runtime.onMessage.addListener(
           // still set: a content script asking this question during a teardown must
           // not self-mount a toolbar onto a page the stop has already swept.
           const live = isRecordingActive && !stopInFlight;
+          // A screen/window share shows the controls on whatever tab the user is
+          // looking at — but ONLY that one. This answer used to be an unqualified
+          // yes for every tab, so each page loaded during a recording quietly
+          // mounted its own stop/pause bar with its own timer, and the user ended up
+          // with a stack of them across their tabs (none of which the background
+          // knew about, so nothing pruned them). A tab the user switches to gets the
+          // toolbar pushed to it by ensureToolbarOnActiveTab, which is the one place
+          // that decides where the controls live.
+          const senderIsActiveTab = _sender.tab?.active === true;
           const showToolbar =
             live &&
-            (currentRecordingOptions?.type === 'screen' ||
-              senderTabId == null ||
-              currentRecordingTabId === senderTabId);
+            (senderTabId == null ||
+              currentRecordingTabId === senderTabId ||
+              (currentRecordingOptions?.type === 'screen' && senderIsActiveTab));
           sendResponse({
             isRecording: live,
             isPaused,
@@ -2630,6 +2681,16 @@ chrome.runtime.onMessage.addListener(
           });
         })();
         return true;
+      }
+
+      case 'TOOLBAR_MOUNTED': {
+        // A content script mounted the toolbar on its own (page load during a
+        // recording). Record it: `toolbarShownOnTabs` drives pruning, and a toolbar
+        // nothing knows about is exactly the kind that outlives its recording.
+        const mountedTabId = _sender.tab?.id;
+        if (mountedTabId != null) markToolbarShown(mountedTabId);
+        sendResponse({ success: true });
+        return false;
       }
 
       case 'ENSURE_TOOLBAR': {
@@ -2755,6 +2816,7 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         recordingId: readyRecordingId,
         title: readyTitle,
         recordingType: readyRecordingType,
+        audioMixed,
       } = message.payload as {
         thumbnailDataUrl: string | null;
         duration: number;
@@ -2763,6 +2825,7 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         recordingId?: string;
         title?: string;
         recordingType?: string;
+        audioMixed?: boolean;
       };
 
       const editorRecordingId = readyRecordingId ?? 'unknown';
@@ -2788,6 +2851,7 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
               consoleLogs: capture.consoleLogs,
               networkCaptures: capture.networkCaptures,
               visitedUrls: capture.visitedUrls,
+              audioMixed: audioMixed ?? false,
             },
           });
           await registerDraft({
@@ -2799,6 +2863,10 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
             recordingType: readyRecordingType ?? currentRecordingOptions?.type ?? 'screen',
             createdAt: Date.now(),
             status: 'draft',
+            // Per-recording, unlike EDITOR_DATA (a single slot that always holds the
+            // LATEST recording) — so reopening an older draft still reads the right
+            // answer for that file rather than the newest one's.
+            audioMixed: audioMixed ?? false,
           });
           await chrome.windows.create({
             url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),

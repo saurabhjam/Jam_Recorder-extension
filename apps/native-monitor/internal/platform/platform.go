@@ -43,6 +43,22 @@ type Monitor interface {
 	// "not required here" from "required and missing".
 	Permissions() protocol.Permissions
 
+	// CaptureScreen grabs the ENTIRE physical screen, encoded to fit
+	// targetBytes with its longest edge at most maxEdge.
+	//
+	// There is no window, region or tab variant, and there will not be one.
+	// This method exists because the browser's screen-share picker offers
+	// those choices and no browser API can remove them — so a monitoring
+	// session could be aimed at a single tab, and every screenshot in the
+	// report would then be a partial record of what the person was doing.
+	// Removing the capability is the only way to remove the mistake.
+	//
+	// Returns ErrScreenPermission when the OS grant is missing and
+	// ErrScreenUnsupported where the platform cannot do it at all. Callers
+	// must surface either as a failure — never as a reason to capture
+	// something narrower.
+	CaptureScreen(maxEdge, targetBytes int) (*Frame, error)
+
 	// Name identifies the platform for the READY handshake.
 	Name() string
 }

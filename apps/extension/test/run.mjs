@@ -24,6 +24,7 @@ execFileSync(
   [
     'tsc',
     resolve(here, '..', 'src', 'utils', 'captureSchedule.ts'),
+    resolve(here, '..', 'src', 'utils', 'encodeBudget.ts'),
     '--outDir',
     outDir,
     '--module',
@@ -37,6 +38,7 @@ execFileSync(
 );
 
 execFileSync(process.execPath, [resolve(here, 'captureSchedule.test.mjs')], { stdio: 'inherit' });
+execFileSync(process.execPath, [resolve(here, 'encodeBudget.test.mjs')], { stdio: 'inherit' });
 
 // Runs against dist/, so it only means anything after a build — which is
 // precisely when it matters, because this is the check a build cannot make.

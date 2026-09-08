@@ -215,3 +215,49 @@ func TestPauseClosesTheIntervalAtThePause(t *testing.T) {
 		t.Errorf("interval must end at the pause (600s), got %d", (*emitted)[0].DurationSecs)
 	}
 }
+
+func TestNotificationCountsDoNotSplitAnInterval(t *testing.T) {
+	// Twenty seconds in Slack came back as six one-to-four-second "Slack" rows.
+	// The user never switched away — messages arrived, and each new unread count
+	// renamed the window, changing the interval identity.
+	engine, emitted := newTestEngine()
+	for i, title := range []string{
+		"Slack | general | BestQ",
+		"(1) Slack | general | BestQ",
+		"(3) Slack | general | BestQ",
+		"(12) Slack | general | BestQ",
+		"Slack | general | BestQ",
+	} {
+		engine.Sample(&platform.Window{
+			ApplicationName: "Slack",
+			ApplicationID:   "com.tinyspeck.slackmacgap",
+			Title:           title,
+		}, at(10, 0, i*4))
+	}
+	if len(*emitted) != 0 {
+		t.Fatalf("an unread counter is not a context switch, got %d row(s): %+v", len(*emitted), *emitted)
+	}
+
+	engine.Flush(at(10, 1, 0))
+	if len(*emitted) != 1 {
+		t.Fatalf("expected one consolidated interval, got %d", len(*emitted))
+	}
+	if (*emitted)[0].DurationSecs != 60 {
+		t.Errorf("expected the full 60s, got %d", (*emitted)[0].DurationSecs)
+	}
+}
+
+func TestARealChannelChangeIsStillANewInterval(t *testing.T) {
+	// The counter is noise; the channel is not. Collapsing both would hide where
+	// the time actually went.
+	engine, emitted := newTestEngine()
+	engine.Sample(&platform.Window{ApplicationName: "Slack", ApplicationID: "s", Title: "(2) Slack | general | BestQ"}, at(10, 0, 0))
+	engine.Sample(&platform.Window{ApplicationName: "Slack", ApplicationID: "s", Title: "Slack | releases | BestQ"}, at(10, 5, 0))
+
+	if len(*emitted) != 1 {
+		t.Fatalf("a channel change is a new interval, got %d", len(*emitted))
+	}
+	if !strings.Contains((*emitted)[0].WindowTitle, "general") {
+		t.Errorf("first interval should be #general, got %q", (*emitted)[0].WindowTitle)
+	}
+}

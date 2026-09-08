@@ -38,6 +38,8 @@ interface Handlers {
   onActivity: (activity: NativeActivity) => void;
   onIdle: (event: NativeIdleEvent) => void;
   onStateChange: (state: NativeAgentState) => void;
+  /** One capture of the entire screen, ready to queue for upload. */
+  onScreenFrame: (frame: NativeScreenFrame) => void;
 }
 
 let port: chrome.runtime.Port | null = null;
@@ -47,6 +49,8 @@ let state: NativeAgentState = { ...INITIAL_NATIVE_AGENT_STATE };
 /** The session the agent is monitoring, so a reconnect can re-bind it. */
 let boundSessionID: string | null = null;
 let idleThresholdSeconds = 0;
+// Capture cadence handed to the agent, replayed on reconnect.
+let screenshotEverySeconds = 0;
 
 /** Reconnect bookkeeping. */
 let reconnectAttempt = 0;
@@ -188,10 +192,58 @@ function validateCapabilities(raw: unknown): NativeCapabilities | undefined {
     windowTitle: flag(c.windowTitle),
     processIdentifier: flag(c.processIdentifier),
     browserProfile: flag(c.browserProfile),
+    screenCapture: flag(c.screenCapture),
     // Pinned false regardless of what the agent claims. No platform can supply
     // this, so a `true` here would be a bug or a lie either way.
     exactBrowserUrl: false,
     idleDetection: flag(c.idleDetection),
+  };
+}
+
+/**
+ * Validate a frame before it becomes a stored screenshot.
+ *
+ * The declared byte length is checked against the decoded length rather than
+ * trusted. A frame is written to durable storage and later shown as a record of
+ * what somebody was doing, so a truncated or mis-declared payload must be
+ * dropped here instead of becoming a broken image in a report.
+ */
+function validateScreenFrame(raw: unknown): NativeScreenFrame | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const f = raw as Record<string, unknown>;
+
+  const mimeType = asString(f.mimeType, 64);
+  const data = typeof f.data === 'string' ? f.data : null;
+  const capturedAt = asTimestamp(f.capturedAt);
+  if (!mimeType || !data || !capturedAt) return null;
+  // Only real image types, and only ones the API accepts.
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) return null;
+
+  let bytes: Uint8Array;
+  try {
+    const binary = atob(data);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  } catch {
+    return null;
+  }
+  if (bytes.length === 0) return null;
+
+  const declared = Number(f.bytes);
+  if (Number.isFinite(declared) && declared > 0 && declared !== bytes.length) return null;
+
+  const asCount = (value: unknown): number => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+  };
+
+  return {
+    mimeType,
+    bytes,
+    width: asCount(f.width),
+    height: asCount(f.height),
+    capturedAt,
+    displayCount: asCount(f.displayCount),
   };
 }
 
@@ -200,6 +252,7 @@ function validatePermissions(raw: unknown): NativePermissions | undefined {
   const p = raw as Record<string, unknown>;
   const result: NativePermissions = {};
   if (typeof p.accessibility === 'boolean') result.accessibility = p.accessibility;
+  if (typeof p.screenRecording === 'boolean') result.screenRecording = p.screenRecording;
   if (typeof p.x11Tools === 'boolean') result.x11Tools = p.x11Tools;
   return result;
 }
@@ -294,6 +347,9 @@ function handleMessage(raw: unknown): void {
           type: 'START_MONITORING',
           sessionId: boundSessionID,
           idleThresholdSeconds: idleThresholdSeconds || undefined,
+          // Replayed on re-bind: without it an agent restart would leave the
+          // session running with activity but no screenshots at all.
+          screenshotIntervalSeconds: screenshotEverySeconds || undefined,
         });
       }
       return;
@@ -329,6 +385,16 @@ function handleMessage(raw: unknown): void {
         return;
       }
       handlers?.onIdle(event);
+      return;
+    }
+
+    case 'SCREEN_FRAME': {
+      const frame = validateScreenFrame(msg.frame);
+      if (!frame) {
+        console.warn('[NativeAgent] rejected a malformed screen frame');
+        return;
+      }
+      handlers?.onScreenFrame(frame);
       return;
     }
 
@@ -447,14 +513,24 @@ export function connectNativeAgent(): void {
 }
 
 /** Bind the agent to a monitoring session. */
-export function startNativeMonitoring(sessionId: string, thresholdSeconds: number): void {
+export function startNativeMonitoring(
+  sessionId: string,
+  thresholdSeconds: number,
+  screenshotIntervalSeconds: number,
+): void {
   boundSessionID = sessionId;
   idleThresholdSeconds = thresholdSeconds;
+  screenshotEverySeconds = screenshotIntervalSeconds;
   connectNativeAgent();
   post({
     type: 'START_MONITORING',
     sessionId,
     idleThresholdSeconds: thresholdSeconds || undefined,
+    // The capture cadence runs on the agent's own timer. A service worker is
+    // torn down every thirty seconds and an offscreen document is throttled
+    // while the browser is in the background — which, for a tool that watches
+    // what someone does in *other* applications, is most of the time.
+    screenshotIntervalSeconds: screenshotIntervalSeconds || undefined,
   });
 }
 

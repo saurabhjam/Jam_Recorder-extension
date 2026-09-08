@@ -134,6 +134,14 @@ func Decode(body []byte) (Inbound, error) {
 	if msg.IdleThresholdSeconds != 0 && (msg.IdleThresholdSeconds < 30 || msg.IdleThresholdSeconds > 3600) {
 		return Inbound{}, fmt.Errorf("idleThresholdSeconds %d is outside 30..3600", msg.IdleThresholdSeconds)
 	}
+	// Bounded so a bad or hostile value cannot turn the agent into a capture
+	// loop: below 5s the encodes overlap and spend the machine's CPU, and
+	// above an hour the cadence is not monitoring any more.
+	if msg.ScreenshotIntervalSeconds != 0 &&
+		(msg.ScreenshotIntervalSeconds < 5 || msg.ScreenshotIntervalSeconds > 3600) {
+		return Inbound{}, fmt.Errorf("screenshotIntervalSeconds %d is outside 5..3600",
+			msg.ScreenshotIntervalSeconds)
+	}
 
 	return msg, nil
 }
@@ -141,7 +149,7 @@ func Decode(body []byte) (Inbound, error) {
 func knownInboundType(t string) bool {
 	switch t {
 	case TypeHello, TypeStartMonitoring, TypeStopMonitoring,
-		TypePause, TypeResume, TypeFlush, TypeGetStatus:
+		TypePause, TypeResume, TypeFlush, TypeGetStatus, TypeCaptureScreen:
 		return true
 	}
 	return false

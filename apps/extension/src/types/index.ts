@@ -106,6 +106,11 @@ export interface Recording {
  * editor window is ever opened/closed), then promoted to `status: 'saved'`
  * once the editor uploads it — it stays in the list either way.
  */
+/** How many local recordings the Drafts list keeps; older ones are evicted and
+ *  their blobs reclaimed. Shared so the background and the popup can't disagree
+ *  about the cap — a mismatch there resurrects or drops entries. */
+export const MAX_DRAFTS = 5;
+
 export interface DraftRecording {
   recordingId: string;
   title: string;
@@ -115,6 +120,13 @@ export interface DraftRecording {
   recordingType: string;
   createdAt: number;
   status: 'draft' | 'saved';
+  /**
+   * The recording's own audio track already carries every source (system + mic), so
+   * the editor can upload the file untouched. Absent on recordings made before the
+   * mic was mixed in — those still need a re-encode to hear the mic, and the editor
+   * treats a missing flag as exactly that.
+   */
+  audioMixed?: boolean;
   backendRecordId?: string;
   shareUrl?: string;
   videoUrl?: string;
@@ -181,6 +193,7 @@ export type MessageType =
   | 'HIDE_TOOLBAR'
   | 'ENSURE_TOOLBAR'
   | 'TOOLBAR_STATUS'
+  | 'TOOLBAR_MOUNTED'
   | 'SHOW_COUNTDOWN'
   | 'UPDATE_TIMER'
   | 'RECORDING_PAUSE_STATE'

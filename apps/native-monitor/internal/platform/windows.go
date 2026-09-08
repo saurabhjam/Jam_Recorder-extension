@@ -206,6 +206,9 @@ func (w *windowsMonitor) Capabilities() protocol.Capabilities {
 		BrowserProfile:        true,
 		ExactBrowserURL:       false,
 		IdleDetection:         true,
+		// GDI reads the virtual screen with no grant and no prompt for any
+		// process in the interactive session.
+		ScreenCapture: true,
 	}
 }
 

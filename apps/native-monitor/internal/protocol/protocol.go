@@ -21,6 +21,7 @@ const (
 	TypeResume          = "RESUME_MONITORING"
 	TypeFlush           = "FLUSH"
 	TypeGetStatus       = "GET_STATUS"
+	TypeCaptureScreen   = "CAPTURE_SCREEN"
 )
 
 // Message types. Agent → extension.
@@ -35,6 +36,7 @@ const (
 	TypeIdleChanged     = "IDLE_CHANGED"
 	TypeHeartbeat       = "HEARTBEAT"
 	TypeStatus          = "STATUS"
+	TypeScreenFrame     = "SCREEN_FRAME"
 	TypeError           = "ERROR"
 )
 
@@ -43,6 +45,11 @@ const (
 const (
 	ErrPermissionRequired  = "PERMISSION_REQUIRED"
 	ErrUnsupportedPlatform = "UNSUPPORTED_PLATFORM"
+	// ErrCaptureFailed is a screen read that failed for a reason the user
+	// cannot fix by granting something — a wedged window server, an encode
+	// failure. Kept distinct from a permission error because the two need
+	// different words in front of the person using the extension.
+	ErrCaptureFailed = "SCREEN_CAPTURE_FAILED"
 	ErrProtocolMismatch    = "PROTOCOL_VERSION_MISMATCH"
 	ErrInvalidMessage      = "INVALID_MESSAGE"
 	ErrNoSession           = "NO_ACTIVE_SESSION"
@@ -66,6 +73,15 @@ type Inbound struct {
 	// IdleThresholdSeconds lets the extension keep the agent aligned with the
 	// backend's configured threshold instead of both hardcoding 300.
 	IdleThresholdSeconds int `json:"idleThresholdSeconds,omitempty"`
+	// ScreenshotIntervalSeconds turns on the agent's own capture ticker.
+	//
+	// The cadence lives here rather than in the browser because a native timer
+	// is the only reliable one available: a service worker is torn down every
+	// thirty seconds and an offscreen document is throttled when the browser is
+	// in the background — which, for a tool that watches what someone does in
+	// *other* applications, is most of the time. Zero or absent means the
+	// extension does not want frames.
+	ScreenshotIntervalSeconds int `json:"screenshotIntervalSeconds,omitempty"`
 }
 
 // Capabilities states what this machine can actually report.
@@ -83,6 +99,13 @@ type Capabilities struct {
 	// and deriving one would be fabrication — see the README's security model.
 	ExactBrowserURL bool `json:"exactBrowserUrl"`
 	IdleDetection   bool `json:"idleDetection"`
+	// ScreenCapture is whether this agent can grab the whole physical screen.
+	//
+	// It exists so the extension can refuse to start rather than silently
+	// falling back to the browser's own screen-share picker — which is the
+	// thing this capability was added to eliminate. False here means monitoring
+	// does not start, not that it starts with a narrower picture.
+	ScreenCapture bool `json:"screenCapture"`
 }
 
 // Permissions is the OS-level grants the agent needs, as observed now.
@@ -90,6 +113,9 @@ type Permissions struct {
 	// Accessibility is macOS only; nil elsewhere so the extension can tell
 	// "not required here" from "required and missing".
 	Accessibility *bool `json:"accessibility,omitempty"`
+	// ScreenRecording is macOS only: CGDisplayCreateImage returns nothing
+	// without it. nil elsewhere, where whole-screen capture needs no grant.
+	ScreenRecording *bool `json:"screenRecording,omitempty"`
 	// X11Tools reports whether the Linux helper binaries are present.
 	X11Tools *bool `json:"x11Tools,omitempty"`
 }
@@ -124,6 +150,31 @@ type Activity struct {
 	SessionID        string `json:"sessionId,omitempty"`
 }
 
+// ScreenFrame is one capture of the entire physical screen.
+//
+// Always the whole screen. There is deliberately no way to ask for a window or
+// a region: the picker that offered those choices is the reason capture moved
+// out of the browser, and re-introducing the option here would re-introduce the
+// bug in a place with no user prompt to make it visible.
+type ScreenFrame struct {
+	// MimeType of Data once decoded, e.g. "image/jpeg".
+	MimeType string `json:"mimeType"`
+	// Data is the encoded image, base64 (standard alphabet, padded).
+	Data string `json:"data"`
+	// Width and Height are of the encoded image, after any downscale.
+	Width  int `json:"width"`
+	Height int `json:"height"`
+	// Bytes is the decoded length, so the extension can sanity-check Data.
+	Bytes int `json:"bytes"`
+	// CapturedAt is when the pixels were read, RFC 3339. Never upload time.
+	CapturedAt string `json:"capturedAt"`
+	// DisplayCount is how many screens the machine has. Reported because a
+	// single-display capture on a three-display machine is a partial record,
+	// and the report should be able to say so rather than imply completeness.
+	DisplayCount int `json:"displayCount"`
+	SessionID    string `json:"sessionId,omitempty"`
+}
+
 // Outbound is any message the agent sends.
 type Outbound struct {
 	ProtocolVersion int    `json:"protocolVersion"`
@@ -144,6 +195,14 @@ type Outbound struct {
 	IdleStartedAt string `json:"idleStartedAt,omitempty"`
 	IdleEndedAt   string `json:"idleEndedAt,omitempty"`
 	IdleSeconds   int    `json:"idleSeconds,omitempty"`
+
+	// One captured frame of the whole screen, base64 in Data.
+	//
+	// Base64 costs a third in size over the wire, which is the price of the
+	// stdio channel being JSON. The frames are encoded to a byte budget well
+	// under the 1 MB native-messaging ceiling, so the overhead is affordable
+	// and the alternative — a second transport — would not be.
+	Frame *ScreenFrame `json:"frame,omitempty"`
 
 	State     string `json:"state,omitempty"`
 	SessionID string `json:"sessionId,omitempty"`

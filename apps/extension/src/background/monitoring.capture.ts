@@ -1,24 +1,38 @@
 /**
  * Screen monitoring — capture control, in the service worker.
  *
- * This module owns the *grant* (which screen the user allowed) and the
- * *watchdog*. The frames themselves are grabbed in the offscreen document,
- * which is the only context with a canvas — see offscreen/monitoring.capture.ts.
+ * ── Why capture is not in the browser any more ───────────────────────────────
+ * It used to open a stream with `getDisplayMedia` from the offscreen document.
+ * That always shows Chrome's share picker, and the picker offers **Chrome tab**
+ * and **Window** beside **Entire screen**. No extension API can remove those
+ * choices — `displaySurface: 'monitor'` only preselects a tab, which Chrome
+ * demonstrably ignores when composing the dialog — so a monitoring session
+ * could be pointed at a single tab, and every screenshot in the report would
+ * then be a partial record of what the person was actually doing. Post-hoc
+ * rejection made that safe but not pleasant: the user still had to choose, and
+ * choosing wrong meant starting over.
  *
- * ── Why the grant is acquired here ───────────────────────────────────────────
- * `chrome.desktopCapture.chooseDesktopMedia` is an extension API available only
- * to the service worker. Unlike `getDisplayMedia` it needs no user gesture, and
- * restricting its sources to `['screen']` means the picker offers whole screens
- * and nothing else — which is exactly what monitoring is, as distinct from
- * recording where the user legitimately chooses a tab or a window.
+ * `chrome.desktopCapture` could not replace it either: from a service worker it
+ * demands a target tab, and a target tab scopes the stream to that tab's
+ * frames — which excludes the offscreen document that would have to open it.
+ *
+ * So the frames come from the desktop agent, which reads the display directly.
+ * There is no picker, no prompt, and no window or region entry point in its
+ * protocol — the capability that allowed the wrong thing is simply absent.
+ *
+ * ── What this module now owns ────────────────────────────────────────────────
+ * The capture *state* and the *watchdog*. Frames arrive as `SCREEN_FRAME`
+ * messages handled in native-agent.manager.ts, which reports each one here.
+ *
+ * Recording is untouched and still uses `getDisplayMedia` in the offscreen
+ * document, where choosing a tab or a window is exactly what the user wants.
  *
  * ── Why the watchdog cannot trust a timer ────────────────────────────────────
- * The old health check was `Boolean(stream && timer)`. A timer is truthy while
- * the underlying track is dead, and null while a capture is in flight, so it
- * answered neither "is the stream alive" nor "are frames being taken". Health
- * now comes from the offscreen document's explicit capture state plus a live
- * read of the video track, and a stale `lastSuccessfulCaptureAt` is treated as
- * a failure even when everything claims to be fine.
+ * The old health check was `Boolean(stream && timer)`, which answered neither
+ * "is capture alive" nor "are frames arriving". Health is now the agent's
+ * reported capability plus the age of the last frame actually received, and a
+ * stale `lastSuccessfulCaptureAt` is a failure even when everything claims to
+ * be fine.
  */
 
 import {
@@ -27,23 +41,12 @@ import {
   type MonitoringInterval,
 } from '@/types/monitoring';
 
-interface OffscreenBridge {
-  ensureDocument: () => Promise<void>;
-  send: (type: string, payload?: unknown) => Promise<unknown>;
-}
-
-let offscreen: OffscreenBridge | null = null;
 let health: CaptureHealth = { ...INITIAL_CAPTURE_HEALTH };
-
-export function configureCaptureOffscreen(bridge: OffscreenBridge): void {
-  offscreen = bridge;
-}
 
 export function getCaptureHealth(): CaptureHealth {
   return health;
 }
 
-/** The offscreen document pushes its real state here on every change. */
 export function setCaptureHealth(next: CaptureHealth): void {
   health = next;
 }
@@ -52,97 +55,129 @@ export function resetCaptureHealth(): void {
   health = { ...INITIAL_CAPTURE_HEALTH };
 }
 
-/**
- * Ask the offscreen document to acquire the screen and start capturing.
- *
- * The grant itself is taken there, with `getDisplayMedia`, because
- * `chrome.desktopCapture.chooseDesktopMedia` cannot serve this: from a service
- * worker it demands a target tab, and a target tab scopes the stream to that
- * tab's frames — which excludes the offscreen document that has to open it.
- *
- * The document reports back whether the track is genuinely live and whether the
- * user actually picked a whole screen. Obtaining a stream is not the same as
- * capture being healthy, and the two must not be conflated.
- */
-export async function startCapture(options: {
-  project: string;
-  sessionId: string;
-  intervalSeconds: MonitoringInterval;
-}): Promise<{ started: boolean; health: CaptureHealth }> {
-  if (!offscreen) return { started: false, health };
-  await offscreen.ensureDocument();
-  const result = (await offscreen.send('OFFSCREEN_MONITORING_START_CAPTURE', options)) as
-    | { started?: boolean; health?: CaptureHealth; error?: string }
-    | undefined;
-
-  if (result?.health) health = result.health;
-  if (result?.error) {
-    health = { ...health, status: 'failed', error: result.error };
-  }
-  return { started: result?.started === true, health };
+/** What the agent must report before a session may start capturing. */
+export interface AgentCaptureReadiness {
+  connected: boolean;
+  /** The agent's own answer to "can I read the whole screen". */
+  screenCapture: boolean;
+  /** True when the OS grant is the thing that is missing. */
+  permissionMissing: boolean;
+  /** Platform cannot do it at all (Wayland, macOS below 14). */
+  unsupported: boolean;
 }
 
-export async function stopCapture(): Promise<void> {
-  try {
-    await offscreen?.send('OFFSCREEN_MONITORING_STOP_CAPTURE');
-  } catch {
-    // The document is already gone, which is the same outcome.
+/**
+ * Begin capture, or refuse.
+ *
+ * Refusing is the point. Monitoring means the entire screen, so when the agent
+ * cannot deliver that, the session must say so rather than degrade to
+ * something narrower — there is deliberately no browser fallback left to
+ * degrade to.
+ *
+ * The cadence is not started here: it is passed to the agent with the session
+ * (`screenshotIntervalSeconds`) and runs on its native timer, because a
+ * service worker is torn down every thirty seconds and an offscreen document is
+ * throttled while the browser is in the background — which, for a tool that
+ * watches what someone does in *other* applications, is most of the time.
+ */
+export function startCapture(
+  readiness: AgentCaptureReadiness,
+  _interval: MonitoringInterval,
+): {
+  started: boolean;
+  health: CaptureHealth;
+} {
+  if (!readiness.connected) {
+    health = {
+      ...INITIAL_CAPTURE_HEALTH,
+      status: 'failed',
+      error:
+        'The BestQ monitoring agent is not running, so the screen cannot be captured. Install it and restart your browser.',
+    };
+    return { started: false, health };
   }
+  if (readiness.permissionMissing) {
+    health = {
+      ...INITIAL_CAPTURE_HEALTH,
+      status: 'failed',
+      error:
+        'Screen Recording permission is required. Grant it to the BestQ agent in System Settings › Privacy & Security › Screen Recording, then start again.',
+    };
+    return { started: false, health };
+  }
+  if (readiness.unsupported) {
+    health = {
+      ...INITIAL_CAPTURE_HEALTH,
+      status: 'failed',
+      error: 'Whole-screen capture is not available on this operating system.',
+    };
+    return { started: false, health };
+  }
+  if (!readiness.screenCapture) {
+    health = {
+      ...INITIAL_CAPTURE_HEALTH,
+      status: 'failed',
+      error: 'The monitoring agent cannot capture this screen.',
+    };
+    return { started: false, health };
+  }
+
+  health = {
+    ...INITIAL_CAPTURE_HEALTH,
+    status: 'active',
+    // The agent reads the display directly, so there is no MediaStreamTrack to
+    // be live or dead. Frame arrival is the only honest liveness signal, and
+    // the watchdog below uses exactly that.
+    trackLive: true,
+    error: null,
+  };
+  return { started: true, health };
+}
+
+/** Record a frame the agent delivered. */
+export function noteFrameCaptured(capturedAt: string): CaptureHealth {
+  health = {
+    ...health,
+    status: 'active',
+    trackLive: true,
+    lastCaptureAttemptAt: capturedAt,
+    lastSuccessfulCaptureAt: capturedAt,
+    successfulCaptureCount: health.successfulCaptureCount + 1,
+    error: null,
+  };
+  return health;
+}
+
+/**
+ * Record a capture the agent could not take.
+ *
+ * `reconnect` rather than `failed` for a transient read failure: the session
+ * keeps its time, activity and inactivity, and the next interval may well
+ * succeed. A permission or platform problem is `failed`, because nothing will
+ * change until someone acts.
+ */
+export function noteFrameFailed(reason: string, permanent: boolean): CaptureHealth {
+  health = {
+    ...health,
+    status: permanent ? 'failed' : 'reconnect',
+    trackLive: false,
+    failedCaptureCount: health.failedCaptureCount + 1,
+    error: reason,
+  };
+  return health;
+}
+
+export function stopCapture(): void {
   resetCaptureHealth();
 }
 
-export async function pauseCapture(): Promise<void> {
-  try {
-    await offscreen?.send('OFFSCREEN_MONITORING_PAUSE_CAPTURE');
-  } catch {
-    /* nothing to pause */
-  }
-}
-
 /**
- * Finish outstanding uploads before the session is settled.
+ * How long a session may go without a frame before it is called broken.
  *
- * Bounded inside the offscreen document, so a dead network cannot hold Stop
- * open indefinitely — the queue survives either way.
- */
-export async function flushCapture(): Promise<void> {
-  try {
-    await offscreen?.send('OFFSCREEN_MONITORING_FLUSH');
-  } catch {
-    /* the document is gone; queued frames remain in IndexedDB */
-  }
-}
-
-/**
- * Ask the offscreen document for its real capture state.
- *
- * Returns null when the document is unreachable, which is itself meaningful:
- * the document holding the stream no longer exists, so capture is definitely
- * not happening regardless of what the last known health said.
- */
-export async function probeCapture(): Promise<CaptureHealth | null> {
-  try {
-    const result = (await offscreen?.send('OFFSCREEN_MONITORING_HEALTH_QUERY')) as
-      | { health?: CaptureHealth }
-      | undefined;
-    if (result?.health) {
-      health = result.health;
-      return health;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * How long a session may go without a successful capture before it is called
- * broken.
- *
- * Two intervals plus a minute of slack: one missed deadline can happen for
- * innocent reasons (a slow frame, a deferred deadline), but two in a row means
- * something is actually wrong and the user needs to be told rather than shown
- * a reassuring "Monitoring Active".
+ * Two intervals plus a minute of slack: one missed capture can happen for
+ * innocent reasons — a slow encode, a machine under load — but two in a row
+ * means something is actually wrong and the user needs to be told rather than
+ * shown a reassuring "Monitoring Active".
  */
 export function isCaptureStale(intervalSeconds: number, now = Date.now()): boolean {
   if (health.status !== 'active' && health.status !== 'capturing') return false;
@@ -153,7 +188,7 @@ export function isCaptureStale(intervalSeconds: number, now = Date.now()): boole
   return now - last > intervalSeconds * 2000 + 60_000;
 }
 
-/** Does capture need a fresh grant from the user to continue? */
+/** Does capture need someone to act before it can continue? */
 export function needsReconnect(): boolean {
   return health.status === 'reconnect' || health.status === 'failed';
 }

@@ -119,7 +119,7 @@ func handle(agent *core.Agent, msg protocol.Inbound, send func(protocol.Outbound
 		agent.Hello()
 
 	case protocol.TypeStartMonitoring:
-		agent.StartMonitoring(msg.SessionID, msg.IdleThresholdSeconds)
+		agent.StartMonitoring(msg.SessionID, msg.IdleThresholdSeconds, msg.ScreenshotIntervalSeconds)
 
 	case protocol.TypeStopMonitoring:
 		agent.StopMonitoring(now, true)
@@ -132,6 +132,12 @@ func handle(agent *core.Agent, msg protocol.Inbound, send func(protocol.Outbound
 
 	case protocol.TypeFlush:
 		agent.Flush(now)
+
+	case protocol.TypeCaptureScreen:
+		// An out-of-band frame, for the extension to prove capture works
+		// before it commits to a session — and to recover a missed interval.
+		// The cadence itself is the agent's own ticker.
+		go agent.CaptureScreenNow()
 
 	case protocol.TypeGetStatus:
 		agent.Status()

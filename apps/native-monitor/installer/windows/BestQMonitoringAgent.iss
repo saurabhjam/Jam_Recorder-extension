@@ -46,8 +46,17 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; SignTool=bestq
 
 [Files]
+; One binary is installed, chosen by architecture. Windows on ARM would run the
+; x64 build under emulation, which works but pays an emulation cost on a process
+; that samples the foreground window every two seconds — and ArchitecturesAllowed
+; already admits arm64 machines, so shipping only x64 would quietly hand every
+; one of them the emulated path.
 Source: "..\..\build\bestq-monitoring-agent-windows-amd64.exe"; \
-  DestDir: "{app}"; DestName: "bestq-monitoring-agent.exe"; Flags: ignoreversion
+  DestDir: "{app}"; DestName: "bestq-monitoring-agent.exe"; Flags: ignoreversion; \
+  Check: not IsArm64Host
+Source: "..\..\build\bestq-monitoring-agent-windows-arm64.exe"; \
+  DestDir: "{app}"; DestName: "bestq-monitoring-agent.exe"; Flags: ignoreversion; \
+  Check: IsArm64Host
 
 [Registry]
 ; Chrome will only launch a host it has a registry entry for. Writing this is
@@ -70,6 +79,13 @@ Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\com.bestq.moni
 { The host manifest is generated at install time so `path` is the real install
   directory. A manifest shipped with a baked-in path breaks the moment the user
   installs anywhere other than the default. }
+{ Named IsArm64Host rather than IsArm64 so it cannot collide with the built-in
+  of that name added in Inno Setup 6.3 — this script targets 6.x generally. }
+function IsArm64Host: Boolean;
+begin
+  Result := ProcessorArchitecture = paArm64;
+end;
+
 procedure WriteHostManifest();
 var
   Manifest: string;

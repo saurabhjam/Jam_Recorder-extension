@@ -54,7 +54,7 @@ import {
   setMonitoringProject,
   MonitoringApiError,
 } from '@/services/monitoring.api';
-import { purgeSessionQueue, queueStats } from '@/utils/monitoringQueue';
+import { enqueueSnapshot, purgeSessionQueue, queueStats } from '@/utils/monitoringQueue';
 import {
   configureUploader,
   drainSnapshotQueue,
@@ -63,12 +63,10 @@ import {
   stopUploader,
 } from './monitoring.uploader';
 import {
-  configureCaptureOffscreen,
   startCapture,
   stopCapture,
-  pauseCapture,
-  flushCapture,
-  probeCapture,
+  noteFrameCaptured,
+  noteFrameFailed,
   getCaptureHealth,
   setCaptureHealth,
   resetCaptureHealth,
@@ -143,12 +141,10 @@ export function getMonitoringState(): MonitoringState {
 /** Read-through accessor for callers that may run in a freshly-woken worker. */
 export async function loadMonitoringState(): Promise<MonitoringState> {
   await hydrate();
-  // Capture health lives in the offscreen document, which outlives the worker,
-  // so a woken worker must ask rather than trust its own restored copy.
-  if (state.status === 'monitoring') {
-    const probed = await probeCapture();
-    if (probed) await persist({ capture: probed });
-  }
+  // No round trip to ask "is capture alive" any more. Capture lives in the
+  // agent, and the only honest liveness signal is whether frames are still
+  // arriving — which the persisted health already records, and the watchdog
+  // already judges.
   return state;
 }
 
@@ -186,8 +182,6 @@ export function configureMonitoringOffscreen(bridge: {
   ensureDocument: () => Promise<void>;
   send: (type: string, payload?: unknown) => Promise<unknown>;
 }): void {
-  configureCaptureOffscreen(bridge);
-
   configureUploader({
     onStats: async (stats) => {
       await hydrate();
@@ -273,6 +267,34 @@ export function configureMonitoringOffscreen(bridge: {
           openInactivityStartedAt: null,
           lastActivityAt: event.endedAt ?? new Date().toISOString(),
         });
+      })();
+    },
+
+    // A captured frame goes straight into the durable queue, then the worker's
+    // uploader takes it. Enqueue-before-upload is deliberate: the frame
+    // survives a worker teardown, a network outage and a browser restart,
+    // whereas uploading inline would lose it on any of the three.
+    onScreenFrame: (frame) => {
+      void (async () => {
+        await hydrate();
+        if (state.status !== 'monitoring' || !state.sessionId || !state.project) return;
+        try {
+          await enqueueSnapshot({
+            clientSnapshotId: generateId(20),
+            sessionId: state.sessionId,
+            project: state.project,
+            capturedAt: frame.capturedAt,
+            blob: new Blob([frame.bytes as BlobPart], { type: frame.mimeType }),
+            mimeType: frame.mimeType,
+            fileSize: frame.bytes.length,
+          });
+        } catch (err) {
+          console.warn('[Monitoring] could not queue a captured frame:', err);
+          await persist({ capture: noteFrameFailed('The screenshot could not be stored.', false) });
+          return;
+        }
+        await persist({ capture: noteFrameCaptured(frame.capturedAt) });
+        void drainSnapshotQueue();
       })();
     },
 
@@ -401,7 +423,7 @@ async function runStart(options: {
   //
   // Bound to the session id so intervals it reports can be attributed, and so
   // an agent restart can re-bind itself without the extension intervening.
-  startNativeMonitoring(state.sessionId!, state.inactivityThresholdSeconds);
+  startNativeMonitoring(state.sessionId!, state.inactivityThresholdSeconds, state.intervalSeconds);
 
   await initializeCurrentActivity({ nativeTracking: isNativeAgentTracking() });
   startIdleDetection();
@@ -417,11 +439,21 @@ async function runStart(options: {
 
 async function beginCapture(): Promise<void> {
   if (!state.sessionId || !state.project) return;
-  const result = await startCapture({
-    project: state.project,
-    sessionId: state.sessionId,
-    intervalSeconds: state.intervalSeconds,
-  });
+
+  // The agent's own report of what it can do, not an assumption. Monitoring
+  // means the entire screen, so if the agent cannot deliver that the session
+  // says so — there is no browser fallback left, by design: the fallback was
+  // the share picker, which could be aimed at a single tab.
+  const agent = getNativeAgentState();
+  const result = startCapture(
+    {
+      connected: isNativeAgentTracking(),
+      screenCapture: agent.capabilities?.screenCapture === true,
+      permissionMissing: agent.permissions?.screenRecording === false,
+      unsupported: agent.status === 'unsupported-platform',
+    },
+    state.intervalSeconds,
+  );
 
   // Uploading runs here in the worker, not in the offscreen document, and it
   // runs even when capture failed to start: a previous session may have left
@@ -504,15 +536,15 @@ async function runStop(): Promise<MonitoringState> {
     );
   }
 
-  // 3. Take a final frame, then give everything queued a bounded chance to
-  //    land. Both halves matter: the offscreen document can only capture, and
-  //    only the worker can upload.
-  await flushCapture();
+  // 3. Give everything queued a bounded chance to land. There is no final
+  //    frame to take: the agent's capture ticker stops with the session, and
+  //    a frame captured after the stop time would sit outside the session it
+  //    would be filed under.
   await flushSnapshotQueue();
   stopUploader();
 
   // 4. Only now may capture go.
-  await stopCapture();
+  stopCapture();
   stopNativeMonitoring();
   stopIdleDetection();
 
@@ -954,7 +986,11 @@ export async function restoreMonitoringSession(): Promise<void> {
     // Re-open the port and re-bind the session: the port does not survive a
     // worker teardown, but the agent process and its session binding do.
     if (state.sessionId) {
-      startNativeMonitoring(state.sessionId, state.inactivityThresholdSeconds);
+      startNativeMonitoring(
+        state.sessionId,
+        state.inactivityThresholdSeconds,
+        state.intervalSeconds,
+      );
     } else {
       connectNativeAgent();
     }

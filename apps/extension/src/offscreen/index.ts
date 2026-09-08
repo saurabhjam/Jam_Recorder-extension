@@ -19,15 +19,13 @@
 import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
 import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
-import { recordingOpfsName, saveBlobToIDB, micBlobKey } from '@/utils/blobStorage';
 import {
-  startMonitoringCapture,
-  stopMonitoringCapture,
-  pauseMonitoringCapture,
-  flushMonitoringCapture,
-  getMonitoringCaptureHealth,
-  isMonitoringCaptureActive,
-} from './monitoring.capture';
+  recordingOpfsName,
+  saveBlobToIDB,
+  micBlobKey,
+  systemBlobKey,
+  loadBlobFromOPFS,
+} from '@/utils/blobStorage';
 import {
   buildShareUrl,
   API_BASE_URL as REPORTS_URL,
@@ -152,10 +150,22 @@ let tabAudioStreams: MediaStream[] = []; // audible-tab audio mixed into desktop
 let webcamStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null; // mixes system/tab audio into one track
 let audioLimiter: DynamicsCompressorNode | null = null; // master bus tab-audio sources feed into
-// The mic records to its OWN blob, parallel to the main recording, so the editor can
-// mute mic and system audio independently (they can't be separated once summed).
+// System/tab audio WITHOUT the mic — recorded on the side so the editor can drop the
+// mic from a recording whose main track already has both summed.
+let systemBusDestination: MediaStreamAudioDestinationNode | null = null;
+// The main recording carries EVERYTHING the user expects to hear (video + system
+// audio + mic), so saving it needs no re-encode at all. The mic and the system bus
+// are ALSO recorded to their own small audio-only blobs purely so the editor can
+// offer "mute mic" / "mute system audio" after the fact — those are the only two
+// cases that pay for a re-encode.
 let micRecorder: MediaRecorder | null = null;
 let micChunks: Blob[] = [];
+let systemRecorder: MediaRecorder | null = null;
+let systemChunks: Blob[] = [];
+// True when the mic was folded into the main recording's audio track (always, now,
+// when a mic was in use). Reported to the editor so it knows the main blob is
+// already complete and must not play/mix the mic a second time.
+let micMixedIntoMain = false;
 let sink: RecordingSink | null = null; // streams recorder chunks to disk (OPFS) or memory
 let mimeType = 'video/webm';
 let isRecordingActive = false;
@@ -484,13 +494,13 @@ async function createRecordingStream(
   const tracks: MediaStreamTrack[] = [];
   if (videoTrack) tracks.push(videoTrack);
 
-  // NOTE: the mic is deliberately NOT mixed into this stream. It is recorded to its
-  // own blob by `startMicRecorder`, so the editor can mute mic and system audio
-  // independently. Summing them here would fuse them into one track and make that
-  // impossible after the fact — which is exactly the bug this split fixes.
+  const micTracks = micStream?.getAudioTracks() ?? [];
+  const hasMic = micTracks.length > 0;
+  micMixedIntoMain = false;
 
-  // No system audio to mix and none coming later → record the capture stream as-is.
-  if (!hasCaptureAudio && !needsDynamicTabAudio) {
+  // Nothing to mix at all (no system audio now or later, no mic) → record the
+  // capture stream as-is.
+  if (!hasCaptureAudio && !needsDynamicTabAudio && !hasMic) {
     return videoTrack ? new MediaStream(tracks) : captureStream;
   }
 
@@ -500,6 +510,12 @@ async function createRecordingStream(
   audioContext = new AudioContext();
   const destination = audioContext.createMediaStreamDestination();
 
+  // A second destination carrying the SYSTEM bus only. It is what makes "mute mic"
+  // possible even though the mic is mixed into the main recording: the editor
+  // re-encodes against this track instead of trying to unmix one that is already
+  // summed. Recorded (cheaply, audio-only) only when both sources actually exist.
+  const systemOnlyDestination = audioContext.createMediaStreamDestination();
+
   const limiter = audioContext.createDynamicsCompressor();
   limiter.threshold.value = -3; // dB — start limiting just below clipping
   limiter.knee.value = 0;
@@ -507,7 +523,11 @@ async function createRecordingStream(
   limiter.attack.value = 0.003;
   limiter.release.value = 0.25;
   limiter.connect(destination);
+  limiter.connect(systemOnlyDestination);
   audioLimiter = limiter; // dynamically-added tabs connect here
+  // Only worth keeping when system audio exists (or can still arrive): with a mic
+  // alone this bus is permanent silence, and recording it would just cost a file.
+  systemBusDestination = hasCaptureAudio || needsDynamicTabAudio ? systemOnlyDestination : null;
 
   // Capture audio present → tab recording (chromeMediaSource:'tab') or
   // getDisplayMedia system audio (Windows/ChromeOS). Tab capture mutes the tab's
@@ -522,8 +542,15 @@ async function createRecordingStream(
     if (monitorCaptureAudio) src.connect(audioContext.destination);
   }
 
-  // Mic intentionally omitted from this graph — see the note above; it goes to its
-  // own recorder so it stays independently mutable in the editor.
+  // The mic goes into the MAIN mix (so the recorded file is complete on its own and
+  // needs no re-encode to be saved) but deliberately NOT into the system-only bus,
+  // which is what keeps the two separable for the editor's mute toggles. It is also
+  // still recorded to its own blob by `startAuxRecorders`, for "mute system audio".
+  if (hasMic) {
+    const micSrc = audioContext.createMediaStreamSource(new MediaStream(micTracks));
+    micSrc.connect(destination); // straight to the mix — never to audioContext.destination (echo)
+    micMixedIntoMain = true;
+  }
 
   // The offscreen document has no user gesture, so the AudioContext starts
   // suspended and the graph outputs silence. With a mic, getUserMedia happens
@@ -619,7 +646,7 @@ async function startRecording(payload: StartRecordingPayload): Promise<void> {
   // 1-second timeslices for consistent chunking
   recorder.start(1000);
 
-  startMicRecorder();
+  startAuxRecorders();
   watchForCaptureEnd();
 }
 
@@ -653,68 +680,114 @@ function watchForCaptureEnd(): void {
 }
 
 /**
- * Record the microphone to its own blob, in parallel with the main recording.
+ * Start the two audio-only side recorders that back the editor's mute toggles.
  *
- * Both recorders are started back-to-back off the same live streams, so the two
- * files line up on playback. Keeping them separate is what lets the editor offer
- * independent "mute mic" and "mute system audio" — mixing at record time would
- * collapse them into one inseparable track.
+ * The main recording already contains everything (video + system + mic), so saving
+ * it as-is needs no processing whatsoever — that is the whole point, and it is why
+ * a save is now a straight upload instead of a real-time re-encode. These two small
+ * blobs exist only for the two cases where the user asks for something the main
+ * track can no longer give: mic alone (system muted) or system alone (mic muted).
+ *
+ * All three recorders start back-to-back off the same live streams, so the files
+ * line up on playback, and they are paused/resumed together.
  */
-function startMicRecorder(): void {
+function startAuxRecorders(): void {
   micChunks = [];
   micRecorder = null;
+  systemChunks = [];
+  systemRecorder = null;
+
+  const audioMime =
+    ['audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
+
+  const start = (
+    tracks: MediaStreamTrack[],
+    chunks: Blob[],
+    label: string,
+  ): MediaRecorder | null => {
+    if (tracks.length === 0) return null;
+    try {
+      const rec = new MediaRecorder(
+        new MediaStream(tracks),
+        audioMime ? { mimeType: audioMime } : undefined,
+      );
+      rec.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+      rec.onerror = (e) => {
+        // Non-fatal in every case: the main recording is complete on its own.
+        console.warn(`[Offscreen] ${label} recorder error:`, e.error);
+      };
+      rec.start(1000);
+      return rec;
+    } catch (err) {
+      console.warn(`[Offscreen] Could not start ${label} recorder:`, err);
+      return null;
+    }
+  };
 
   const micTracks = micStream?.getAudioTracks() ?? [];
-  if (micTracks.length === 0) return;
+  micRecorder = start(micTracks, micChunks, 'Mic');
 
-  try {
-    const micOnly = new MediaStream(micTracks);
-    const preferred = ['audio/webm;codecs=opus', 'audio/webm'];
-    const micMime = preferred.find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
-    micRecorder = new MediaRecorder(micOnly, micMime ? { mimeType: micMime } : undefined);
-    micRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) micChunks.push(e.data);
-    };
-    micRecorder.onerror = (e) => {
-      // Non-fatal: the main recording continues; the mic track is simply absent.
-      console.warn('[Offscreen] Mic recorder error:', e.error);
-    };
-    micRecorder.start(1000);
-  } catch (err) {
-    console.warn('[Offscreen] Could not start mic recorder:', err);
-    micRecorder = null;
+  // Only worth recording when BOTH sources are present: with no mic there is
+  // nothing to subtract from the main track, and with no system audio the
+  // "mute mic" result is simply a silent video.
+  if (micTracks.length > 0 && systemBusDestination) {
+    systemRecorder = start(systemBusDestination.stream.getAudioTracks(), systemChunks, 'System');
   }
 }
 
-/** Stop the mic recorder and return its blob (null when no mic was recorded). */
-async function finalizeMicRecording(): Promise<Blob | null> {
-  const rec = micRecorder;
+/** Stop one side recorder and return its blob (null when it never ran/captured). */
+async function finalizeAuxRecorder(
+  rec: MediaRecorder | null,
+  chunks: Blob[],
+  label: string,
+): Promise<Blob | null> {
   if (!rec) return null;
   try {
     if (rec.state !== 'inactive') {
+      // Bounded like the main recorder's stop: a side track that never reports back
+      // must not be able to hold up finalizing the recording itself.
       await new Promise<void>((resolve) => {
-        rec.onstop = () => resolve();
+        const done = setTimeout(resolve, 5000);
+        rec.onstop = () => {
+          clearTimeout(done);
+          resolve();
+        };
         rec.stop();
       });
     }
-    if (micChunks.length === 0) return null;
-    return new Blob(micChunks, { type: rec.mimeType || 'audio/webm' });
+    if (chunks.length === 0) return null;
+    return new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
   } catch (err) {
-    console.warn('[Offscreen] Could not finalize mic recording:', err);
+    console.warn(`[Offscreen] Could not finalize ${label} recording:`, err);
     return null;
-  } finally {
-    micRecorder = null;
-    micChunks = [];
   }
+}
+
+/** Stop both side recorders and hand back whatever they captured. */
+async function finalizeAuxRecordings(): Promise<{ micBlob: Blob | null; systemBlob: Blob | null }> {
+  const [micBlob, systemBlob] = await Promise.all([
+    finalizeAuxRecorder(micRecorder, micChunks, 'mic'),
+    finalizeAuxRecorder(systemRecorder, systemChunks, 'system'),
+  ]);
+  micRecorder = null;
+  micChunks = [];
+  systemRecorder = null;
+  systemChunks = [];
+  return { micBlob, systemBlob };
 }
 
 function pauseRecording(): void {
   if (recorder?.state === 'recording') {
     recorder.pause();
   }
-  // Keep the mic track in lockstep, or the two files drift out of sync.
+  // Keep the side tracks in lockstep, or the files drift out of sync.
   if (micRecorder?.state === 'recording') {
     micRecorder.pause();
+  }
+  if (systemRecorder?.state === 'recording') {
+    systemRecorder.pause();
   }
 }
 
@@ -724,6 +797,9 @@ function resumeRecording(): void {
   }
   if (micRecorder?.state === 'paused') {
     micRecorder.resume();
+  }
+  if (systemRecorder?.state === 'paused') {
+    systemRecorder.resume();
   }
 }
 
@@ -737,6 +813,13 @@ async function stopRecording(metadata: {
   hasWebcam: boolean;
 }): Promise<void> {
   if (!recorder || !isRecordingActive) {
+    // The recorder is gone (the offscreen document was torn down and rebuilt, or the
+    // capture died and cleanup already ran) — but every timeslice written before that
+    // is still sitting in OPFS. Throwing here used to discard a complete recording
+    // over a lost object reference, so recover the file instead and hand the editor
+    // what was captured. Only genuinely-empty recordings fail now.
+    const salvaged = await salvageRecordingFromDisk(metadata);
+    if (salvaged) return;
     throw new Error('No active recording');
   }
   const activeRecorder = recorder;
@@ -784,8 +867,9 @@ async function stopRecording(metadata: {
     }
   });
 
-  // Grab the parallel mic track before cleanup() tears the streams down.
-  const micBlob = await finalizeMicRecording();
+  // Grab the parallel audio tracks before cleanup() tears the streams down.
+  const { micBlob, systemBlob } = await finalizeAuxRecordings();
+  const audioMixed = micMixedIntoMain;
 
   const activeSink = sink;
   let finalBlob: Blob;
@@ -815,14 +899,18 @@ async function stopRecording(metadata: {
     }
   }
 
-  // Persist the mic track under a sibling key so the editor can load it alongside
-  // the video and toggle it independently. Failing here is non-fatal: the editor
-  // simply finds no mic track and offers only the system-audio control.
-  if (micBlob && micBlob.size > 0) {
+  // Persist the side tracks under sibling keys so the editor can mute either source
+  // after the fact. Failing here is non-fatal by design: the main recording is
+  // complete on its own, so the editor just offers fewer mute options.
+  for (const [key, blob] of [
+    [micBlobKey(metadata.recordingId), micBlob],
+    [systemBlobKey(metadata.recordingId), systemBlob],
+  ] as Array<[string, Blob | null]>) {
+    if (!blob || blob.size === 0) continue;
     try {
-      await saveBlobToIDB(micBlobKey(metadata.recordingId), micBlob);
+      await saveBlobToIDB(key, blob);
     } catch (err) {
-      console.warn('[Offscreen] Could not save mic blob to IDB:', err);
+      console.warn('[Offscreen] Could not save side audio blob to IDB:', err);
     }
   }
 
@@ -834,8 +922,46 @@ async function stopRecording(metadata: {
     blobSize: finalBlob.size,
     shareUrl: null,
     recordingType: metadata.type,
+    // The main file already carries every audio source, so the editor can upload it
+    // untouched instead of re-encoding to fold the mic back in.
+    audioMixed,
   });
   // Upload is now triggered explicitly by the editor — offscreen is done here.
+}
+
+/**
+ * Last-resort save path: rebuild the recording from whatever reached OPFS and report
+ * it as ready, for stops that arrive after the recorder itself is gone.
+ *
+ * Returns false when there is nothing on disk to salvage.
+ */
+async function salvageRecordingFromDisk(metadata: {
+  recordingId: string;
+  title: string;
+  type: string;
+  duration: number;
+}): Promise<boolean> {
+  let blob: Blob | null = null;
+  try {
+    blob = await loadBlobFromOPFS(metadata.recordingId);
+  } catch {
+    blob = null;
+  }
+  if (!blob || blob.size === 0) return false;
+
+  console.warn('[Offscreen] Recorder gone — salvaging recording from OPFS:', blob.size, 'bytes');
+  const thumbnailDataUrl = await generateThumbnail(blob);
+  sendToBackground('OFFSCREEN_RECORDING_READY', {
+    recordingId: metadata.recordingId,
+    title: metadata.title,
+    thumbnailDataUrl,
+    duration: metadata.duration,
+    blobSize: blob.size,
+    shareUrl: null,
+    recordingType: metadata.type,
+    audioMixed: true,
+  });
+  return true;
 }
 
 async function generateThumbnail(blob: Blob): Promise<string | null> {
@@ -920,6 +1046,7 @@ function cleanup(): void {
   webcamStream = null;
   audioContext = null;
   audioLimiter = null;
+  systemBusDestination = null;
   needsDynamicTabAudio = false;
   recorder = null;
   sink = null;
@@ -1266,57 +1393,19 @@ chrome.runtime.onMessage.addListener((message: OffscreenIncomingMessage, _sender
     }
 
     // ── Screen monitoring ──────────────────────────────────────────────────
-    // Capture lives in this document because a service worker has no canvas and
-    // no getDisplayMedia, and because holding the stream here is what keeps it
-    // alive across the worker's constant teardowns.
-    case 'OFFSCREEN_MONITORING_START_CAPTURE': {
-      const payload = message.payload as {
-        project: string;
-        sessionId: string;
-        intervalSeconds: 30 | 60;
-        streamId: string;
-      };
-      startMonitoringCapture(payload)
-        .then((result) => sendResponse(result))
-        .catch((err: Error) =>
-          sendResponse({
-            started: false,
-            error: err.message,
-            health: getMonitoringCaptureHealth(),
-          }),
-        );
-      return true;
-    }
-
-    case 'OFFSCREEN_MONITORING_STOP_CAPTURE': {
-      stopMonitoringCapture();
-      sendResponse({ success: true });
-      return false;
-    }
-
-    case 'OFFSCREEN_MONITORING_PAUSE_CAPTURE': {
-      // Releases the stream but leaves the queue draining — frames already
-      // captured are still valid and must still be uploaded.
-      pauseMonitoringCapture();
-      sendResponse({ success: true });
-      return false;
-    }
-
-    case 'OFFSCREEN_MONITORING_FLUSH': {
-      flushMonitoringCapture()
-        .then(() => sendResponse({ success: true }))
-        .catch((err: Error) => sendResponse({ error: err.message }));
-      return true;
-    }
-
-    case 'OFFSCREEN_MONITORING_HEALTH_QUERY': {
-      // The background's watchdog. Returns the explicit capture state plus a
-      // live read of the video track — never "is there a timer object", which
-      // answers neither whether the stream is alive nor whether frames are
-      // being taken.
-      sendResponse({ health: getMonitoringCaptureHealth(), active: isMonitoringCaptureActive() });
-      return false;
-    }
+    // Not here any more. Monitoring frames come from the desktop agent, which
+    // reads the display directly.
+    //
+    // They used to be grabbed in this document with getDisplayMedia, and that
+    // is the one thing monitoring must never do: getDisplayMedia always shows
+    // Chrome's share picker, the picker offers Chrome tab and Window beside
+    // Entire screen, and no extension API can remove those choices. A session
+    // aimed at a single tab produces a report that looks complete and is not.
+    // The handlers are gone rather than merely unused, so no message can
+    // resurrect that path.
+    //
+    // Recording still uses getDisplayMedia below, where choosing a tab or a
+    // window is exactly what the user wants.
 
     case 'OFFSCREEN_PROCESS_QUEUE': {
       processOfflineQueue()

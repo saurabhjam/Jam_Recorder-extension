@@ -35,8 +35,8 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { formatDuration } from '@/utils';
-import { INITIAL_MONITORING_STATE, MONITORING_INTERVALS } from '@/types/monitoring';
-import type { MonitoringInterval, MonitoringState } from '@/types/monitoring';
+import { INITIAL_MONITORING_STATE, MONITORING_INTERVAL_SECONDS } from '@/types/monitoring';
+import type { MonitoringState } from '@/types/monitoring';
 import {
   getAssignedProjects,
   resolveDefaultProject,
@@ -167,7 +167,9 @@ function captureLabel(state: MonitoringState): { text: string; tone: 'ok' | 'war
         ? { text: 'Connected', tone: 'ok' }
         : { text: 'Stream not live', tone: 'warn' };
     case 'requesting':
-      return { text: 'Waiting for screen selection…', tone: 'idle' };
+      // No selection to wait for any more — the agent reads the display
+      // directly, so this is only the moment before the first frame arrives.
+      return { text: 'Starting…', tone: 'idle' };
     case 'reconnect':
       return { text: 'Disconnected', tone: 'warn' };
     case 'failed':
@@ -183,7 +185,6 @@ interface MonitoringViewProps {
 
 export function MonitoringView({ onBack }: MonitoringViewProps) {
   const [state, setState] = useState<MonitoringState>(INITIAL_MONITORING_STATE);
-  const [interval, setIntervalSeconds] = useState<MonitoringInterval>(60);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [project, setProject] = useState<string | null>(null);
   const [projectsLoading, setProjectsLoading] = useState(true);
@@ -195,7 +196,6 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
     const next = await sendToBackground<MonitoringState>('MONITORING_GET_STATE');
     if (next) {
       setState(next);
-      setIntervalSeconds(next.intervalSeconds ?? 60);
     }
   }, []);
 
@@ -290,7 +290,7 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
               leftIcon={<MonitorOff size={14} />}
               onClick={() => run('MONITORING_RECONNECT_CAPTURE')}
             >
-              Reconnect Screen
+              Retry capture
             </Button>
           </div>
         )}
@@ -400,9 +400,9 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
             <div>
               <p className="text-sm font-semibold text-white">Entire Screen Monitoring</p>
               <p className="mt-1 text-xs text-dark-300 leading-5">
-                Your entire screen will be monitored while monitoring is active. You will be asked
-                which screen to share — monitoring always captures a whole screen, never a single
-                tab or window.
+                Your entire screen is captured while monitoring is active — always the whole screen,
+                never a single tab or window. The BestQ desktop agent takes the screenshots, so
+                there is nothing to choose and no sharing prompt.
               </p>
             </div>
 
@@ -435,28 +435,6 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
                 </select>
               )}
             </div>
-
-            <fieldset className="space-y-2">
-              <legend className="text-[11px] font-semibold uppercase tracking-wide text-dark-400">
-                Screenshot interval
-              </legend>
-              {MONITORING_INTERVALS.map((seconds) => (
-                <label
-                  key={seconds}
-                  className="flex items-center gap-2 text-sm text-white cursor-pointer"
-                >
-                  <input
-                    type="radio"
-                    name="monitoring-interval"
-                    value={seconds}
-                    checked={interval === seconds}
-                    onChange={() => setIntervalSeconds(seconds)}
-                    className="accent-jam-500"
-                  />
-                  {seconds} seconds
-                </label>
-              ))}
-            </fieldset>
           </div>
         )}
 
@@ -517,7 +495,10 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
               // Persist before starting, so a retry after a failure — and the
               // next popup open — default to what the user just picked.
               await setSelectedProject(project);
-              await run('MONITORING_START', { intervalSeconds: interval, project });
+              await run('MONITORING_START', {
+                intervalSeconds: MONITORING_INTERVAL_SECONDS,
+                project,
+              });
             }}
           >
             Start Monitoring

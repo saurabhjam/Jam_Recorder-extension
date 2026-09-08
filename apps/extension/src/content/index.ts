@@ -222,6 +222,14 @@ function startToolbarGuard(): void {
       stopToolbarGuard();
       return;
     }
+    // The extension was reloaded or updated out from under this page. Nothing here
+    // can reach the background any more, so the controls are a leftover from a
+    // previous copy of the extension: they can't stop anything, nothing will ever
+    // tell them to hide, and they sit on the page looking live. Take them down.
+    if (!chrome.runtime?.id) {
+      unmountToolbar();
+      return;
+    }
     if (!isToolbarVisible || window.__bestqToolbarSuppressed) return;
     if (!toolbarContainer || !toolbarContainer.isConnected) {
       // Do NOT blindly remount: this watchdog used to resurrect the toolbar
@@ -421,6 +429,37 @@ function mountToolbar(recordingId: string): void {
   syncToolbarWithBackground(recordingId);
 }
 
+/**
+ * Send a message to the background, reporting whether this instance can still reach
+ * it at all.
+ *
+ * A content script whose extension has been reloaded or updated keeps running with a
+ * dead `chrome.runtime` — every call throws "Extension context invalidated". Its
+ * toolbar is still on the page, still looks live, and its Stop button did nothing at
+ * all: the click threw, no message went anywhere, and the bar just stayed there. So
+ * a failed send is treated as what it is — this toolbar is a leftover — and the
+ * caller takes it off the page instead of leaving the user clicking a dead button.
+ */
+function sendToBackgroundSafe(message: ExtensionMessage): boolean {
+  try {
+    if (!chrome.runtime?.id) return false;
+    chrome.runtime.sendMessage(message, () => {
+      // Swallow "no receiving end": the worker may be asleep, or the stop may have
+      // gone through and taken it down with it.
+      void chrome.runtime.lastError;
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Report a self-mounted toolbar so the background can track (and later sweep) it. */
+function notifyToolbarMounted(): void {
+  if (!toolbarContainer?.isConnected) return;
+  sendToBackgroundSafe({ type: 'TOOLBAR_MOUNTED' } satisfies ExtensionMessage);
+}
+
 /** Seed timer + pause state from the background after a (re)mount, so the
  *  toolbar never comes back at 0:00 / un-paused when the recording isn't. */
 function syncToolbarWithBackground(recordingId: string): void {
@@ -464,28 +503,36 @@ function renderToolbar(recordingId: string): void {
           stopFallbackTimer = null;
           if (isStopping) unmountToolbar();
         }, 8000);
-        chrome.runtime.sendMessage({ type: 'STOP_RECORDING' } satisfies ExtensionMessage, () => {
-          // Swallow "no receiving end" — the stop may well have gone through and
-          // taken the service worker down with it.
-          void chrome.runtime.lastError;
-        });
+        if (!sendToBackgroundSafe({ type: 'STOP_RECORDING' } satisfies ExtensionMessage)) {
+          // Nothing received the stop and nothing ever will — this toolbar belongs to
+          // a superseded copy of the extension. Waiting out the fallback would just
+          // leave the user pressing a dead button for another eight seconds.
+          unmountToolbar();
+        }
       },
       onPause: () => {
         if (isStopping) return;
         // Optimistic flip; the background's RECORDING_PAUSE_STATE broadcast confirms.
         isRecordingPaused = true;
         renderToolbar(recordingId);
-        chrome.runtime.sendMessage({ type: 'PAUSE_RECORDING' } satisfies ExtensionMessage);
+        // Same reasoning as Stop: controls that can't reach the extension are a
+        // leftover, and showing "Paused" over a recording that is still running is
+        // worse than admitting the bar is dead.
+        if (!sendToBackgroundSafe({ type: 'PAUSE_RECORDING' } satisfies ExtensionMessage)) {
+          unmountToolbar();
+        }
       },
       onResume: () => {
         if (isStopping) return;
         isRecordingPaused = false;
         renderToolbar(recordingId);
-        chrome.runtime.sendMessage({ type: 'RESUME_RECORDING' } satisfies ExtensionMessage);
+        if (!sendToBackgroundSafe({ type: 'RESUME_RECORDING' } satisfies ExtensionMessage)) {
+          unmountToolbar();
+        }
       },
       onScreenshot: () => {
         if (isStopping) return;
-        chrome.runtime.sendMessage({ type: 'TAKE_SCREENSHOT' } satisfies ExtensionMessage);
+        sendToBackgroundSafe({ type: 'TAKE_SCREENSHOT' } satisfies ExtensionMessage);
       },
       onAnnotate: (imageUrl: string) => {
         mountAnnotationCanvas(imageUrl);
@@ -1294,6 +1341,10 @@ void (async function autoRestoreToolbar() {
       if (response?.showToolbar && response?.recordingId) {
         mountToolbar(response.recordingId as string);
         startCapture();
+        // Tell the background this tab now carries a toolbar. Self-mounts were
+        // invisible to it, so they were never pruned when the user moved on and
+        // never counted as "shown" — leaving stop/pause bars stacked up across tabs.
+        notifyToolbarMounted();
         return;
       }
       return; // recording, but this tab shouldn't show the toolbar

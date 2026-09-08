@@ -261,6 +261,16 @@ func (d *darwinMonitor) IdleSeconds() (float64, error) {
 	return seconds, nil
 }
 
+// CaptureScreen grabs the whole main display. See platform.Monitor.
+func (d *darwinMonitor) CaptureScreen(maxEdge, targetBytes int) (*Frame, error) {
+	frame, err := captureWithinBudget(captureScreenJPEG, maxEdge, targetBytes)
+	if err != nil {
+		return nil, err
+	}
+	frame.DisplayCount = displayCount()
+	return frame, nil
+}
+
 func (d *darwinMonitor) Capabilities() protocol.Capabilities {
 	trusted := C.bestq_ax_trusted() == 1
 	return protocol.Capabilities{
@@ -273,10 +283,14 @@ func (d *darwinMonitor) Capabilities() protocol.Capabilities {
 		// A window title is not a URL. Never true, on any platform.
 		ExactBrowserURL: false,
 		IdleDetection:   true,
+		// Needs the Screen Recording grant, and is reported honestly so the
+		// extension refuses to start rather than falling back to the picker.
+		ScreenCapture: screenCaptureAllowed(),
 	}
 }
 
 func (d *darwinMonitor) Permissions() protocol.Permissions {
 	trusted := C.bestq_ax_trusted() == 1
-	return protocol.Permissions{Accessibility: &trusted}
+	recording := screenCaptureAllowed()
+	return protocol.Permissions{Accessibility: &trusted, ScreenRecording: &recording}
 }

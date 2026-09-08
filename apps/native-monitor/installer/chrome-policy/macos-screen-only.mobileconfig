@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Restricts the BestQ extension's share picker to "Entire screen" on macOS.
+
+  Read installer/chrome-policy/README.md first: ScreenCaptureAllowed=false is a
+  GLOBAL deny, so any origin absent from the allowlists below loses screen
+  sharing. Add every tool your team shares from.
+
+  Deploy through MDM, or install locally for testing with:
+      sudo profiles install -path macos-screen-only.mobileconfig
+  Then confirm at chrome://policy after "Reload policies".
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadVersion</key><integer>1</integer>
+  <key>PayloadIdentifier</key><string>in.best-quality.chrome.screen-only</string>
+  <key>PayloadUUID</key><string>4C1E9D3A-BE57-4A21-9F2C-0A1B2C3D4E5F</string>
+  <key>PayloadDisplayName</key><string>BestQ — Chrome screen capture policy</string>
+  <key>PayloadOrganization</key><string>BestQ</string>
+  <key>PayloadScope</key><string>System</string>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key><string>com.google.Chrome</string>
+      <key>PayloadVersion</key><integer>1</integer>
+      <key>PayloadIdentifier</key><string>in.best-quality.chrome.screen-only.chrome</string>
+      <key>PayloadUUID</key><string>9A1F2C64-4E7B-4C1E-9D3A-BE5701020304</string>
+      <key>PayloadDisplayName</key><string>Chrome capture surfaces</string>
+      <key>PayloadEnabled</key><true/>
+
+      <!-- Master switch: deny, then grant per surface per origin. -->
+      <key>ScreenCaptureAllowed</key><false/>
+
+      <!-- Whole screens: the extension, plus anything that needs it. -->
+      <key>ScreenCaptureAllowedByOrigins</key>
+      <array>
+        <string>chrome-extension://heogonedpcjllemcclnbedlgnnijhloi</string>
+        <string>https://meet.google.com</string>
+      </array>
+
+      <!-- Windows: NOT the extension. This is what removes the "Window" tab. -->
+      <key>WindowCaptureAllowedByOrigins</key>
+      <array>
+        <string>https://meet.google.com</string>
+      </array>
+
+      <!-- Tabs: NOT the extension. This removes the "Chrome tab" tab. -->
+      <key>TabCaptureAllowedByOrigins</key>
+      <array>
+        <string>https://meet.google.com</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

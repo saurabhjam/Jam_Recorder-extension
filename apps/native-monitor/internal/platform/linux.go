@@ -242,6 +242,17 @@ func (l *linuxMonitor) IdleSeconds() (float64, error) {
 	return float64(ms) / 1000.0, nil
 }
 
+// CaptureScreen is not implemented on Linux. See platform.Monitor.
+//
+// Reported as unavailable rather than approximated. X11 could be read with an
+// extra helper binary, and Wayland cannot be read by an unprivileged client at
+// all — it has no protocol for "give me the screen" outside the portal, which
+// prompts. Monitoring therefore refuses to start here instead of quietly
+// capturing something narrower than the whole screen.
+func (l *linuxMonitor) CaptureScreen(maxEdge, targetBytes int) (*Frame, error) {
+	return nil, ErrScreenUnsupported
+}
+
 func (l *linuxMonitor) Capabilities() protocol.Capabilities {
 	l.probe()
 	x11 := l.session == sessionX11

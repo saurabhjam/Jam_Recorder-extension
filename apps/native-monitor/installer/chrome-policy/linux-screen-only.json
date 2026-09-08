@@ -1,0 +1,10 @@
+{
+  "_comment": "Install to /etc/opt/chrome/policies/managed/bestq-screen-only.json (root, 0644). Read README.md first: ScreenCaptureAllowed=false is a GLOBAL deny — every origin absent from these lists loses screen sharing.",
+  "ScreenCaptureAllowed": false,
+  "ScreenCaptureAllowedByOrigins": [
+    "chrome-extension://heogonedpcjllemcclnbedlgnnijhloi",
+    "https://meet.google.com"
+  ],
+  "WindowCaptureAllowedByOrigins": ["https://meet.google.com"],
+  "TabCaptureAllowedByOrigins": ["https://meet.google.com"]
+}

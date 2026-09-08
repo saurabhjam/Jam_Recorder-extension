@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -213,14 +214,40 @@ func buildActivity(win *platform.Window) protocol.Activity {
 // native apps too, because an editor moving between files is genuinely a
 // different piece of work. Normalised so a title differing only by whitespace
 // or an unsaved-changes marker does not split an interval.
+// unreadBadge matches the notification counter applications prepend to their
+// window title: "(3) Slack | general", "(12) Inbox — Gmail".
+//
+// It has to be stripped before the title is used as an interval identity.
+// Otherwise every arriving message renames the window, the identity changes,
+// and one continuous stretch in an application is chopped into a row per
+// notification — which is exactly how twenty seconds in Slack came back as six
+// separate "Slack" entries of one to four seconds each. The user never switched
+// away; only the unread count moved.
+var unreadBadge = regexp.MustCompile(`^\s*\(\s*\d+\+?\s*\)\s*`)
+
 func identityOf(a protocol.Activity) string {
-	title := strings.TrimSpace(a.WindowTitle)
-	title = strings.TrimLeft(title, "•*● ")
-	title = strings.Join(strings.Fields(title), " ")
+	title := normaliseTitle(a.WindowTitle)
 	return strings.Join([]string{
 		a.ApplicationID,
 		a.ApplicationName,
 		a.BrowserProfile,
 		title,
 	}, "|")
+}
+
+// normaliseTitle removes the parts of a window title that change without the
+// user doing anything: notification counters and unsaved-change markers.
+//
+// Applied repeatedly, because a title can carry more than one badge.
+func normaliseTitle(raw string) string {
+	title := strings.TrimSpace(raw)
+	for {
+		stripped := unreadBadge.ReplaceAllString(title, "")
+		stripped = strings.TrimLeft(stripped, "•*● ")
+		if stripped == title {
+			break
+		}
+		title = stripped
+	}
+	return strings.Join(strings.Fields(title), " ")
 }

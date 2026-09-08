@@ -29,6 +29,17 @@ export type MonitoringInterval = 30 | 60;
 
 export const MONITORING_INTERVALS: MonitoringInterval[] = [30, 60];
 
+/**
+ * The interval every session uses.
+ *
+ * Fixed rather than chosen. A screenshot cadence is a policy of the monitoring
+ * programme, not a per-run preference — letting the monitored person pick 60s
+ * over 30s let them halve their own coverage, and the report gives no hint that
+ * they did. 30s stays the type's narrower value so the backend contract, which
+ * validates against {@link MONITORING_INTERVALS}, is unchanged.
+ */
+export const MONITORING_INTERVAL_SECONDS: MonitoringInterval = 30;
+
 export interface MonitoringSessionResource {
   id: string;
   startedAt: string;
@@ -289,12 +300,41 @@ export interface NativeCapabilities {
    */
   exactBrowserUrl: false;
   idleDetection: boolean;
+  /**
+   * Whether the agent can read the ENTIRE physical screen.
+   *
+   * Monitoring will not start without it. There is no narrower fallback by
+   * design — the fallback used to be the browser's share picker, which offers
+   * Tab and Window beside Entire screen and cannot be restricted, so a session
+   * could be aimed at one tab and produce a report that looked complete.
+   */
+  screenCapture: boolean;
 }
 
 /** OS grants the agent needs, as observed now. Absent means "not required here". */
 export interface NativePermissions {
   accessibility?: boolean;
+  /** macOS Screen Recording. Absent where whole-screen capture needs no grant. */
+  screenRecording?: boolean;
   x11Tools?: boolean;
+}
+
+/** One decoded capture of the entire screen, as delivered by the agent. */
+export interface NativeScreenFrame {
+  mimeType: string;
+  bytes: Uint8Array;
+  width: number;
+  height: number;
+  /** When the pixels were read. Never the upload time. */
+  capturedAt: string;
+  /**
+   * How many displays the machine has.
+   *
+   * Carried because a single-display capture on a multi-display machine is a
+   * partial record, and a report should be able to say so rather than imply it
+   * saw everything.
+   */
+  displayCount: number;
 }
 
 export interface NativeAgentState {
