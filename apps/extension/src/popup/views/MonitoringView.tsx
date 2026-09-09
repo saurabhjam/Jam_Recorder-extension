@@ -276,11 +276,20 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
           <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
             <p className="flex items-start gap-2 text-xs font-semibold text-amber-200">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-              Screen capture disconnected
+              {state.capture.status === 'failed'
+                ? 'Screenshots cannot be captured'
+                : 'Screen capture disconnected'}
             </p>
+            {/*
+              The actual reason, not a generic sentence. "Screen capture
+              disconnected" is the same words whether the agent is missing, the
+              Screen Recording grant was never given, or the OS cannot do it at
+              all — and those need three different actions from the person
+              reading this.
+            */}
             <p className="text-[11px] leading-4 text-amber-100/80">
-              No new screenshots are being captured. Everything already captured is safe, and
-              activity is still being recorded.
+              {state.capture.error ??
+                'No new screenshots are being captured. Everything already captured is safe, and activity is still being recorded.'}
             </p>
             <Button
               variant="secondary"

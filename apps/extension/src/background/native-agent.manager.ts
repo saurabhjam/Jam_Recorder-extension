@@ -40,6 +40,11 @@ interface Handlers {
   onStateChange: (state: NativeAgentState) => void;
   /** One capture of the entire screen, ready to queue for upload. */
   onScreenFrame: (frame: NativeScreenFrame) => void;
+  /**
+   * Capture failed. `permanent` distinguishes "someone must act" (a missing
+   * grant, an OS that cannot do it) from "try again next interval".
+   */
+  onCaptureError: (reason: string, permanent: boolean) => void;
 }
 
 let port: chrome.runtime.Port | null = null;
@@ -88,9 +93,18 @@ export function nativeOwnsIdleDetection(): boolean {
 /** Resolvers waiting on a FLUSHED acknowledgement. */
 const pendingFlushes = new Set<() => void>();
 
+/** Resolvers waiting for the handshake to settle either way. */
+const pendingReadiness = new Set<() => void>();
+
 function setState(patch: Partial<NativeAgentState>): void {
   state = { ...state, ...patch };
   handlers?.onStateChange(state);
+  // Anything waiting on the handshake settles here — on READY, and equally on
+  // 'not-installed', so a machine without the agent fails fast instead of
+  // sitting out the whole timeout.
+  if (pendingReadiness.size > 0) {
+    [...pendingReadiness].forEach((notify) => notify());
+  }
 }
 
 // ─── Message validation ───────────────────────────────────────────────────────
@@ -427,6 +441,33 @@ function handleMessage(raw: unknown): void {
     case 'ERROR': {
       const code = asString(msg.code, 64);
       const message = asString(msg.message, 300);
+      // Capture failures are routed to capture health, NOT to the agent's own
+      // status. A missing Screen Recording grant stops screenshots and nothing
+      // else — foreground application, window titles and idle detection all
+      // keep working — so marking the whole agent degraded would misdescribe
+      // it and hide the one thing that actually needs fixing.
+      switch (code) {
+        case 'SCREEN_PERMISSION_REQUIRED':
+          handlers?.onCaptureError(
+            message ?? 'Screen Recording permission is required to capture screenshots.',
+            true,
+          );
+          return;
+        case 'SCREEN_CAPTURE_UNSUPPORTED':
+          handlers?.onCaptureError(
+            message ?? 'Whole-screen capture is not available on this operating system.',
+            true,
+          );
+          return;
+        case 'SCREEN_CAPTURE_FAILED':
+          // Transient by assumption: the next interval may well succeed, and
+          // the session keeps its time, activity and inactivity meanwhile.
+          handlers?.onCaptureError(message ?? 'The screen could not be captured.', false);
+          return;
+        default:
+          break;
+      }
+
       if (code === 'PERMISSION_REQUIRED') {
         setState({ status: 'permission-required', error: message ?? 'A permission is required.' });
       } else if (code === 'UNSUPPORTED_PLATFORM') {
@@ -531,6 +572,35 @@ export function startNativeMonitoring(
     // while the browser is in the background — which, for a tool that watches
     // what someone does in *other* applications, is most of the time.
     screenshotIntervalSeconds: screenshotIntervalSeconds || undefined,
+  });
+}
+
+/**
+ * Resolve once the agent has answered its handshake, or on timeout.
+ *
+ * Needed because capture depends on the agent's reported capabilities, and
+ * those only exist after READY arrives. Reading them before the port is open
+ * reports a perfectly healthy agent as absent.
+ *
+ * Resolves rather than rejects on timeout: a missing agent is a capture
+ * failure with a specific message, not an exception that should abort a start
+ * whose time, activity and inactivity tracking are all still fine.
+ */
+export function waitForNativeAgent(timeoutMs = 6000): Promise<boolean> {
+  if (isNativeAgentTracking() && state.capabilities) return Promise.resolve(true);
+  if (state.status === 'not-installed' || state.status === 'unsupported-platform') {
+    return Promise.resolve(false);
+  }
+
+  return new Promise<boolean>((resolve) => {
+    const settle = (ready: boolean): void => {
+      clearTimeout(timer);
+      pendingReadiness.delete(notify);
+      resolve(ready);
+    };
+    const notify = (): void => settle(isNativeAgentTracking() && Boolean(state.capabilities));
+    const timer = setTimeout(() => settle(false), timeoutMs);
+    pendingReadiness.add(notify);
   });
 }
 

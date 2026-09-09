@@ -41,6 +41,24 @@ static int bestq_screen_capture_allowed(void) {
     return CGPreflightScreenCaptureAccess() ? 1 : 0;
 }
 
+// Ask macOS for the Screen Recording grant, once.
+//
+// Preflighting alone is not enough, and this was a real dead end:
+// CGPreflightScreenCaptureAccess only *checks*, so an agent that never
+// requested does not appear in System Settings > Privacy & Security > Screen
+// Recording at all. The list showed Chrome, Slack, VS Code and the rest, with
+// no bestq-monitoring-agent row — so there was nothing to switch on, and
+// capture could never start however many times the user looked.
+//
+// CGRequestScreenCaptureAccess registers the executable with TCC and raises the
+// system prompt, which is what creates that row. It reports the answer for the
+// current process; the grant takes effect for a *new* process, which is why the
+// agent still says "permission required" for this run and the extension asks
+// the user to restart the browser afterwards.
+static int bestq_screen_capture_request(void) {
+    return CGRequestScreenCaptureAccess() ? 1 : 0;
+}
+
 static int bestq_display_count(void) {
     uint32_t count = 0;
     if (CGGetActiveDisplayList(0, NULL, &count) != kCGErrorSuccess) return 0;
@@ -153,11 +171,24 @@ import "C"
 
 import (
 	"errors"
+	"sync"
 	"unsafe"
 )
 
 func screenCaptureAllowed() bool {
 	return C.bestq_screen_capture_allowed() == 1
+}
+
+// requestScreenCapture guards the prompt so it appears once per agent process.
+//
+// Repeating it every capture interval would put a system dialog on screen every
+// thirty seconds, which is not a machine anybody can use.
+var requestScreenCapture sync.Once
+
+func requestScreenCaptureAccess() {
+	requestScreenCapture.Do(func() {
+		C.bestq_screen_capture_request()
+	})
 }
 
 func displayCount() int {
@@ -173,6 +204,10 @@ func captureScreenJPEG(maxEdge int, quality float64) ([]byte, int, int, error) {
 	}
 	switch {
 	case result == -1:
+		// Registers the executable with TCC so it appears in System Settings
+		// and the user has a row to switch on. Without this the agent is
+		// invisible there and the permission can never be granted at all.
+		requestScreenCaptureAccess()
 		return nil, 0, 0, ErrScreenPermission
 	case result != 1 || frame.data == nil || frame.len <= 0:
 		return nil, 0, 0, errors.New("the display could not be read")

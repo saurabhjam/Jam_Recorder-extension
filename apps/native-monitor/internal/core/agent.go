@@ -398,7 +398,7 @@ func (a *Agent) loop(stop <-chan struct{}, done chan<- struct{}) {
 //
 // Same path as the ticker, so an on-demand frame and a scheduled one cannot
 // differ in what they capture or how they fail.
-func (a *Agent) CaptureScreenNow() { a.captureOnce() }
+func (a *Agent) CaptureScreenNow() { a.capture(false) }
 
 // captureOnce grabs the whole screen and pushes it to the extension.
 //
@@ -410,9 +410,19 @@ func (a *Agent) CaptureScreenNow() { a.captureOnce() }
 // A failure is reported, never substituted. If the screen cannot be read the
 // extension is told so and stops the session — it must not fall back to
 // capturing something narrower.
-func (a *Agent) captureOnce() {
+func (a *Agent) captureOnce() { a.capture(true) }
+
+// capture takes one frame. `requireSession` is false for an explicit
+// CAPTURE_SCREEN request.
+//
+// The distinction matters: the ticker must not fire outside a session, but an
+// explicit request is how the extension proves capture works *before*
+// committing to one — and how the user gets the macOS permission prompt at all.
+// Requiring a session for both made that probe a silent no-op, which looked
+// exactly like a working agent that captures nothing.
+func (a *Agent) capture(requireSession bool) {
 	a.mu.Lock()
-	if a.state != StateMonitoring {
+	if requireSession && a.state != StateMonitoring {
 		a.mu.Unlock()
 		return
 	}
@@ -438,12 +448,13 @@ func (a *Agent) captureOnce() {
 	if err != nil {
 		switch {
 		case errors.Is(err, platform.ErrScreenPermission):
-			a.send(protocol.Errorf(protocol.ErrPermissionRequired,
-				"Screen Recording permission is required to capture the screen."))
+			a.send(protocol.Errorf(protocol.ErrScreenPermission,
+				"Screen Recording permission is required. Grant it to the BestQ agent in "+
+					"System Settings > Privacy & Security > Screen Recording, then restart your browser."))
 			Logf("WARN", "screen_capture_denied")
 		case errors.Is(err, platform.ErrScreenUnsupported):
-			a.send(protocol.Errorf(protocol.ErrUnsupportedPlatform,
-				"Whole-screen capture is not available on this platform."))
+			a.send(protocol.Errorf(protocol.ErrScreenUnsupported,
+				"Whole-screen capture is not available on this operating system."))
 			Logf("WARN", "screen_capture_unsupported")
 		default:
 			a.send(protocol.Errorf(protocol.ErrCaptureFailed, "The screen could not be captured."))

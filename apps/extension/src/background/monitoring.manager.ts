@@ -76,6 +76,7 @@ import {
   configureNativeAgent,
   connectNativeAgent,
   startNativeMonitoring,
+  waitForNativeAgent,
   stopNativeMonitoring,
   pauseNativeAgent,
   resumeNativeAgent,
@@ -298,6 +299,15 @@ export function configureMonitoringOffscreen(bridge: {
       })();
     },
 
+    onCaptureError: (reason, permanent) => {
+      void (async () => {
+        await hydrate();
+        if (state.status !== 'monitoring') return;
+        await persist({ capture: noteFrameFailed(reason, permanent) });
+        setMonitoringBadge();
+      })();
+    },
+
     onStateChange: (native: NativeAgentState) => {
       void (async () => {
         await hydrate();
@@ -407,23 +417,23 @@ async function runStart(options: {
     }
   }
 
-  // ── 2. Capture, activity, heartbeat ──────────────────────────────────────
-  await beginCapture();
-
-  // A session that cannot see the screen is not monitoring. If the user
-  // cancelled the picker, end it now rather than leaving a live session
-  // recording nothing but activity the user never agreed to.
-  if (getCaptureHealth().status === 'idle' && state.capture.error) {
-    await persist({ error: state.capture.error });
-    return runStop();
-  }
-
-  // The agent is optional. A missing host degrades to browser-only activity,
-  // which is still a useful session, so it must not block the start.
+  // ── 2. Agent, capture, activity, heartbeat ───────────────────────────────
+  //
+  // The agent goes FIRST, and capture waits for it. Capture is the agent's job
+  // now, so starting capture before the port is open reported "the agent is
+  // not running" on a machine where it was running perfectly — the popup said
+  // that while showing "Activity agent: Connected" two lines below, because
+  // the agent connected a moment later.
   //
   // Bound to the session id so intervals it reports can be attributed, and so
   // an agent restart can re-bind itself without the extension intervening.
   startNativeMonitoring(state.sessionId!, state.inactivityThresholdSeconds, state.intervalSeconds);
+
+  // Bounded: a missing agent must fail the capture cleanly rather than hold
+  // the start open. Activity, time and inactivity are unaffected either way.
+  await waitForNativeAgent(6000);
+
+  await beginCapture();
 
   await initializeCurrentActivity({ nativeTracking: isNativeAgentTracking() });
   startIdleDetection();

@@ -45,11 +45,18 @@ const (
 const (
 	ErrPermissionRequired  = "PERMISSION_REQUIRED"
 	ErrUnsupportedPlatform = "UNSUPPORTED_PLATFORM"
-	// ErrCaptureFailed is a screen read that failed for a reason the user
-	// cannot fix by granting something — a wedged window server, an encode
-	// failure. Kept distinct from a permission error because the two need
-	// different words in front of the person using the extension.
-	ErrCaptureFailed = "SCREEN_CAPTURE_FAILED"
+	// The three ways whole-screen capture can fail.
+	//
+	// Deliberately separate from PERMISSION_REQUIRED and UNSUPPORTED_PLATFORM,
+	// which the agent already uses for Accessibility and for the platform as a
+	// whole. Reusing those would make a missing Screen Recording grant look
+	// like a broken agent: window titles, foreground application and idle
+	// detection all keep working without it, and only screenshots stop. The
+	// extension routes these to capture health and leaves the agent's own
+	// status alone.
+	ErrScreenPermission  = "SCREEN_PERMISSION_REQUIRED"
+	ErrScreenUnsupported = "SCREEN_CAPTURE_UNSUPPORTED"
+	ErrCaptureFailed     = "SCREEN_CAPTURE_FAILED"
 	ErrProtocolMismatch    = "PROTOCOL_VERSION_MISMATCH"
 	ErrInvalidMessage      = "INVALID_MESSAGE"
 	ErrNoSession           = "NO_ACTIVE_SESSION"
