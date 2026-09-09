@@ -35,12 +35,20 @@ const (
 	SampleInterval = 2 * time.Second
 	// ScreenshotMaxEdge is the longest edge of a stored capture.
 	//
-	// 1280 keeps window titles, tab strips and ordinary application UI
-	// legible, which is the entire purpose of the image, while a 4K frame at
-	// full resolution would be several megabytes per capture.
-	ScreenshotMaxEdge = 1280
+	// 1600 rather than 1280: at 1280 a 4K desktop is reduced by a third in each
+	// direction and small text stops being readable, which defeats the purpose
+	// of the image. The larger frame costs bytes, which the budget below now
+	// allows for.
+	ScreenshotMaxEdge = 1600
 	// ScreenshotTargetBytes is the per-frame byte budget the encoder aims at.
-	ScreenshotTargetBytes = 30 * 1024
+	//
+	// Raised from 30 KB. That budget did hold, but it bought the size by
+	// pushing quality to its floor and then shrinking the image, and the
+	// screenshots came back too soft to read — which makes them worthless as a
+	// record of what someone was doing. 120 KB keeps text legible at 1600px on
+	// an ordinary desktop; at a 30-second interval that is roughly 14 MB per
+	// hour per person, which is the real cost of a readable screenshot.
+	ScreenshotTargetBytes = 120 * 1024
 
 	// HeartbeatInterval — the extension treats silence past ~3x this as a dead
 	// agent, so 20s gives it room to notice without chattering.

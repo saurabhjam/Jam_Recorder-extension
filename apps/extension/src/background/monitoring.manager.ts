@@ -217,6 +217,22 @@ export function configureMonitoringOffscreen(bridge: {
         // application time; sessions that happened to contain a focus change
         // kept their earlier intervals and lost only the last one.
         if (state.status !== 'monitoring' && state.status !== 'stopping') return;
+
+        // The browser stopped being the frontmost application, so this
+        // extension's page tracking must stop with it.
+        //
+        // It follows the active tab, and an active tab stays active while the
+        // browser sits behind Slack or an editor. One report showed 8m43s on a
+        // single page during a session where the browser was frontmost for
+        // 3m36s — page time cannot exceed browser time, and did.
+        //
+        // Only on a real application switch: closing on every browser interval
+        // would discard page time at each tab-title change instead, since
+        // nothing reopens the interval until the next tab or focus event.
+        if (interval.focusLeftApplication && interval.browserName) {
+          await closeOpenActivity(new Date(interval.endedAt));
+        }
+
         await recordNativeInterval(interval);
         await persist({
           lastActivityAt: interval.endedAt,

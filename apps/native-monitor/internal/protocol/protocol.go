@@ -151,6 +151,17 @@ type Activity struct {
 	// (password managers), so the extension can say why rather than showing a
 	// blank the user reads as a bug.
 	TitleSuppressed bool `json:"titleSuppressed,omitempty"`
+	// FocusLeftApplication marks an interval that ended because the user moved
+	// to a DIFFERENT application, as opposed to one that ended because the
+	// window title changed within the same application.
+	//
+	// The extension needs the distinction to bound its own page tracking. It
+	// tracks the active tab, which keeps accruing time while the browser sits
+	// behind another application — a report showed 8m43s on one page during a
+	// session where the browser was frontmost for 3m36s. Closing that page
+	// interval whenever a browser interval ended would instead lose time on
+	// every tab-title change, so only a real application switch counts.
+	FocusLeftApplication bool `json:"focusLeftApplication,omitempty"`
 	// ClientActivityID is the idempotency key the backend dedupes on, minted
 	// here so a resend after a reconnect cannot create a second row.
 	ClientActivityID string `json:"clientActivityId"`

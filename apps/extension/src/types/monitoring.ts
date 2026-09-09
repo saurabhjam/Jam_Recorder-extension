@@ -378,6 +378,15 @@ export interface NativeActivity {
   durationSeconds: number;
   /** True for applications whose titles are dropped wholesale (password managers). */
   titleSuppressed?: boolean;
+  /**
+   * The interval ended because the user moved to a different application,
+   * rather than because the window title changed within the same one.
+   *
+   * Used to bound this extension's own page tracking: it follows the active
+   * tab, which otherwise keeps accruing time while the browser sits behind
+   * another window.
+   */
+  focusLeftApplication?: boolean;
   /** Idempotency key the backend dedupes on. */
   clientActivityId: string;
   sessionId?: string;

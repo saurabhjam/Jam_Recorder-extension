@@ -194,6 +194,9 @@ func runProbe(monitor platform.Monitor) {
 	fmt.Printf("  browserProfile         %v\n", caps.BrowserProfile)
 	fmt.Printf("  exactBrowserUrl        %v  (never available — a title is not a URL)\n", caps.ExactBrowserURL)
 	fmt.Printf("  idleDetection          %v\n", caps.IdleDetection)
+	// Printed because this is the capability an installer's output is checked
+	// against — its absence here is why an install that had it looked broken.
+	fmt.Printf("  screenCapture          %v\n", caps.ScreenCapture)
 	if perms.Accessibility != nil {
 		fmt.Printf("permissions:\n  accessibility          %v\n", *perms.Accessibility)
 	}

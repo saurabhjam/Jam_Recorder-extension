@@ -29,12 +29,14 @@ type Frame struct {
 
 // Quality bounds and pass count for the byte-budget search.
 //
-// The floor keeps a dense screen legible-but-soft rather than chasing it down
-// to something worthless. Four passes narrow the range to a few percent, which
+// The floor is 0.45, not 0.30. Below roughly 0.4 a JPEG of a screenshot puts
+// visible ringing around every text stroke, and a screenshot nobody can read is
+// not a record of anything. With the larger byte budget the floor is rarely
+// reached at all. Four passes narrow the range to a few percent, which
 // is finer than the size difference it produces — and each pass re-encodes, so
 // this is the CPU budget too.
 const (
-	screenMinQuality = 0.30
+	screenMinQuality = 0.45
 	screenMaxQuality = 0.85
 	screenPasses     = 4
 )

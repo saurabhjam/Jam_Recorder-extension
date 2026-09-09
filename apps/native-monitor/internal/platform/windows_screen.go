@@ -42,6 +42,36 @@ var (
 	procBitBlt             = gdi32.NewProc("BitBlt")
 )
 
+// DPI awareness contexts. -4 is PER_MONITOR_AWARE_V2.
+const dpiAwarenessPerMonitorV2 = ^uintptr(3) // -4 as an unsigned word
+
+// init makes this process DPI-aware before anything reads a screen metric.
+//
+// Without it Windows lies to the process about the size of the screen. A
+// non-aware process on a display scaled to 125% is told the virtual screen is
+// 1536x864 when it is physically 1920x1080 — but BitBlt copies *physical*
+// pixels. The result is a screenshot of the top-left ~64% of the desktop, which
+// is exactly the "half screenshot" this produced: not a cropping bug in the
+// scaler, a process being given logical coordinates and using them as physical
+// ones.
+//
+// Must run before any GetSystemMetrics call, hence init() rather than a lazy
+// call inside the capture path.
+func init() {
+	// Windows 10 1703+. Per-monitor v2 is what handles a laptop panel and an
+	// external monitor at different scale factors, which is the common case.
+	if proc := user32.NewProc("SetProcessDpiAwarenessContext"); proc.Find() == nil {
+		if ret, _, _ := proc.Call(dpiAwarenessPerMonitorV2); ret != 0 {
+			return
+		}
+	}
+	// Older Windows: system-wide awareness. Less correct across mixed-DPI
+	// monitors, but still physical pixels rather than virtualised ones.
+	if proc := user32.NewProc("SetProcessDPIAware"); proc.Find() == nil {
+		proc.Call()
+	}
+}
+
 func getSystemMetrics(index int) int {
 	value, _, _ := procGetSystemMetrics.Call(uintptr(index))
 	return int(int32(value))
@@ -162,11 +192,15 @@ func captureVirtualScreen(maxEdge int) (*image.RGBA, int, error) {
 	return scaleRGBA(full, maxEdge), displayCountWindows(), nil
 }
 
-// scaleRGBA does a nearest-neighbour reduction.
+// scaleRGBA reduces the image by averaging each destination pixel over the
+// source block it covers.
 //
-// Nearest-neighbour rather than a filtered resample: it is a few lines instead
-// of a dependency, and for a screenshot being shrunk to fit a byte budget the
-// difference is not what limits legibility — the JPEG quality is.
+// Box averaging rather than nearest-neighbour, which is what this used to do.
+// Nearest-neighbour picks one source pixel and discards the rest, so on a
+// screenshot — where the content that matters is one-pixel-wide text strokes —
+// it drops whole strokes and leaves the remainder aliased. Averaging keeps a
+// grey where a stroke was, which both reads better and compresses better,
+// because JPEG spends its bits on the sharp noise nearest-neighbour creates.
 func scaleRGBA(src *image.RGBA, maxEdge int) *image.RGBA {
 	w, h := src.Rect.Dx(), src.Rect.Dy()
 	longest := w
@@ -187,16 +221,35 @@ func scaleRGBA(src *image.RGBA, maxEdge int) *image.RGBA {
 
 	dst := image.NewRGBA(image.Rect(0, 0, tw, th))
 	for y := 0; y < th; y++ {
-		sy := int(float64(y) / scale)
-		if sy >= h {
-			sy = h - 1
+		y0 := y * h / th
+		y1 := (y + 1) * h / th
+		if y1 <= y0 {
+			y1 = y0 + 1
 		}
 		for x := 0; x < tw; x++ {
-			sx := int(float64(x) / scale)
-			if sx >= w {
-				sx = w - 1
+			x0 := x * w / tw
+			x1 := (x + 1) * w / tw
+			if x1 <= x0 {
+				x1 = x0 + 1
 			}
-			copy(dst.Pix[(y*tw+x)*4:(y*tw+x)*4+4], src.Pix[(sy*w+sx)*4:(sy*w+sx)*4+4])
+
+			var r, g, b, n uint32
+			for sy := y0; sy < y1; sy++ {
+				row := sy * w * 4
+				for sx := x0; sx < x1; sx++ {
+					i := row + sx*4
+					r += uint32(src.Pix[i])
+					g += uint32(src.Pix[i+1])
+					b += uint32(src.Pix[i+2])
+					n++
+				}
+			}
+
+			o := (y*tw + x) * 4
+			dst.Pix[o] = byte(r / n)
+			dst.Pix[o+1] = byte(g / n)
+			dst.Pix[o+2] = byte(b / n)
+			dst.Pix[o+3] = 0xFF
 		}
 	}
 	return dst

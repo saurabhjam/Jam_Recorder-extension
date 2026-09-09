@@ -121,7 +121,12 @@ func (e *ActivityEngine) Sample(win *platform.Window, at time.Time) {
 		return
 	}
 
-	e.closeLocked(at)
+	// Whether the *application* changed, or only the window title within it.
+	// The extension uses this to decide if its own page tracking should stop.
+	appChanged := e.current == nil ||
+		e.current.ApplicationID != next.ApplicationID ||
+		e.current.ApplicationName != next.ApplicationName
+	e.closeLockedWithReason(at, appChanged)
 	e.current = &next
 	e.identity = identity
 	e.startedAt = at
@@ -140,7 +145,14 @@ func (e *ActivityEngine) Current() *protocol.Activity {
 }
 
 // closeLocked emits the open interval. Caller holds the mutex.
+//
+// Used by Flush, Pause and Stop, where the interval ends because monitoring
+// ended rather than because focus moved — so it is not a focus change.
 func (e *ActivityEngine) closeLocked(at time.Time) {
+	e.closeLockedWithReason(at, false)
+}
+
+func (e *ActivityEngine) closeLockedWithReason(at time.Time, focusLeftApplication bool) {
 	if e.current == nil {
 		return
 	}
@@ -160,6 +172,7 @@ func (e *ActivityEngine) closeLocked(at time.Time) {
 	activity.StartedAt = startedAt.UTC().Format(time.RFC3339Nano)
 	activity.EndedAt = at.UTC().Format(time.RFC3339Nano)
 	activity.DurationSecs = int(duration.Round(time.Second) / time.Second)
+	activity.FocusLeftApplication = focusLeftApplication
 	// Deterministic per session+sequence, which is what makes a resend safe.
 	activity.ClientActivityID = fmt.Sprintf("native-%s-%d", e.sessionID, e.sequence)
 

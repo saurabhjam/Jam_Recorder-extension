@@ -172,6 +172,7 @@ function validateActivity(raw: unknown): NativeActivity | null {
     endedAt,
     durationSeconds: Math.round(durationSeconds),
     titleSuppressed: a.titleSuppressed === true,
+    focusLeftApplication: a.focusLeftApplication === true,
     clientActivityId,
     sessionId: asString(a.sessionId, 64),
   };

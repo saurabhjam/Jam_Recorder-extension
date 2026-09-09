@@ -12,7 +12,7 @@ func fakeEncoder(bytesAtFullQuality int) (encodeOnce, *int) {
 	calls := 0
 	return func(edge int, quality float64) ([]byte, int, int, error) {
 		calls++
-		area := float64(edge) / 1280.0
+		area := float64(edge) / 1600.0
 		size := int(float64(bytesAtFullQuality) * quality * area * area)
 		if size < 1 {
 			size = 1
@@ -22,15 +22,15 @@ func fakeEncoder(bytesAtFullQuality int) (encodeOnce, *int) {
 }
 
 func TestQualityAloneMeetsTheBudget(t *testing.T) {
-	encode, calls := fakeEncoder(90 * 1024)
-	frame, err := captureWithinBudget(encode, 1280, 30*1024)
+	encode, calls := fakeEncoder(200 * 1024)
+	frame, err := captureWithinBudget(encode, 1600, 120*1024)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(frame.Data) > 30*1024 {
+	if len(frame.Data) > 120*1024 {
 		t.Errorf("frame is over budget: %d bytes", len(frame.Data))
 	}
-	if frame.Width != 1280 {
+	if frame.Width != 1600 {
 		t.Errorf("should not have downscaled, got width %d", frame.Width)
 	}
 	if *calls > screenPasses+1 {
@@ -39,18 +39,18 @@ func TestQualityAloneMeetsTheBudget(t *testing.T) {
 }
 
 func TestDenseScreenFallsBackToFewerPixels(t *testing.T) {
-	// 300 KB at full quality: no quality setting reaches 30 KB at full size,
+	// 600 KB at full quality: no quality setting reaches the budget at full
 	// so the search has to drop resolution. Without that step the frame would
 	// come back over budget on every busy screen.
-	encode, _ := fakeEncoder(300 * 1024)
-	frame, err := captureWithinBudget(encode, 1280, 30*1024)
+	encode, _ := fakeEncoder(600 * 1024)
+	frame, err := captureWithinBudget(encode, 1600, 120*1024)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(frame.Data) > 30*1024 {
+	if len(frame.Data) > 120*1024 {
 		t.Errorf("frame is over budget: %d bytes", len(frame.Data))
 	}
-	if frame.Width >= 1280 {
+	if frame.Width >= 1600 {
 		t.Errorf("expected a downscale, still %dpx wide", frame.Width)
 	}
 }
@@ -61,7 +61,7 @@ func TestAnUnfittableScreenStillYieldsAFrame(t *testing.T) {
 	encode := encodeOnce(func(edge int, quality float64) ([]byte, int, int, error) {
 		return make([]byte, 5*1024*1024), edge, edge, nil
 	})
-	frame, err := captureWithinBudget(encode, 1280, 30*1024)
+	frame, err := captureWithinBudget(encode, 1600, 120*1024)
 	if err != nil {
 		t.Fatalf("expected a frame, got error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestPermissionErrorsStopImmediately(t *testing.T) {
 		calls++
 		return nil, 0, 0, ErrScreenPermission
 	})
-	_, err := captureWithinBudget(encode, 1280, 30*1024)
+	_, err := captureWithinBudget(encode, 1600, 120*1024)
 	if !errors.Is(err, ErrScreenPermission) {
 		t.Fatalf("expected the permission error to surface, got %v", err)
 	}
@@ -89,7 +89,7 @@ func TestPermissionErrorsStopImmediately(t *testing.T) {
 
 func TestABadBudgetIsRejected(t *testing.T) {
 	encode, _ := fakeEncoder(50 * 1024)
-	if _, err := captureWithinBudget(encode, 1280, 0); err == nil {
+	if _, err := captureWithinBudget(encode, 1600, 0); err == nil {
 		t.Error("a zero budget must be rejected rather than looping")
 	}
 }

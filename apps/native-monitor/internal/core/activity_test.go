@@ -261,3 +261,53 @@ func TestARealChannelChangeIsStillANewInterval(t *testing.T) {
 		t.Errorf("first interval should be #general, got %q", (*emitted)[0].WindowTitle)
 	}
 }
+
+func TestFocusChangeIsMarkedOnlyWhenTheApplicationChanges(t *testing.T) {
+	// The extension bounds its own page tracking on this flag. Marking a
+	// title change as a focus change would make it discard browser time on
+	// every tab switch; not marking a real app switch lets page time run on
+	// while the browser sits behind another window.
+	engine, emitted := newTestEngine()
+
+	chrome := func(title string) *platform.Window {
+		return &platform.Window{
+			ApplicationName: "Google Chrome",
+			ApplicationID:   "com.google.Chrome",
+			Title:           title,
+		}
+	}
+
+	engine.Sample(chrome("Board - Jira"), at(10, 0, 0))
+	engine.Sample(chrome("Issue 12 - Jira"), at(10, 5, 0)) // same app, new page
+	engine.Sample(&platform.Window{
+		ApplicationName: "Slack",
+		ApplicationID:   "com.tinyspeck.slackmacgap",
+		Title:           "general",
+	}, at(10, 9, 0)) // different app
+
+	if len(*emitted) != 2 {
+		t.Fatalf("expected two closed intervals, got %d", len(*emitted))
+	}
+	if (*emitted)[0].FocusLeftApplication {
+		t.Error("a page change inside the browser is not a focus change")
+	}
+	if !(*emitted)[1].FocusLeftApplication {
+		t.Error("switching to another application is a focus change")
+	}
+}
+
+func TestStopIsNotAFocusChange(t *testing.T) {
+	// Monitoring ending is not the user moving away, and treating it as one
+	// would close the extension's page interval a second time at the same
+	// instant the stop path already closes it.
+	engine, emitted := newTestEngine()
+	engine.Sample(&platform.Window{ApplicationName: "Google Chrome", ApplicationID: "c", Title: "x"}, at(10, 0, 0))
+	engine.Stop(at(10, 5, 0))
+
+	if len(*emitted) != 1 {
+		t.Fatalf("expected one interval, got %d", len(*emitted))
+	}
+	if (*emitted)[0].FocusLeftApplication {
+		t.Error("stop must not be reported as a focus change")
+	}
+}
