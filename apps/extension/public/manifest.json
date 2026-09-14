@@ -6,6 +6,7 @@
   "description": "Record your screen, capture bugs, and share instantly with BestQ",
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "tabs",
     "scripting",
     "tabCapture",

@@ -17,10 +17,22 @@ import type {
   DailyMonitoringReportResource,
   MonitoringActivityPayload,
   MonitoringInterval,
+  MonitoringPauseInterval,
   SnapshotUploadResponse,
   StartMonitoringResponse,
 } from '@/types/monitoring';
 import { API_BASE_URL } from '@/config';
+
+/**
+ * Every request is bounded.
+ *
+ * A server that accepts the connection and never answers is the most common
+ * shape of "down" — an overloaded API, a database it is waiting on — and an
+ * unbounded request holds the whole outbox behind it for as long as the browser
+ * cares to wait. A timeout surfaces as a network failure, which sync treats as
+ * an outage: the data stays, and the server is probed again later.
+ */
+const REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * An API failure that preserves the backend's stable monitoring error code.
@@ -93,6 +105,7 @@ async function request<T>(project: string, path: string, init: RequestInit = {})
   try {
     response = await fetch(`${API_BASE_URL}/v1/${project}/monitoring${path}`, {
       ...init,
+      signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       headers: {
         Accept: 'application/json',
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
@@ -183,15 +196,22 @@ export function resumeMonitoring(project: string, sessionId: string, at: string)
   });
 }
 
-/** Stop and settle the day. Stopping an already-stopped session is a no-op. */
+/**
+ * Stop and settle the day. Stopping an already-stopped session is a no-op.
+ *
+ * Stopping a session the server EXPIRED re-settles it at `endedAt` instead: the
+ * client was running through time the server could not see, and `pauses` lets
+ * the server leave out the stretches of that time the user had paused.
+ */
 export function stopMonitoring(
   project: string,
   sessionId: string,
   endedAt: string,
+  pauses: MonitoringPauseInterval[] = [],
 ): Promise<DailyMonitoringReportResource> {
   return request<DailyMonitoringReportResource>(project, `/sessions/${sessionId}/stop`, {
     method: 'POST',
-    body: JSON.stringify({ endedAt }),
+    body: JSON.stringify({ endedAt, pauses }),
   });
 }
 
@@ -288,6 +308,7 @@ export async function uploadSnapshotBytes(
       method: 'PUT',
       headers: { 'Content-Type': mimeType },
       body: blob,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (err) {
     throw new MonitoringApiError(

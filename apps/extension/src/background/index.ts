@@ -36,6 +36,7 @@ import {
   loadMonitoringState,
   restoreMonitoringSession,
   handleMonitoringAlarm,
+  handleMonitoringSyncAlarm,
   handleMonitoringOffscreenMessage,
   noteActivePage,
   noteBrowserBlurred,
@@ -634,6 +635,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   // it will be many times over an eight-hour session.
   if (alarm.name === MONITORING_ALARMS.TICK) {
     void handleMonitoringAlarm();
+    return;
+  }
+  // Monitoring data saved during an outage, uploaded gradually. Armed only
+  // while the outbox holds something, and independent of TICK so it keeps
+  // draining after the session has stopped.
+  if (alarm.name === MONITORING_ALARMS.SYNC) {
+    void handleMonitoringSyncAlarm();
     return;
   }
   if (alarm.name !== URL_POLL_ALARM) return;

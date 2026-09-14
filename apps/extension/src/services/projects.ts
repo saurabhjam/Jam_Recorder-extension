@@ -119,7 +119,25 @@ export async function setSelectedProject(name: string): Promise<void> {
  */
 export async function resolveDefaultProject(options: ProjectOption[]): Promise<string | null> {
   if (options.length === 0) return null;
+
   const remembered = await getSelectedProject();
   if (remembered && options.some((option) => option.name === remembered)) return remembered;
-  return options[0].name;
+
+  // A team project in preference to a personal one.
+  //
+  // The list is sorted by name, so taking the first meant the default was
+  // whatever sorted earliest — frequently somebody's PERSONAL project, which
+  // is a private sandbox nobody else can see. Monitoring filed there is
+  // invisible to the team that asked for it, and nothing in the UI would say
+  // so. A personal project is still used when it is all the user has.
+  const preferred = options.find((option) => option.entryType === 'INTERNAL') ?? options[0];
+
+  // Persisted, not just returned. Otherwise the default exists only inside a
+  // popup that happens to be open: the service worker reads this key when
+  // monitoring is started by any other route — a keyboard shortcut, a resumed
+  // session after a worker restart — and would refuse with "Select a project
+  // before starting monitoring" on a machine where a default was plainly
+  // available.
+  await setSelectedProject(preferred.name);
+  return preferred.name;
 }

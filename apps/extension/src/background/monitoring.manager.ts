@@ -12,8 +12,16 @@
  * in-memory state is re-read from storage at the top of every entry point, and
  * everything periodic is driven by `chrome.alarms`, which Chrome guarantees
  * will wake a stopped worker. The one-minute alarm floor is why the alarm does
- * bookkeeping (heartbeat, activity flush, capture watchdog) while the offscreen
- * document — which is NOT torn down — drives the 30/60s capture cadence.
+ * bookkeeping (heartbeat, activity flush, capture watchdog) while the native
+ * agent — which is NOT torn down — drives the 30/60s capture cadence.
+ *
+ * ── Nothing is sent inline, and nothing waits for the server ─────────────────
+ * Every write — screenshots, activity, inactivity, pause, resume, stop — goes
+ * into the durable outbox first and is delivered by `monitoring.sync.ts`. A
+ * session behaves the same whether the server is up, down for a minute or down
+ * for a morning; only how soon the server hears about it changes. The only
+ * direct calls left are `start`, which has to return a session id, and the
+ * heartbeat, which is a liveness signal with nothing to replay.
  *
  * ── Session state and capture state are separate ─────────────────────────────
  * They fail independently. A session can be perfectly alive on the server while
@@ -36,32 +44,48 @@ import {
   MONITORING_STORAGE_KEYS,
   type CaptureHealth,
   type MonitoringInterval,
+  type MonitoringPauseInterval,
   type MonitoringState,
   type NativeAgentState,
   type NativeActivity,
   type NativeIdleEvent,
+  type StartMonitoringResponse,
 } from '@/types/monitoring';
 import {
   startMonitoring as apiStart,
-  stopMonitoring as apiStop,
-  pauseMonitoring as apiPause,
-  resumeMonitoring as apiResume,
   sendHeartbeat,
-  startInactivity,
-  endInactivity,
-  sendActivityBatch,
   getMonitoringProject,
   setMonitoringProject,
   MonitoringApiError,
 } from '@/services/monitoring.api';
-import { enqueueSnapshot, purgeSessionQueue, queueStats } from '@/utils/monitoringQueue';
 import {
-  configureUploader,
-  drainSnapshotQueue,
-  flushSnapshotQueue,
-  startUploader,
-  stopUploader,
-} from './monitoring.uploader';
+  enqueueActivity,
+  enqueueEvent,
+  enqueueSnapshot,
+  listPendingEvents,
+  retagSession,
+  unparkSession,
+  updateSyncSession,
+  type MonitoringEventKind,
+} from '@/utils/monitoringQueue';
+import {
+  currentRunStartMs,
+  extendLiveness,
+  settledEndMs,
+  type LivenessSegment,
+} from '@/utils/monitoringSyncPolicy';
+import { getAssignedProjects, resolveDefaultProject } from '@/services/projects';
+import {
+  configureSync,
+  drainSync,
+  flushSessionSync,
+  handleSyncAlarm,
+  noteServerReachable,
+  noteServerUnreachable,
+  startSyncSweep,
+  stopSyncSweep,
+  type SyncStatus,
+} from './monitoring.sync';
 import {
   startCapture,
   stopCapture,
@@ -91,10 +115,10 @@ import {
   initializeCurrentActivity,
   closeOpenActivity,
   recordNativeInterval,
-  flushActivityBuffer,
   clearActivityState,
   currentActivityLabel,
-  bufferedActivityCount,
+  configureActivitySink,
+  takeLegacyActivityBuffer,
 } from './monitoring.activity';
 
 let state: MonitoringState = { ...INITIAL_MONITORING_STATE };
@@ -104,11 +128,12 @@ let hydrated = false;
  * In-flight transitions.
  *
  * Returned to a second caller rather than beginning a rival lifecycle: two
- * concurrent starts would each open a screen picker and race to persist a
- * session id, and two concurrent stops would each try to settle the day.
+ * concurrent starts would each race to persist a session id, and two
+ * concurrent stops would each try to settle the day.
  */
 let startInFlight: Promise<MonitoringState> | null = null;
 let stopInFlight: Promise<MonitoringState> | null = null;
+let continuationInFlight: Promise<void> | null = null;
 
 // ─── State plumbing ───────────────────────────────────────────────────────────
 
@@ -155,9 +180,9 @@ export async function loadMonitoringState(): Promise<MonitoringState> {
  * Writes from the agent that are still in flight.
  *
  * The agent's messages arrive on a port callback, which cannot be awaited by
- * whoever is stopping the session. Without this, the stop could send the
- * buffered activity while the final interval was still being written to that
- * buffer, and then clear it.
+ * whoever is stopping the session. Without this, the stop could be queued while
+ * the final interval was still being written, and that interval would then be
+ * filed behind the stop that ends its session.
  */
 const pendingActivityWrites = new Set<Promise<void>>();
 
@@ -172,36 +197,59 @@ function trackActivityWrite(run: () => Promise<void>): void {
   pendingActivityWrites.add(write);
 }
 
-/** Wait for those writes, so a flush means "buffered", not "sent". */
+/** Wait for those writes, so a flush means "queued", not "about to be". */
 async function settleActivityWrites(): Promise<void> {
   while (pendingActivityWrites.size > 0) {
     await Promise.all([...pendingActivityWrites]);
   }
 }
 
-export function configureMonitoringOffscreen(bridge: {
+export function configureMonitoringOffscreen(_bridge: {
   ensureDocument: () => Promise<void>;
   send: (type: string, payload?: unknown) => Promise<unknown>;
 }): void {
-  configureUploader({
-    onStats: async (stats) => {
+  // Closed activity intervals go straight to the outbox, filed under whatever
+  // session is current at the moment they close.
+  configureActivitySink(async (activity) => {
+    await hydrate();
+    if (!state.sessionId || !state.project) {
+      console.warn('[Monitoring] an activity interval closed with no session to file it under');
+      return;
+    }
+    await enqueueActivity(state.sessionId, state.project, activity);
+  });
+
+  configureSync({
+    onStatus: async (sync: SyncStatus) => {
       await hydrate();
       await persist({
-        queuedSnapshots: stats.pending,
-        failedSnapshots: stats.failed,
-        uploadError: stats.lastError,
+        queuedSnapshots: sync.pendingSnapshots,
+        failedSnapshots: sync.deadSnapshots,
+        pendingSyncItems: sync.pendingActivities + sync.pendingEvents,
+        syncBacklogSince:
+          sync.oldestPendingAtMs == null ? null : new Date(sync.oldestPendingAtMs).toISOString(),
+        uploadError: sync.lastError,
+        offlineSince: sync.offlineSince,
       });
+      if (isMonitoringSessionLive()) setMonitoringBadge();
     },
-    onStored: async (capturedAt) => {
+    onSnapshotStored: async (_sessionId, capturedAt) => {
       await hydrate();
+      if (!isMonitoringSessionLive() && state.status !== 'stopping') return;
+      // A backlog frame from hours ago lands after newer ones; "last
+      // screenshot" must not move backwards when it does.
+      const newer =
+        !state.lastScreenshotAt || Date.parse(capturedAt) > Date.parse(state.lastScreenshotAt);
       await persist({
         screenshotCount: state.screenshotCount + 1,
-        lastScreenshotAt: capturedAt,
-        offlineSince: null,
+        lastScreenshotAt: newer ? capturedAt : state.lastScreenshotAt,
       });
     },
-    onSessionInactive: () => {
-      void stopMonitoringSession();
+    onSessionClosed: (sessionId) => {
+      void (async () => {
+        await hydrate();
+        if (sessionId === state.sessionId) await continueAfterRemoteClose();
+      })();
     },
   });
 
@@ -254,43 +302,22 @@ export function configureMonitoringOffscreen(bridge: {
 
         if (event.idle) {
           if (state.openInactivityStartedAt) return;
-          try {
-            await startInactivity(state.project, state.sessionId, event.startedAt);
-            await persist({ openInactivityStartedAt: event.startedAt });
-          } catch (err) {
-            if (
-              err instanceof MonitoringApiError &&
-              err.code === 'MONITORING_OVERLAPPING_INACTIVITY'
-            ) {
-              await persist({ openInactivityStartedAt: event.startedAt });
-              return;
-            }
-            console.warn('[Monitoring] could not open inactive period:', err);
-          }
+          await queueSessionEvent('inactivity-start', event.startedAt);
+          await persist({ openInactivityStartedAt: event.startedAt });
           return;
         }
 
         if (!state.openInactivityStartedAt) return;
-        try {
-          await endInactivity(
-            state.project,
-            state.sessionId,
-            event.endedAt ?? new Date().toISOString(),
-          );
-        } catch (err) {
-          console.warn('[Monitoring] could not close inactive period:', err);
-        }
-        await persist({
-          openInactivityStartedAt: null,
-          lastActivityAt: event.endedAt ?? new Date().toISOString(),
-        });
+        const endedAt = event.endedAt ?? new Date().toISOString();
+        await queueSessionEvent('inactivity-end', endedAt);
+        await persist({ openInactivityStartedAt: null, lastActivityAt: endedAt });
       })();
     },
 
-    // A captured frame goes straight into the durable queue, then the worker's
-    // uploader takes it. Enqueue-before-upload is deliberate: the frame
-    // survives a worker teardown, a network outage and a browser restart,
-    // whereas uploading inline would lose it on any of the three.
+    // A captured frame goes straight into the durable outbox, then sync takes
+    // it. Enqueue-before-upload is deliberate: the frame survives a worker
+    // teardown, a network outage and a browser restart, whereas uploading
+    // inline would lose it on any of the three.
     onScreenFrame: (frame) => {
       void (async () => {
         await hydrate();
@@ -311,7 +338,7 @@ export function configureMonitoringOffscreen(bridge: {
           return;
         }
         await persist({ capture: noteFrameCaptured(frame.capturedAt) });
-        void drainSnapshotQueue();
+        void drainSync('live');
       })();
     },
 
@@ -334,17 +361,69 @@ export function configureMonitoringOffscreen(bridge: {
   });
 }
 
+/**
+ * Record a session event in the outbox and nudge delivery.
+ *
+ * Local state is updated by the caller whether or not the server can be
+ * reached — getting the event there, in order, is the outbox's job.
+ */
+async function queueSessionEvent(
+  kind: MonitoringEventKind,
+  at: string,
+  pauses?: MonitoringPauseInterval[],
+): Promise<void> {
+  if (!state.sessionId || !state.project) return;
+  try {
+    await enqueueEvent({ sessionId: state.sessionId, project: state.project, kind, at, pauses });
+  } catch (err) {
+    console.warn(`[Monitoring] could not save a ${kind} event:`, err);
+    return;
+  }
+  void drainSync('live');
+}
+
+// ─── Liveness ─────────────────────────────────────────────────────────────────
+
+/**
+ * This machine's own record of when it was running, kept per session.
+ *
+ * The server can only see heartbeats. When it expires a session after an
+ * outage, this is what says how long monitoring really went on — through the
+ * outage, which was monitored, but not through a sleep, which was not.
+ */
+async function readLiveness(): Promise<LivenessSegment[]> {
+  const stored = await chrome.storage.local.get([MONITORING_STORAGE_KEYS.LIVENESS]);
+  return (stored[MONITORING_STORAGE_KEYS.LIVENESS] as LivenessSegment[] | undefined) ?? [];
+}
+
+async function noteAlive(atMs = Date.now()): Promise<LivenessSegment[]> {
+  const segments = extendLiveness(await readLiveness(), atMs);
+  await chrome.storage.local.set({ [MONITORING_STORAGE_KEYS.LIVENESS]: segments });
+  return segments;
+}
+
+/** The end this client can vouch for, for a stop issued at `atMs`. */
+async function settledSessionEnd(atMs: number): Promise<number> {
+  const segments = await noteAlive(atMs);
+  const contactMs = state.lastServerContactAt ? Date.parse(state.lastServerContactAt) : Number.NaN;
+  return settledEndMs(segments, Number.isFinite(contactMs) ? contactMs : null, atMs);
+}
+
+function pauseIntervals(untilIso: string): MonitoringPauseInterval[] {
+  return state.pauseHistory.map((pause) => ({
+    startedAt: pause.from,
+    endedAt: pause.to ?? untilIso,
+  }));
+}
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 /**
  * Begin a session.
  *
- * Order matters. The screen grant is requested BEFORE the backend session is
- * created: if the user cancels the picker there must be no orphaned session on
- * the server, and a session that cannot possibly capture is not a monitoring
- * session. The `clientSessionId` is persisted before the first request so every
- * retry reuses it and the idempotent `start` endpoint returns the same session
- * rather than opening a second one.
+ * The `clientSessionId` is persisted before the first request so every retry
+ * reuses it and the idempotent `start` endpoint returns the same session rather
+ * than opening a second one.
  */
 export function startMonitoringSession(options: {
   intervalSeconds: MonitoringInterval;
@@ -369,11 +448,21 @@ async function runStart(options: {
     return state;
   }
 
-  // The caller's explicit choice wins; the remembered project keeps non-UI
-  // entry points working.
-  const project = options.project ?? (await getMonitoringProject());
+  // The caller's explicit choice, then the remembered one, then a default
+  // resolved here.
+  //
+  // The last step matters because starting monitoring does not always go
+  // through the popup — a keyboard shortcut or a resumed session reaches this
+  // with no project at all. Without it, a user assigned to exactly one project
+  // was told to "select a project" with nothing to select between.
+  const project =
+    options.project ?? (await getMonitoringProject()) ?? (await defaultProjectOrNull());
+
   if (!project) {
-    await persist({ status: 'idle', error: 'Select a project before starting monitoring.' });
+    await persist({
+      status: 'idle',
+      error: 'No project is available for monitoring. Ask an administrator to assign you to one.',
+    });
     return state;
   }
   // Monitoring's own key — see MONITORING_STORAGE_KEYS.PROJECT for why this is
@@ -391,13 +480,6 @@ async function runStart(options: {
   });
 
   // ── 1. Backend session ───────────────────────────────────────────────────
-  //
-  // The screen is requested after this, not before. The picker is a modal the
-  // user answers in their own time, and holding an unstarted session open
-  // across it would leave the extension in `starting` with nothing on the
-  // server if they wandered off. If they cancel, the session is stopped again
-  // immediately below — which the backend handles as an ordinary short session
-  // rather than an orphan.
   try {
     const response = await apiStart(
       project,
@@ -405,6 +487,7 @@ async function runStart(options: {
       options.intervalSeconds,
       new Date().toISOString(),
     );
+    const now = Date.now();
     await persist({
       status: 'monitoring',
       sessionId: response.session.id,
@@ -416,17 +499,24 @@ async function runStart(options: {
       startedAt: response.session.startedAt,
       pausedMs: 0,
       pausedAt: null,
+      pauseHistory: [],
+      lastServerContactAt: new Date(now).toISOString(),
       screenshotCount: response.session.screenshotCount ?? 0,
       lastScreenshotAt: null,
-      offlineSince: null,
       error: null,
     });
+    // A fresh session starts a fresh liveness log.
+    await chrome.storage.local.set({
+      [MONITORING_STORAGE_KEYS.LIVENESS]: extendLiveness([], now),
+    });
+    await noteServerReachable();
   } catch (err) {
     if (err instanceof MonitoringApiError && err.code === 'MONITORING_ALREADY_ACTIVE') {
       // A session is already running for this user. Re-read rather than
       // reporting a failure for something that is working.
       await persist({ status: 'monitoring', error: null });
     } else {
+      await noteServerUnreachable(err);
       const message = err instanceof Error ? err.message : 'Could not start monitoring';
       await persist({ status: 'idle', error: message });
       return state;
@@ -481,10 +571,10 @@ async function beginCapture(): Promise<void> {
     state.intervalSeconds,
   );
 
-  // Uploading runs here in the worker, not in the offscreen document, and it
-  // runs even when capture failed to start: a previous session may have left
-  // frames queued, and those are still owed to the server.
-  startUploader();
+  // Delivery runs here in the worker, and it runs even when capture failed to
+  // start: a previous session may have left data queued, and that is still
+  // owed to the server.
+  startSyncSweep();
 
   await persist({
     capture: result.health,
@@ -496,34 +586,46 @@ async function beginCapture(): Promise<void> {
 }
 
 /**
- * Re-acquire the screen after the stream died.
+ * Re-acquire the screen after capture stopped.
  *
- * A new grant is genuinely required: a stopped track cannot be restarted, and
- * only the user can authorise a replacement. The session continues untouched,
- * so nothing already recorded is affected.
+ * The session continues untouched, so nothing already recorded is affected.
  */
 export async function reconnectMonitoringCapture(): Promise<MonitoringState> {
   await hydrate();
   if (state.status !== 'monitoring' || !state.sessionId) return state;
 
   await persist({ capture: { ...state.capture, status: 'requesting', error: null } });
-  // Re-acquiring genuinely re-prompts: a stopped track cannot be revived and
-  // only the user can authorise a replacement. The session itself continues
-  // untouched, so nothing already recorded is affected.
   await beginCapture();
   setMonitoringBadge();
   return state;
 }
 
+/**
+ * A project to monitor into when nobody named one.
+ *
+ * Returns null rather than throwing: a failure to reach the projects API must
+ * produce the "no project available" message, not an unhandled rejection that
+ * leaves the session half-started.
+ */
+async function defaultProjectOrNull(): Promise<string | null> {
+  try {
+    return await resolveDefaultProject(await getAssignedProjects());
+  } catch (err) {
+    console.warn('[Monitoring] could not resolve a default project:', err);
+    return null;
+  }
+}
+
 // ─── Stop ─────────────────────────────────────────────────────────────────────
 
 /**
- * Stop, flushing everything first.
+ * Stop, with everything the session produced queued ahead of the stop.
  *
  * The order is the point: the open activity and inactive period are closed at
- * the true stop time, buffered data is sent, and outstanding uploads get a
- * bounded chance to finish — all *before* the backend session is settled.
- * Tearing capture down first would discard the last frames of the day.
+ * the true stop time and queued, and only then is the stop queued behind them.
+ * Delivery gets a bounded chance to finish while the popup waits; whatever the
+ * server cannot take right now stays in the outbox and keeps uploading after
+ * the session is gone locally. Stopping during an outage loses nothing.
  */
 export function stopMonitoringSession(): Promise<MonitoringState> {
   if (stopInFlight) return stopInFlight;
@@ -547,63 +649,61 @@ async function runStop(): Promise<MonitoringState> {
   // 1. Close what is open, at the real stop time.
   //    Awaited: the agent emits an interval only when it ends, so for a session
   //    spent in a single application this flush produces the session's only
-  //    activity row. Firing and forgetting sent it after step 2 had already
-  //    flushed and cleared the buffer, and it was lost.
+  //    activity row, and it must be queued before the stop.
   await flushNativeAgent();
   await settleActivityWrites();
   await closeOpenActivity(stoppedAt);
   await closeOpenInactivity(stoppedAt);
 
-  // 2. Send buffered activity.
   if (project && sessionId) {
-    await flushActivityBuffer(
-      (activities) => sendActivityBatch(project, sessionId, activities),
-      (err) => !(err instanceof MonitoringApiError) || err.isRetryable,
-    );
-  }
+    // 2. The stop, at the end this client can vouch for. Online that is simply
+    //    now; if the server expired the session during an outage, it is what
+    //    the server re-settles the session to.
+    const endedAt = new Date(await settledSessionEnd(stoppedAt.getTime())).toISOString();
+    try {
+      await enqueueEvent({
+        sessionId,
+        project,
+        kind: 'stop',
+        at: endedAt,
+        pauses: pauseIntervals(endedAt),
+      });
+    } catch (err) {
+      console.warn(
+        '[Monitoring] could not queue the stop; the server will expire the session:',
+        err,
+      );
+    }
 
-  // 3. Give everything queued a bounded chance to land. There is no final
-  //    frame to take: the agent's capture ticker stops with the session, and
-  //    a frame captured after the stop time would sit outside the session it
-  //    would be filed under.
-  await flushSnapshotQueue();
-  stopUploader();
+    // 3. A bounded chance for the live data and the stop to land now. Backlog
+    //    is not waited for — it keeps going in the background.
+    await flushSessionSync(sessionId);
+  }
+  stopSyncSweep();
 
   // 4. Only now may capture go.
   stopCapture();
   stopNativeMonitoring();
   stopIdleDetection();
 
-  // 5. Settle the session.
-  if (project && sessionId) {
-    try {
-      await apiStop(project, sessionId, stoppedAt.toISOString());
-    } catch (err) {
-      // Stopping an already-stopped session is a server-side no-op, and a
-      // network failure only means the backend expires it on its own. The local
-      // session is over either way — leaving it "active" would be worse.
-      console.warn('[Monitoring] stop request failed; session ended locally:', err);
-    }
-  }
-
-  const stats = await queueStats().catch(() => null);
-  if (sessionId && stats && stats.pending === 0) {
-    await purgeSessionQueue(sessionId).catch(() => 0);
-  }
-
   await chrome.alarms.clear(MONITORING_ALARMS.TICK);
   await clearActivityState();
+  await chrome.storage.local.remove([MONITORING_STORAGE_KEYS.LIVENESS]);
   resetCaptureHealth();
 
   await persist({
     ...INITIAL_MONITORING_STATE,
-    // Anything that could not be uploaded is real data loss, reported rather
-    // than quietly forgotten with the rest of the session state.
-    failedSnapshots: stats?.failed ?? 0,
-    queuedSnapshots: stats?.pending ?? 0,
-    uploadError: stats?.lastError ?? null,
+    // Sync status outlives the session: what is still uploading, and anything
+    // that genuinely could not be, must stay visible after it has stopped.
+    queuedSnapshots: state.queuedSnapshots,
+    failedSnapshots: state.failedSnapshots,
+    pendingSyncItems: state.pendingSyncItems,
+    syncBacklogSince: state.syncBacklogSince,
+    uploadError: state.uploadError,
+    offlineSince: state.offlineSince,
   });
   clearMonitoringBadge();
+  void drainSync('sweep');
   return state;
 }
 
@@ -627,18 +727,13 @@ export async function pauseMonitoringSession(): Promise<MonitoringState> {
   await closeOpenInactivity(at);
   await closeOpenActivity(at);
   pauseNativeAgent();
+  await queueSessionEvent('pause', at.toISOString());
 
-  try {
-    await apiPause(state.project, state.sessionId, at.toISOString());
-  } catch (err) {
-    console.warn('[Monitoring] pause request failed:', err);
-  }
-
-  await pauseCapture();
   stopIdleDetection();
   await persist({
     status: 'paused',
     pausedAt: at.toISOString(),
+    pauseHistory: [...state.pauseHistory, { from: at.toISOString(), to: null }],
     capture: { ...getCaptureHealth(), status: 'idle' },
     currentActivityLabel: null,
   });
@@ -646,30 +741,28 @@ export async function pauseMonitoringSession(): Promise<MonitoringState> {
   return state;
 }
 
-/**
- * Resume.
- *
- * A fresh screen grant is required: pausing released the stream, and a stopped
- * track cannot be revived. Asking again is better than resuming into a session
- * that silently captures nothing.
- */
+/** Resume. */
 export async function resumeMonitoringSession(): Promise<MonitoringState> {
   await hydrate();
   if (state.status !== 'paused' || !state.project || !state.sessionId) return state;
 
   const at = new Date();
-  try {
-    await apiResume(state.project, state.sessionId, at.toISOString());
-  } catch (err) {
-    console.warn('[Monitoring] resume request failed:', err);
-  }
+  const atIso = at.toISOString();
+  await queueSessionEvent('resume', atIso);
 
   const pausedMs =
     state.pausedMs + (state.pausedAt ? at.getTime() - new Date(state.pausedAt).getTime() : 0);
-  await persist({ status: 'monitoring', pausedAt: null, pausedMs });
+  await persist({
+    status: 'monitoring',
+    pausedAt: null,
+    pausedMs,
+    pauseHistory: state.pauseHistory.map((pause, index) =>
+      index === state.pauseHistory.length - 1 && pause.to === null
+        ? { ...pause, to: atIso }
+        : pause,
+    ),
+  });
 
-  // Pausing released the stream, so resuming re-prompts. Asking again is
-  // better than resuming into a session that silently captures nothing.
   await beginCapture();
 
   resumeNativeAgent();
@@ -681,6 +774,185 @@ export async function resumeMonitoringSession(): Promise<MonitoringState> {
   return state;
 }
 
+// ─── A session the server closed underneath us ────────────────────────────────
+
+/**
+ * Keep monitoring after the server closed the live session.
+ *
+ * The server closes a live session for reasons that are not the user stopping:
+ * it expired it after hearing nothing for too long — a network outage, a
+ * backend that was down, a laptop asleep — or it split it at midnight. Stopping
+ * locally, which is what used to happen, silently ended a session the person
+ * believed was running and orphaned everything captured while the server could
+ * not hear it.
+ *
+ * Instead:
+ *  1. Whatever is open is closed and filed under the old session.
+ *  2. The old session gets a stop at the end this machine can vouch for. The
+ *     server re-settles an expired session to that end, which widens it over
+ *     the outage so everything captured then lands in it; for a midnight split
+ *     it is a no-op.
+ *  3. Monitoring continues in the server session that covers the present: the
+ *     midnight continuation if there is one — found by re-using the client
+ *     session id, which the rollover carries over — otherwise a new session
+ *     starting where this run of liveness began.
+ *  4. Never-sent items from after that start move to the new session. Anything
+ *     else the old session refuses follows by timestamp as sync meets it.
+ */
+function continueAfterRemoteClose(): Promise<void> {
+  if (continuationInFlight) return continuationInFlight;
+  continuationInFlight = runContinuation()
+    .catch((err) => {
+      console.warn('[Monitoring] could not continue after the session closed:', err);
+    })
+    .finally(() => {
+      continuationInFlight = null;
+    });
+  return continuationInFlight;
+}
+
+async function runContinuation(): Promise<void> {
+  await hydrate();
+  const { project, sessionId: closedId } = state;
+  if ((state.status !== 'monitoring' && state.status !== 'paused') || !project || !closedId) {
+    return;
+  }
+  const wasPaused = state.status === 'paused';
+  const wasInactive = Boolean(state.openInactivityStartedAt);
+  const at = new Date();
+
+  // 1. Close what is open, into the old session.
+  if (!wasPaused) {
+    await flushNativeAgent();
+    await settleActivityWrites();
+    await closeOpenActivity(at);
+    await closeOpenInactivity(at);
+  }
+
+  // 2. Re-settle the old session. A retry after a failed step 3 must not queue
+  //    a second stop.
+  const endMs = await settledSessionEnd(at.getTime());
+  const startMs = Math.max(endMs, currentRunStartMs(await readLiveness(), at.getTime()));
+  const alreadyQueued = (await listPendingEvents()).some(
+    (event) => event.sessionId === closedId && event.kind === 'stop',
+  );
+  if (!alreadyQueued) {
+    const endIso = new Date(endMs).toISOString();
+    await enqueueEvent({
+      sessionId: closedId,
+      project,
+      kind: 'stop',
+      at: endIso,
+      pauses: pauseIntervals(endIso),
+    });
+  }
+  await updateSyncSession(closedId, { closedRemotely: true });
+  void drainSync('live');
+
+  // 3. The session that covers now.
+  let next: { response: StartMonitoringResponse; clientSessionId: string };
+  try {
+    next = await startContinuation(project, closedId, new Date(startMs).toISOString());
+  } catch (err) {
+    if (err instanceof MonitoringApiError && err.code === 'MONITORING_ALREADY_ACTIVE') {
+      // Another browser or device holds a live session for this user and
+      // project, and two cannot run at once. This one ends; what it captured is
+      // safe in the outbox either way.
+      console.warn('[Monitoring] another client holds the live session — stopping here');
+      await stopMonitoringSession();
+      await persist({
+        error:
+          'Monitoring was started from another browser or device, so it stopped here. Everything captured here is saved and will upload.',
+      });
+      return;
+    }
+    // Most likely still offline. Monitoring carries on locally under the old
+    // session and the next tick tries again.
+    await noteServerUnreachable(err);
+    console.warn('[Monitoring] could not open the continuation session yet:', err);
+    return;
+  }
+
+  const { response, clientSessionId } = next;
+  const nextId = response.session.id;
+  const parsedStart = Date.parse(response.session.startedAt);
+  const nextStartedMs = Number.isFinite(parsedStart) ? parsedStart : startMs;
+
+  // 4. Point the old session's data at its successor.
+  await updateSyncSession(closedId, {
+    closedRemotely: true,
+    successorId: nextId,
+    successorStartedAtMs: nextStartedMs,
+  });
+  const moved = await retagSession(closedId, nextId, nextStartedMs);
+  await unparkSession(closedId);
+
+  await persist({
+    sessionId: nextId,
+    clientSessionId,
+    dailyReportId: response.dailyReport.id,
+    inactivityThresholdSeconds:
+      response.inactivityThresholdSeconds || state.inactivityThresholdSeconds,
+    lastServerContactAt: new Date().toISOString(),
+    openInactivityStartedAt: null,
+    error: null,
+  });
+  await noteServerReachable();
+  console.log(
+    `[Monitoring] session ${closedId} was closed by the server; continuing in ${nextId} (${moved} queued item(s) moved)`,
+  );
+
+  // Carry on exactly where monitoring was.
+  startNativeMonitoring(nextId, state.inactivityThresholdSeconds, state.intervalSeconds);
+  if (wasPaused) {
+    pauseNativeAgent();
+    await queueSessionEvent('pause', response.session.startedAt);
+  } else {
+    await initializeCurrentActivity({ nativeTracking: isNativeAgentTracking() });
+    // Still away from the keyboard, the idle stretch continues in the new
+    // session from its first moment. Checked rather than assumed: reopening a
+    // period for someone who came back meanwhile would never be closed.
+    const idleNow = wasInactive
+      ? await chrome.idle
+          .queryState(Math.max(15, state.inactivityThresholdSeconds))
+          .catch(() => 'active' as const)
+      : 'active';
+    if (idleNow !== 'active') {
+      await queueSessionEvent('inactivity-start', response.session.startedAt);
+      await persist({ openInactivityStartedAt: response.session.startedAt });
+    }
+  }
+
+  await persist({
+    currentActivityLabel: await currentActivityLabel(),
+    native: getNativeAgentState(),
+  });
+  setMonitoringBadge();
+  void drainSync('live');
+}
+
+async function startContinuation(
+  project: string,
+  closedId: string,
+  startedAt: string,
+): Promise<{ response: StartMonitoringResponse; clientSessionId: string }> {
+  // The same client id first: a midnight rollover carries it onto the next
+  // day's session, and `start` hands that session back instead of creating one.
+  if (state.clientSessionId) {
+    const same = await apiStart(project, state.clientSessionId, state.intervalSeconds, startedAt);
+    const live = same.session.status === 'ACTIVE' || same.session.status === 'PAUSED';
+    if (same.session.id !== closedId && live) {
+      return { response: same, clientSessionId: state.clientSessionId };
+    }
+  }
+  // The same id resolves to the closed session itself, so a new one is needed.
+  const fresh = generateId(24);
+  return {
+    response: await apiStart(project, fresh, state.intervalSeconds, startedAt),
+    clientSessionId: fresh,
+  };
+}
+
 // ─── Alarm upkeep ─────────────────────────────────────────────────────────────
 
 async function armAlarm(): Promise<void> {
@@ -688,7 +960,7 @@ async function armAlarm(): Promise<void> {
 }
 
 /**
- * Heartbeat, activity flush, and the capture watchdog.
+ * Heartbeat, activity batch, and the capture watchdog.
  *
  * Runs in whatever worker instance the alarm woke, so it hydrates first.
  */
@@ -701,28 +973,31 @@ export async function handleMonitoringAlarm(): Promise<void> {
   const { project, sessionId } = state;
   if (!project || !sessionId) return;
 
+  // Proof of life, recorded locally before anything can fail.
+  await noteAlive();
+
   // A paused session still heartbeats: the client IS alive, and letting it
-  // expire during a legitimate pause would truncate the day.
+  // expire during a legitimate pause would truncate the day. The heartbeat is
+  // also sync's probe — it is what notices the server coming back.
   try {
     await sendHeartbeat(project, sessionId, {
       clientTime: new Date().toISOString(),
       lastActivityAt: state.lastActivityAt ?? undefined,
       lastSnapshotAt: state.lastScreenshotAt ?? undefined,
     });
-    if (state.offlineSince) await persist({ offlineSince: null });
+    await noteServerReachable();
+    await persist({ lastServerContactAt: new Date().toISOString() });
   } catch (err) {
     if (err instanceof MonitoringApiError && err.code === 'MONITORING_SESSION_NOT_ACTIVE') {
-      console.warn('[Monitoring] session no longer active server-side — ending locally');
-      await stopMonitoringSession();
-      return;
+      await noteServerReachable();
+      await continueAfterRemoteClose();
+    } else {
+      await noteServerUnreachable(err);
     }
-    if (!state.offlineSince) await persist({ offlineSince: new Date().toISOString() });
   }
 
-  await flushActivityBuffer(
-    (activities) => sendActivityBatch(project, sessionId, activities),
-    (err) => !(err instanceof MonitoringApiError) || err.isRetryable,
-  );
+  // Activity is batched per minute, and this tick is the batch.
+  await drainSync('tick');
 
   if (state.status === 'monitoring') {
     await runCaptureWatchdog();
@@ -731,50 +1006,32 @@ export async function handleMonitoringAlarm(): Promise<void> {
     recoverNativeAgentIfStale();
   }
 
-  const stats = await queueStats().catch(() => null);
   await persist({
-    queuedSnapshots: stats?.pending ?? 0,
-    failedSnapshots: stats?.failed ?? 0,
-    uploadError: stats?.lastError ?? null,
     currentActivityLabel: await currentActivityLabel(),
     native: getNativeAgentState(),
   });
   setMonitoringBadge();
 }
 
+/** The outbox alarm. Runs with or without a live session. */
+export async function handleMonitoringSyncAlarm(): Promise<void> {
+  await hydrate();
+  await handleSyncAlarm();
+}
+
 /**
  * Is capture genuinely working?
  *
- * Three distinct failures, each needing a different answer:
- *  - the offscreen document is gone → its stream went with it; needs a re-grant
- *  - the track is dead              → only the user can grant a new screen
- *  - everything claims fine but no frame has landed in two intervals → say so
+ * Judged from frames actually arriving. The agent reports a failure it can see;
+ * a stall it cannot see — everything claims fine, no frame in two intervals —
+ * is caught by the age of the last frame.
  */
 async function runCaptureWatchdog(): Promise<void> {
-  const probed = await probeCapture();
+  const health = getCaptureHealth();
 
-  if (!probed) {
-    // The document holding the stream no longer exists, so capture is
-    // definitely not happening whatever the last known health claimed. A
-    // desktopCapture id is single-use once consumed, so this cannot be repaired
-    // without the user — say so rather than silently capturing nothing.
+  if (health.status === 'reconnect' || health.status === 'failed') {
     await persist({
-      capture: {
-        ...state.capture,
-        status: 'reconnect',
-        trackLive: false,
-        error: 'Screen capture needs to be reconnected.',
-      },
-      error: 'Screen capture disconnected — no new screenshots are being captured.',
-    });
-    return;
-  }
-
-  setCaptureHealth(probed);
-
-  if (probed.status === 'reconnect' || probed.status === 'failed') {
-    await persist({
-      capture: probed,
+      capture: health,
       error: 'Screen capture disconnected — no new screenshots are being captured.',
     });
     return;
@@ -783,7 +1040,7 @@ async function runCaptureWatchdog(): Promise<void> {
   if (isCaptureStale(state.intervalSeconds)) {
     await persist({
       capture: {
-        ...probed,
+        ...health,
         status: 'reconnect',
         error: 'No screenshot has been captured recently.',
       },
@@ -792,7 +1049,7 @@ async function runCaptureWatchdog(): Promise<void> {
     return;
   }
 
-  await persist({ capture: probed, error: null });
+  await persist({ capture: health, error: null });
 }
 
 // ─── Inactivity ───────────────────────────────────────────────────────────────
@@ -830,31 +1087,16 @@ function onIdleStateChanged(newState: chrome.idle.IdleState): void {
     if (state.openInactivityStartedAt) return;
 
     const startedAt = new Date().toISOString();
-    try {
-      await startInactivity(state.project, state.sessionId, startedAt);
-      await persist({ openInactivityStartedAt: startedAt });
-    } catch (err) {
-      if (err instanceof MonitoringApiError && err.code === 'MONITORING_OVERLAPPING_INACTIVITY') {
-        // The server already has this stretch; treat it as open so the matching
-        // `end` is still sent.
-        await persist({ openInactivityStartedAt: startedAt });
-        return;
-      }
-      console.warn('[Monitoring] could not open inactive period:', err);
-      await persist({ error: 'An inactivity period could not be recorded.' });
-    }
+    await queueSessionEvent('inactivity-start', startedAt);
+    await persist({ openInactivityStartedAt: startedAt });
   })();
 }
 
 async function closeOpenInactivity(at: Date): Promise<void> {
   if (!state.openInactivityStartedAt || !state.project || !state.sessionId) return;
-  try {
-    // A stretch that turns out to be under the threshold is discarded by the
-    // server (204), which is why nothing is filtered here.
-    await endInactivity(state.project, state.sessionId, at.toISOString());
-  } catch (err) {
-    console.warn('[Monitoring] could not close inactive period:', err);
-  }
+  // A stretch that turns out to be under the threshold is discarded by the
+  // server, which is why nothing is filtered here.
+  await queueSessionEvent('inactivity-end', at.toISOString());
   await persist({ openInactivityStartedAt: null });
 }
 
@@ -933,17 +1175,13 @@ export async function handleMonitoringOffscreenMessage(
       await persist({
         screenshotCount: state.screenshotCount + 1,
         lastScreenshotAt: capturedAt ?? new Date().toISOString(),
-        offlineSince: null,
       });
       return;
     }
 
     case 'OFFSCREEN_MONITORING_SNAPSHOT_ENQUEUED': {
-      // A frame just landed in the queue. Uploading is the worker's job — the
-      // offscreen document cannot do it, because after an extension reload it
-      // keeps its stream but loses `chrome.storage` along with every other
-      // namespace it would need to authenticate.
-      void drainSnapshotQueue();
+      // A frame just landed in the outbox. Delivery is the worker's job.
+      void drainSync('live');
       return;
     }
 
@@ -965,7 +1203,7 @@ export async function handleMonitoringOffscreenMessage(
       const { reason } = (payload ?? {}) as { reason?: string };
       // The session stays alive: time, activity and inactivity are still being
       // recorded and everything already captured is safe. What is lost is the
-      // ability to take NEW screenshots, which needs the user to re-grant.
+      // ability to take NEW screenshots.
       await persist({
         capture: {
           ...getCaptureHealth(),
@@ -996,17 +1234,38 @@ export async function handleMonitoringOffscreenMessage(
  * Re-establish what a live session needs in a freshly-woken worker.
  *
  * Listeners, alarms and the native port do not survive a teardown, so they are
- * re-created rather than assumed. The *stream* normally does survive — it lives
- * in the offscreen document, not here — which is why capture health is probed
- * instead of being reset, and only a genuinely unreachable document downgrades
- * the session to "reconnect".
+ * re-created rather than assumed. Capture health lives in memory, so the
+ * persisted copy stands in for it until the next frame arrives.
+ *
+ * Delivery resumes on every worker start whatever the session state: data
+ * saved during an outage is owed to the server even if its session stopped long
+ * ago, or the browser was restarted since.
  */
 export async function restoreMonitoringSession(): Promise<void> {
   state = await readState();
   hydrated = true;
+
+  // Rows an older build buffered in chrome.storage belong to the session that
+  // was live when they were written, so they can only be moved while it is.
+  if (state.sessionId && state.project) {
+    try {
+      const legacy = await takeLegacyActivityBuffer();
+      for (const row of legacy) await enqueueActivity(state.sessionId, state.project, row);
+      if (legacy.length > 0) {
+        console.log(`[Monitoring] moved ${legacy.length} buffered activity row(s) into the outbox`);
+      }
+    } catch (err) {
+      console.warn('[Monitoring] could not move buffered activity into the outbox:', err);
+    }
+  }
+
+  void drainSync('sweep');
+
   if (state.status !== 'monitoring' && state.status !== 'paused') return;
 
   await armAlarm();
+  startSyncSweep();
+  setCaptureHealth(state.capture);
   if (state.status === 'monitoring') {
     startIdleDetection();
     // Re-open the port and re-bind the session: the port does not survive a
@@ -1020,31 +1279,16 @@ export async function restoreMonitoringSession(): Promise<void> {
     } else {
       connectNativeAgent();
     }
-    const probed = await probeCapture();
-    if (probed) {
-      await persist({ capture: probed, native: getNativeAgentState() });
-    } else {
-      await persist({
-        capture: {
-          ...state.capture,
-          status: 'reconnect',
-          trackLive: false,
-          error: 'Screen capture needs to be reconnected.',
-        },
-      });
-    }
+    await persist({ native: getNativeAgentState() });
   }
   setMonitoringBadge();
-
-  const buffered = await bufferedActivityCount().catch(() => 0);
-  if (buffered > 0) console.log(`[Monitoring] restored with ${buffered} buffered activities`);
 }
 
 /**
  * Is a session live?
  *
  * Used by the offscreen-document owner check: recording finishing must not
- * close a document that is holding a monitoring stream.
+ * close a document while monitoring is running.
  */
 export function isMonitoringSessionLive(): boolean {
   return state.status === 'monitoring' || state.status === 'paused' || state.status === 'starting';

@@ -16,6 +16,12 @@
  *     single-page-app route changes (Jira board → Jira issue) collapsed into
  *     one undifferentiated interval.
  *
+ * A fifth was in delivery: closed intervals waited in a `chrome.storage` array
+ * that session stop cleared whether or not it had been sent, so a stop during
+ * an outage erased the session's activity. Closed intervals now go straight to
+ * the durable outbox through the sink the manager configures, and are removed
+ * only once the server has them.
+ *
  * ── Two sources, never conflated ─────────────────────────────────────────────
  * The native agent reports the real OS foreground application. The extension
  * reports pages in its own Chrome profile. When the agent is present it is
@@ -31,7 +37,6 @@
 
 import { generateId } from '@/utils';
 import {
-  ACTIVITY_BATCH_MAX,
   MONITORING_STORAGE_KEYS,
   type MonitoringActivityPayload,
   type NativeActivity,
@@ -41,8 +46,30 @@ import {
 /** Shorter than this and it was a flick-through, not work. */
 const MIN_ACTIVITY_MS = 1000;
 
-/** Cap the unsent buffer so an outage cannot grow it without bound. */
-const MAX_BUFFERED_ACTIVITIES = 2000;
+// ─── Delivery ─────────────────────────────────────────────────────────────────
+
+type ActivitySink = (activity: MonitoringActivityPayload) => Promise<void>;
+
+let sink: ActivitySink | null = null;
+
+/**
+ * Where closed intervals go.
+ *
+ * Injected so this module stays free of session and delivery concerns: the
+ * manager knows which session an interval belongs to, and the outbox knows how
+ * to get it to the server.
+ */
+export function configureActivitySink(next: ActivitySink): void {
+  sink = next;
+}
+
+async function emit(activity: MonitoringActivityPayload): Promise<void> {
+  if (!sink) {
+    console.warn('[Monitoring] no activity sink configured — interval not recorded');
+    return;
+  }
+  await sink(activity);
+}
 
 // ─── Persistence ──────────────────────────────────────────────────────────────
 
@@ -57,17 +84,6 @@ async function writeOpenActivity(activity: OpenActivity | null): Promise<void> {
     return;
   }
   await chrome.storage.local.set({ [MONITORING_STORAGE_KEYS.OPEN_ACTIVITY]: activity });
-}
-
-async function readBuffer(): Promise<MonitoringActivityPayload[]> {
-  const stored = await chrome.storage.local.get([MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER]);
-  return (stored[MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER] as MonitoringActivityPayload[]) ?? [];
-}
-
-async function writeBuffer(buffer: MonitoringActivityPayload[]): Promise<void> {
-  const bounded =
-    buffer.length > MAX_BUFFERED_ACTIVITIES ? buffer.slice(-MAX_BUFFERED_ACTIVITIES) : buffer;
-  await chrome.storage.local.set({ [MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER]: bounded });
 }
 
 // ─── Identity ─────────────────────────────────────────────────────────────────
@@ -124,7 +140,7 @@ export function toDomain(url: string | undefined | null): string | null {
 // ─── Interval lifecycle ───────────────────────────────────────────────────────
 
 /**
- * Close the open interval at `at` and buffer it.
+ * Close the open interval at `at` and hand it to the outbox.
  *
  * Returns the closed payload, or null when there was nothing open or the
  * interval was too short to mean anything.
@@ -155,9 +171,7 @@ export async function closeOpenActivity(
     endedAt: at.toISOString(),
   };
 
-  const buffer = await readBuffer();
-  buffer.push(payload);
-  await writeBuffer(buffer);
+  await emit(payload);
   return payload;
 }
 
@@ -245,10 +259,10 @@ export async function initializeCurrentActivity(options: {
 // ─── Native-side (the whole machine) ──────────────────────────────────────────
 
 /**
- * Buffer a closed focus interval from the native agent.
+ * Hand a closed focus interval from the native agent to the outbox.
  *
  * These arrive already closed — the agent knows the true boundaries — so they
- * are buffered directly rather than going through open/close.
+ * are emitted directly rather than going through open/close.
  *
  * Recorded as APPLICATION with source NATIVE_AGENT. That pairing is the whole
  * reconciliation rule: the agent is authoritative for *which application* was
@@ -263,7 +277,7 @@ export async function initializeCurrentActivity(options: {
 export async function recordNativeInterval(interval: NativeActivity): Promise<void> {
   if (interval.durationSeconds * 1000 < MIN_ACTIVITY_MS) return;
 
-  const payload: MonitoringActivityPayload = {
+  await emit({
     clientActivityId: interval.clientActivityId,
     activityType: 'APPLICATION',
     source: 'NATIVE_AGENT',
@@ -278,60 +292,28 @@ export async function recordNativeInterval(interval: NativeActivity): Promise<vo
     // one. Populating any of these from a title would be fabricating a visit.
     startedAt: interval.startedAt,
     endedAt: interval.endedAt,
-  };
-
-  const buffer = await readBuffer();
-  buffer.push(payload);
-  await writeBuffer(buffer);
+  });
 }
 
-// ─── Flush ────────────────────────────────────────────────────────────────────
+// ─── Housekeeping ─────────────────────────────────────────────────────────────
+
+/** Forget the open interval. Used once a session is fully settled. */
+export async function clearActivityState(): Promise<void> {
+  await chrome.storage.local.remove([MONITORING_STORAGE_KEYS.OPEN_ACTIVITY]);
+}
 
 /**
- * Send buffered intervals.
+ * Rows an older build left in the `chrome.storage` buffer, removed from it.
  *
- * `sendBatch` is injected so this module stays free of API and session
- * concerns. Partial acceptance is the contract: a batch that the server refuses
- * outright is dropped rather than retried forever, because one malformed row
- * must not block every row behind it — but a batch that never reached the
- * server is kept.
+ * Read once so an upgrade mid-session does not strand them; the caller moves
+ * them into the outbox.
  */
-export async function flushActivityBuffer(
-  // Returns `unknown` rather than `void`: the API's batch response is genuinely
-  // useful to a caller that wants it, and forcing every call site to discard it
-  // would mean wrapping the sender just to satisfy a signature.
-  sendBatch: (activities: MonitoringActivityPayload[]) => Promise<unknown>,
-  isRetryable: (err: unknown) => boolean,
-): Promise<void> {
-  const buffer = await readBuffer();
-  if (buffer.length === 0) return;
-
-  const batch = buffer.slice(0, ACTIVITY_BATCH_MAX);
-  try {
-    await sendBatch(batch);
-    const remaining = (await readBuffer()).slice(batch.length);
-    await writeBuffer(remaining);
-  } catch (err) {
-    if (!isRetryable(err)) {
-      console.warn('[Monitoring] activity batch rejected, dropping it');
-      const remaining = (await readBuffer()).slice(batch.length);
-      await writeBuffer(remaining);
-      return;
-    }
-    // Retryable — leave it for the next tick.
-  }
-}
-
-/** Drop everything buffered. Used once a session is fully settled. */
-export async function clearActivityState(): Promise<void> {
-  await chrome.storage.local.remove([
-    MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER,
-    MONITORING_STORAGE_KEYS.OPEN_ACTIVITY,
-  ]);
-}
-
-export async function bufferedActivityCount(): Promise<number> {
-  return (await readBuffer()).length;
+export async function takeLegacyActivityBuffer(): Promise<MonitoringActivityPayload[]> {
+  const stored = await chrome.storage.local.get([MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER]);
+  const rows =
+    (stored[MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER] as MonitoringActivityPayload[]) ?? [];
+  if (rows.length > 0) await chrome.storage.local.remove([MONITORING_STORAGE_KEYS.ACTIVITY_BUFFER]);
+  return rows;
 }
 
 /** A short human label for what is in front, for the popup. */

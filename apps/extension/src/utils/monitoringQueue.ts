@@ -1,99 +1,264 @@
 /**
- * Durable queue for captured screenshots awaiting upload.
+ * Durable outbox for everything monitoring sends to the server.
  *
- * ── Why a queue exists at all ────────────────────────────────────────────────
- * A capture that succeeded and an upload that failed are two different events.
- * The previous implementation logged the upload failure and moved on, so every
- * screenshot taken during a Wi-Fi drop, a VPN reconnect or a backend restart
- * was destroyed — a permanent hole in somebody's record caused by a temporary
- * network problem. Bytes that exist must not be thrown away because the network
- * is briefly unavailable.
+ * ── Why everything goes through here ─────────────────────────────────────────
+ * A capture that succeeded and an upload that failed are two different events,
+ * and so are an idle period that happened and a request that could not report
+ * it. The previous design only queued screenshots — and even those were given up
+ * on after eight attempts, roughly half an hour — while activity sat in a
+ * `chrome.storage` array that session stop wiped whether or not it had been
+ * sent, and inactivity, pause, resume and stop were plain requests that were
+ * simply lost if the server was down at that moment. A four-hour outage
+ * therefore erased four hours of somebody's record.
+ *
+ * Now every write is recorded here first and removed only when the server has
+ * confirmed it or has said, in its own words, that it can never accept it.
  *
  * ── Why IndexedDB, and its own database ──────────────────────────────────────
- * `chrome.storage.local` is the wrong home for image blobs: it is quota-limited,
- * JSON-serialising, and read wholesale by other parts of the extension. So the
- * blobs go in IndexedDB.
+ * `chrome.storage.local` is quota-limited, JSON-serialising, and has no
+ * transactions — two writers doing read-modify-write on the same array silently
+ * lose each other's rows. IndexedDB has transactions, holds blobs natively, and
+ * with the `unlimitedStorage` permission is exempt from eviction under disk
+ * pressure, which is what "survives the worst case" requires.
  *
  * This is a SEPARATE database from `blobStorage.ts` (which holds recordings) on
- * purpose. Sharing one would mean a monitoring queue drain and a recording
- * finalisation contending for the same transactions, and a schema bump on
- * either side forcing an upgrade on the other. The two features must not be
- * able to break each other.
+ * purpose: a monitoring drain and a recording finalisation must not contend for
+ * the same transactions, and a schema bump on one must not force the other.
  *
- * ── Shared between contexts ──────────────────────────────────────────────────
- * IndexedDB is per-origin, so the offscreen document (which captures) and the
- * service worker (which can drain after the document is gone) see the same
- * records. That is what lets a queue survive the offscreen document being
- * reclaimed mid-session.
+ * ── Stores ───────────────────────────────────────────────────────────────────
+ *   snapshots   one screenshot each, blob included, keyed by clientSnapshotId
+ *   activities  one activity row each; batched at send time
+ *   events      inactivity start/end, pause, resume, stop — ORDERED per session
+ *   sessions    what the client has learned about a session's server state
+ *
+ * No function here makes a network request. Sending is `monitoring.sync.ts`;
+ * the rules it follows are `monitoringSyncPolicy.ts`.
  */
+
+import type { MonitoringActivityPayload, MonitoringPauseInterval } from '@/types/monitoring';
+import { SYNC_POLICY, pickThinningVictims, type SyncLane } from './monitoringSyncPolicy';
 
 const DB_NAME = 'bestq-monitoring-queue';
-const DB_VERSION = 1;
-const STORE = 'snapshots';
+/** 1 held screenshots only. 2 added activities, events and sessions. */
+const DB_VERSION = 2;
 
-/** Bound the queue so an outage cannot fill the user's disk. */
-const MAX_QUEUE_ENTRIES = 600;
+const SNAPSHOTS = 'snapshots';
+const ACTIVITIES = 'activities';
+const EVENTS = 'events';
+const SESSIONS = 'sessions';
 
-/**
- * Give up on an entry after this many attempts.
- *
- * With the backoff below that is roughly half an hour of trying. Past that the
- * failure is not transient — a rejected payload, a revoked session — and
- * retrying forever would keep a dead entry at the head of the queue,
- * indefinitely blocking the ones behind it.
- */
-export const MAX_UPLOAD_ATTEMPTS = 8;
+export type QueuedItemStatus = 'pending' | 'dead';
 
-export type QueuedSnapshotStatus = 'pending' | 'uploading' | 'failed';
+/** Delivery bookkeeping shared by every kind of item. */
+export interface QueuedItemState {
+  status: QueuedItemStatus;
+  /**
+   * Failures counted against the item. Only failures that happened while the
+   * server was demonstrably answering are counted — an outage says nothing
+   * about the item, and counting it is how the old queue gave up on data that
+   * was perfectly fine.
+   */
+  attempts: number;
+  /** Epoch ms before which this item must not be tried. */
+  nextAttemptAt: number;
+  lastError: string | null;
+  /** Waiting for its session to be able to take it, not for the network. */
+  parked: boolean;
+  /**
+   * Whether a request carrying this item was ever issued.
+   *
+   * An item that was never sent provably is not on the server, so it can be
+   * re-homed to another session without any risk of storing it twice. One that
+   * was sent might have landed with the response lost, so only the server may
+   * say where it belongs.
+   */
+  everSent: boolean;
+  /** When this client produced it. Lane and retention are judged from this. */
+  producedAtMs: number;
+  deadAt: number | null;
+}
 
-export interface QueuedSnapshotRecord {
+export interface QueuedSnapshotRecord extends QueuedItemState {
   /** Our idempotency key. Reused across every retry so the server dedupes. */
   clientSnapshotId: string;
   sessionId: string;
   project: string;
-  /** When the frame was actually grabbed — never when it was uploaded (§42). */
+  /** When the frame was actually grabbed — never when it was uploaded. */
   capturedAt: string;
   blob: Blob;
   mimeType: string;
   fileSize: number;
-  attempts: number;
-  status: QueuedSnapshotStatus;
-  /** Epoch ms before which this entry must not be retried. */
-  nextAttemptAt: number;
-  lastError: string | null;
   /**
-   * A storage grant already obtained for this entry.
+   * A storage grant already used for this entry.
    *
-   * Kept so a retry after a successful PUT but a failed `complete` does not
-   * request a second grant and upload the bytes again — the object is already
-   * there and only the confirmation is outstanding.
+   * Kept so a retry after a successful upload but a failed `complete` does not
+   * upload the bytes again — only the confirmation is outstanding.
    */
   storageKey: string | null;
   uploaded: boolean;
 }
 
+export interface QueuedActivityRecord extends QueuedItemState {
+  id?: number;
+  sessionId: string;
+  project: string;
+  payload: MonitoringActivityPayload;
+}
+
+export type MonitoringEventKind =
+  | 'inactivity-start'
+  | 'inactivity-end'
+  | 'pause'
+  | 'resume'
+  | 'stop';
+
+export interface QueuedEventRecord extends QueuedItemState {
+  /** Global insertion order. Events of one session are sent strictly in it. */
+  seq?: number;
+  sessionId: string;
+  project: string;
+  kind: MonitoringEventKind;
+  /** The moment the event happened on this machine. */
+  at: string;
+  /** Stop only: pauses the server needs if it has to re-settle an expired session. */
+  pauses?: MonitoringPauseInterval[];
+}
+
+export interface SyncSessionRecord {
+  sessionId: string;
+  /** The server has said this session no longer accepts live data. */
+  closedRemotely: boolean;
+  /** The session monitoring continued in after this one closed. */
+  successorId: string | null;
+  successorStartedAtMs: number | null;
+  updatedAt: number;
+}
+
+// ─── Plumbing ─────────────────────────────────────────────────────────────────
+
 let dbPromise: Promise<IDBDatabase> | null = null;
+
+function request<T>(req: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error('Monitoring outbox request failed'));
+  });
+}
+
+function settled(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () =>
+      reject(transaction.error ?? new Error('Monitoring outbox transaction failed'));
+    transaction.onabort = () =>
+      reject(transaction.error ?? new Error('Monitoring outbox transaction aborted'));
+  });
+}
+
+/** Visit a cursor; return `false` from `visit` to stop early. */
+function iterate<T>(
+  source: IDBObjectStore | IDBIndex,
+  query: IDBValidKey | IDBKeyRange | null,
+  direction: IDBCursorDirection,
+  visit: (value: T, cursor: IDBCursorWithValue) => boolean | void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cursorRequest = source.openCursor(query, direction);
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor) {
+        resolve();
+        return;
+      }
+      if (visit(cursor.value as T, cursor) === false) {
+        resolve();
+        return;
+      }
+      cursor.continue();
+    };
+    cursorRequest.onerror = () =>
+      reject(cursorRequest.error ?? new Error('Monitoring outbox cursor failed'));
+  });
+}
+
+function ensureIndex(store: IDBObjectStore, name: string): void {
+  if (!store.indexNames.contains(name)) store.createIndex(name, name);
+}
+
+function upgrade(db: IDBDatabase, transaction: IDBTransaction, oldVersion: number): void {
+  const snapshots = db.objectStoreNames.contains(SNAPSHOTS)
+    ? transaction.objectStore(SNAPSHOTS)
+    : db.createObjectStore(SNAPSHOTS, { keyPath: 'clientSnapshotId' });
+  for (const legacy of ['capturedAt', 'nextAttemptAt']) {
+    if (snapshots.indexNames.contains(legacy)) snapshots.deleteIndex(legacy);
+  }
+  ensureIndex(snapshots, 'producedAtMs');
+  ensureIndex(snapshots, 'sessionId');
+  ensureIndex(snapshots, 'status');
+
+  if (oldVersion === 1) {
+    // Every v1 entry marked 'failed' was failed by an attempt cap that gave up
+    // after about half an hour of outage — not by anything wrong with the frame.
+    // Each gets a fresh start; one the server genuinely refuses is now recognised
+    // from the server's own answer.
+    const cursorRequest = snapshots.openCursor();
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor) return;
+      const legacy = cursor.value as Record<string, unknown>;
+      const capturedMs = Date.parse(String(legacy.capturedAt));
+      cursor.update({
+        ...legacy,
+        status: 'pending',
+        attempts: 0,
+        nextAttemptAt: 0,
+        parked: false,
+        everSent: true,
+        producedAtMs: Number.isFinite(capturedMs) ? capturedMs : Date.now(),
+        deadAt: null,
+      });
+      cursor.continue();
+    };
+  }
+
+  if (!db.objectStoreNames.contains(ACTIVITIES)) {
+    const activities = db.createObjectStore(ACTIVITIES, { keyPath: 'id', autoIncrement: true });
+    ensureIndex(activities, 'producedAtMs');
+    ensureIndex(activities, 'sessionId');
+    ensureIndex(activities, 'status');
+  }
+  if (!db.objectStoreNames.contains(EVENTS)) {
+    const events = db.createObjectStore(EVENTS, { keyPath: 'seq', autoIncrement: true });
+    ensureIndex(events, 'sessionId');
+    ensureIndex(events, 'status');
+  }
+  if (!db.objectStoreNames.contains(SESSIONS)) {
+    db.createObjectStore(SESSIONS, { keyPath: 'sessionId' });
+  }
+}
 
 function openQueueDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   const opening = new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const store = db.createObjectStore(STORE, { keyPath: 'clientSnapshotId' });
-        // Drained oldest-capture-first, so a report reads in the order the day
-        // actually happened even when entries were retried out of order.
-        store.createIndex('capturedAt', 'capturedAt');
-        store.createIndex('nextAttemptAt', 'nextAttemptAt');
-      }
+    const openRequest = indexedDB.open(DB_NAME, DB_VERSION);
+    openRequest.onupgradeneeded = (event) => {
+      upgrade(openRequest.result, openRequest.transaction!, event.oldVersion);
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('Could not open monitoring queue'));
+    openRequest.onsuccess = () => {
+      const db = openRequest.result;
+      // Another context upgrading the schema must not be blocked by this handle.
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    openRequest.onerror = () =>
+      reject(openRequest.error ?? new Error('Could not open monitoring outbox'));
   }).catch((err: unknown) => {
-    // Let a later call try again rather than caching a rejected promise
-    // forever — a transient open failure would otherwise disable the queue for
-    // the rest of the session.
+    // Let a later call try again rather than caching a rejected promise forever —
+    // a transient open failure would otherwise disable the outbox for the rest
+    // of the worker's life.
     dbPromise = null;
     throw err;
   });
@@ -101,201 +266,547 @@ function openQueueDb(): Promise<IDBDatabase> {
   return opening;
 }
 
-function tx<T>(
-  mode: IDBTransactionMode,
-  run: (store: IDBObjectStore) => IDBRequest<T>,
+async function read<T>(
+  stores: string | string[],
+  body: (transaction: IDBTransaction) => Promise<T>,
 ): Promise<T> {
-  return openQueueDb().then(
-    (db) =>
-      new Promise<T>((resolve, reject) => {
-        const transaction = db.transaction(STORE, mode);
-        const request = run(transaction.objectStore(STORE));
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error ?? new Error('Monitoring queue error'));
-      }),
-  );
+  const db = await openQueueDb();
+  return body(db.transaction(stores, 'readonly'));
 }
+
+/**
+ * A read-write transaction.
+ *
+ * `body` may await IDB requests made on the same transaction — the transaction
+ * stays open across those microtasks — but must not await anything else, or the
+ * transaction commits underneath it.
+ */
+async function write(
+  stores: string | string[],
+  body: (transaction: IDBTransaction) => void | Promise<void>,
+): Promise<void> {
+  const db = await openQueueDb();
+  const transaction = db.transaction(stores, 'readwrite');
+  const done = settled(transaction);
+  try {
+    await body(transaction);
+  } catch (err) {
+    done.catch(() => {});
+    try {
+      transaction.abort();
+    } catch {
+      /* already finished */
+    }
+    throw err;
+  }
+  await done;
+}
+
+function freshState(producedAtMs: number): QueuedItemState {
+  return {
+    status: 'pending',
+    attempts: 0,
+    nextAttemptAt: 0,
+    lastError: null,
+    parked: false,
+    everSent: false,
+    producedAtMs,
+    deadAt: null,
+  };
+}
+
+// ─── Snapshots ────────────────────────────────────────────────────────────────
+
+/** Last measured size of the screenshot store, refreshed by maintenance. */
+let knownSnapshotBytes = 0;
 
 /**
  * Add a freshly captured frame.
  *
- * Enqueued *before* any upload is attempted, so a worker teardown or a crash
- * between capture and upload cannot lose the frame.
+ * Enqueued *before* any upload is attempted, so a worker teardown, a crash or an
+ * outage between capture and upload cannot lose the frame.
  */
-export async function enqueueSnapshot(
-  record: Omit<
-    QueuedSnapshotRecord,
-    'attempts' | 'status' | 'nextAttemptAt' | 'lastError' | 'storageKey' | 'uploaded'
-  >,
-): Promise<void> {
-  await trimQueue();
-  await tx('readwrite', (store) =>
-    store.put({
-      ...record,
-      attempts: 0,
-      status: 'pending' as QueuedSnapshotStatus,
-      nextAttemptAt: 0,
-      lastError: null,
-      storageKey: null,
-      uploaded: false,
-    }),
-  );
-}
-
-/** Everything still in the queue, oldest capture first. */
-export async function listQueue(): Promise<QueuedSnapshotRecord[]> {
-  const all = await tx<QueuedSnapshotRecord[]>('readonly', (store) => store.getAll());
-  return all.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
+export async function enqueueSnapshot(input: {
+  clientSnapshotId: string;
+  sessionId: string;
+  project: string;
+  capturedAt: string;
+  blob: Blob;
+  mimeType: string;
+  fileSize: number;
+}): Promise<void> {
+  await enforceSnapshotBound();
+  const capturedMs = Date.parse(input.capturedAt);
+  const record: QueuedSnapshotRecord = {
+    ...input,
+    ...freshState(Number.isFinite(capturedMs) ? capturedMs : Date.now()),
+    storageKey: null,
+    uploaded: false,
+  };
+  await write(SNAPSHOTS, (transaction) => {
+    transaction.objectStore(SNAPSHOTS).put(record);
+  });
+  knownSnapshotBytes += input.fileSize || 0;
 }
 
 /**
- * The next entries eligible for an attempt right now.
+ * Keep the store inside its bounds by thinning, never by refusing new frames.
  *
- * Entries in `uploading` are skipped: another drain pass owns them, and two
- * passes uploading the same bytes is wasted bandwidth even though the server
- * would dedupe.
+ * Refusing to enqueue would turn a long outage into a monitoring blackout that
+ * outlives it. Dead entries go first; after that, the densest stretch of old
+ * frames is thinned so coverage of the outage survives at lower density rather
+ * than losing its beginning outright.
  */
-export async function claimDueSnapshots(limit = 4): Promise<QueuedSnapshotRecord[]> {
-  const now = Date.now();
-  const all = await listQueue();
-  return all
-    .filter(
-      (entry) =>
-        entry.status !== 'uploading' &&
-        entry.attempts < MAX_UPLOAD_ATTEMPTS &&
-        entry.nextAttemptAt <= now,
-    )
-    .slice(0, limit);
-}
-
-export async function markUploading(clientSnapshotId: string): Promise<void> {
-  const entry = await tx<QueuedSnapshotRecord | undefined>('readonly', (store) =>
-    store.get(clientSnapshotId),
+async function enforceSnapshotBound(): Promise<void> {
+  const count = await read(SNAPSHOTS, (transaction) =>
+    request(transaction.objectStore(SNAPSHOTS).count()),
   );
-  if (!entry) return;
-  await tx('readwrite', (store) => store.put({ ...entry, status: 'uploading' }));
+  const overCount = count + 1 - SYNC_POLICY.MAX_SNAPSHOTS;
+  const overBytes = knownSnapshotBytes > SYNC_POLICY.MAX_SNAPSHOT_BYTES;
+  if (overCount <= 0 && !overBytes) return;
+
+  // Relief in chunks when the byte bound is hit, so it is not re-scanned on
+  // every frame that follows.
+  const drop = Math.max(overCount, overBytes ? Math.ceil(count * 0.05) : 0);
+
+  const rows: Array<
+    Pick<QueuedSnapshotRecord, 'clientSnapshotId' | 'status' | 'producedAtMs' | 'fileSize'>
+  > = [];
+  await read(SNAPSHOTS, (transaction) =>
+    iterate<QueuedSnapshotRecord>(
+      transaction.objectStore(SNAPSHOTS).index('producedAtMs'),
+      null,
+      'next',
+      (entry) => {
+        rows.push({
+          clientSnapshotId: entry.clientSnapshotId,
+          status: entry.status,
+          producedAtMs: entry.producedAtMs,
+          fileSize: entry.fileSize,
+        });
+      },
+    ),
+  );
+
+  const victims = rows.filter((row) => row.status === 'dead').slice(0, drop);
+  if (victims.length < drop) {
+    const pending = rows.filter((row) => row.status !== 'dead');
+    const picked = pickThinningVictims(
+      pending.map((row) => row.producedAtMs),
+      drop - victims.length,
+      Date.now() - SYNC_POLICY.LIVE_WINDOW_MS,
+    );
+    victims.push(...picked.map((index) => pending[index]));
+  }
+  if (victims.length === 0) return;
+
+  await write(SNAPSHOTS, (transaction) => {
+    const store = transaction.objectStore(SNAPSHOTS);
+    victims.forEach((victim) => store.delete(victim.clientSnapshotId));
+  });
+  knownSnapshotBytes = Math.max(
+    0,
+    knownSnapshotBytes - victims.reduce((sum, victim) => sum + (victim.fileSize || 0), 0),
+  );
+  console.warn(
+    `[Monitoring] Outbox over its bound — thinned ${victims.length} of ${count} screenshot(s)`,
+  );
 }
 
-/** Record that the bytes are in storage but `complete` has not landed yet. */
-export async function markBytesUploaded(
+/**
+ * Screenshots due for an attempt in one lane.
+ *
+ * Live is newest first — the frame just taken is the one a viewer is waiting
+ * for. Backlog is oldest first, so a recovered day fills in the order it
+ * happened.
+ */
+export function nextSnapshots(options: {
+  lane: SyncLane;
+  now: number;
+  limit: number;
+}): Promise<QueuedSnapshotRecord[]> {
+  return nextDue<QueuedSnapshotRecord>(
+    SNAPSHOTS,
+    options,
+    options.lane === 'live' ? 'prev' : 'next',
+  );
+}
+
+export async function getSnapshot(clientSnapshotId: string): Promise<QueuedSnapshotRecord | null> {
+  const entry = await read(SNAPSHOTS, (transaction) =>
+    request<QueuedSnapshotRecord | undefined>(
+      transaction.objectStore(SNAPSHOTS).get(clientSnapshotId),
+    ),
+  );
+  return entry ?? null;
+}
+
+export async function patchSnapshot(
   clientSnapshotId: string,
-  storageKey: string,
+  patch: Partial<QueuedSnapshotRecord>,
 ): Promise<void> {
-  const entry = await tx<QueuedSnapshotRecord | undefined>('readonly', (store) =>
-    store.get(clientSnapshotId),
-  );
-  if (!entry) return;
-  await tx('readwrite', (store) => store.put({ ...entry, storageKey, uploaded: true }));
+  await write(SNAPSHOTS, async (transaction) => {
+    const store = transaction.objectStore(SNAPSHOTS);
+    const entry = await request<QueuedSnapshotRecord | undefined>(store.get(clientSnapshotId));
+    if (entry) store.put({ ...entry, ...patch });
+  });
 }
 
-/**
- * Done — drop the entry and its blob.
- *
- * Deleting on success is what keeps the database from growing without bound
- * across a full working day of captures.
- */
+/** Done — drop the entry and its blob. */
 export async function removeSnapshot(clientSnapshotId: string): Promise<void> {
-  await tx('readwrite', (store) => store.delete(clientSnapshotId));
+  await write(SNAPSHOTS, (transaction) => {
+    transaction.objectStore(SNAPSHOTS).delete(clientSnapshotId);
+  });
 }
 
-/**
- * Attempt failed. Schedule the next one with exponential backoff.
- *
- * 1s, 2s, 4s … capped, so a brief blip retries almost immediately while a long
- * outage stops hammering a backend that is already struggling.
- */
-export async function markAttemptFailed(
-  clientSnapshotId: string,
-  error: string,
-): Promise<QueuedSnapshotRecord | null> {
-  const entry = await tx<QueuedSnapshotRecord | undefined>('readonly', (store) =>
-    store.get(clientSnapshotId),
+// ─── Activities ───────────────────────────────────────────────────────────────
+
+export async function enqueueActivity(
+  sessionId: string,
+  project: string,
+  payload: MonitoringActivityPayload,
+): Promise<void> {
+  await enforceRowBound(ACTIVITIES, SYNC_POLICY.MAX_ACTIVITIES);
+  const record: QueuedActivityRecord = { ...freshState(Date.now()), sessionId, project, payload };
+  await write(ACTIVITIES, (transaction) => {
+    transaction.objectStore(ACTIVITIES).add(record);
+  });
+}
+
+/** Activity rows due for an attempt in one lane, oldest first. */
+export function nextActivities(options: {
+  lane: SyncLane;
+  now: number;
+  limit: number;
+}): Promise<QueuedActivityRecord[]> {
+  return nextDue<QueuedActivityRecord>(ACTIVITIES, options, 'next');
+}
+
+export async function patchActivities(records: QueuedActivityRecord[]): Promise<void> {
+  if (records.length === 0) return;
+  await write(ACTIVITIES, (transaction) => {
+    const store = transaction.objectStore(ACTIVITIES);
+    records.forEach((record) => store.put(record));
+  });
+}
+
+export async function removeActivities(ids: number[]): Promise<void> {
+  if (ids.length === 0) return;
+  await write(ACTIVITIES, (transaction) => {
+    const store = transaction.objectStore(ACTIVITIES);
+    ids.forEach((id) => store.delete(id));
+  });
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+export async function enqueueEvent(input: {
+  sessionId: string;
+  project: string;
+  kind: MonitoringEventKind;
+  at: string;
+  pauses?: MonitoringPauseInterval[];
+}): Promise<void> {
+  await enforceRowBound(EVENTS, SYNC_POLICY.MAX_EVENTS);
+  const record: QueuedEventRecord = { ...freshState(Date.now()), ...input };
+  await write(EVENTS, (transaction) => {
+    transaction.objectStore(EVENTS).add(record);
+  });
+}
+
+/** Every pending event, in insertion order. Events are few, so this is cheap. */
+export async function listPendingEvents(): Promise<QueuedEventRecord[]> {
+  const events = await read(EVENTS, (transaction) =>
+    request<QueuedEventRecord[]>(
+      transaction.objectStore(EVENTS).index('status').getAll(IDBKeyRange.only('pending')),
+    ),
   );
-  if (!entry) return null;
+  return events.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+}
 
-  const attempts = entry.attempts + 1;
-  const backoffMs = Math.min(2 ** attempts * 1000, 5 * 60 * 1000);
-  const updated: QueuedSnapshotRecord = {
-    ...entry,
-    attempts,
-    status: attempts >= MAX_UPLOAD_ATTEMPTS ? 'failed' : 'pending',
-    nextAttemptAt: Date.now() + backoffMs,
-    lastError: error.slice(0, 300),
-  };
-  await tx('readwrite', (store) => store.put(updated));
-  return updated;
+export async function patchEvent(seq: number, patch: Partial<QueuedEventRecord>): Promise<void> {
+  await write(EVENTS, async (transaction) => {
+    const store = transaction.objectStore(EVENTS);
+    const entry = await request<QueuedEventRecord | undefined>(store.get(seq));
+    if (entry) store.put({ ...entry, ...patch });
+  });
+}
+
+export async function removeEvent(seq: number): Promise<void> {
+  await write(EVENTS, (transaction) => {
+    transaction.objectStore(EVENTS).delete(seq);
+  });
+}
+
+// ─── Sessions ─────────────────────────────────────────────────────────────────
+
+export async function getSyncSession(sessionId: string): Promise<SyncSessionRecord | null> {
+  const record = await read(SESSIONS, (transaction) =>
+    request<SyncSessionRecord | undefined>(transaction.objectStore(SESSIONS).get(sessionId)),
+  );
+  return record ?? null;
+}
+
+export async function updateSyncSession(
+  sessionId: string,
+  patch: Partial<Omit<SyncSessionRecord, 'sessionId'>>,
+): Promise<void> {
+  await write(SESSIONS, async (transaction) => {
+    const store = transaction.objectStore(SESSIONS);
+    const existing = await request<SyncSessionRecord | undefined>(store.get(sessionId));
+    store.put({
+      sessionId,
+      closedRemotely: false,
+      successorId: null,
+      successorStartedAtMs: null,
+      ...existing,
+      ...patch,
+      updatedAt: Date.now(),
+    } satisfies SyncSessionRecord);
+  });
+}
+
+// ─── Cross-store ──────────────────────────────────────────────────────────────
+
+const DATA_STORES = [SNAPSHOTS, ACTIVITIES, EVENTS];
+
+/** Make every parked item of a session due now — something changed for it. */
+export async function unparkSession(sessionId: string): Promise<void> {
+  await write(DATA_STORES, async (transaction) => {
+    for (const name of DATA_STORES) {
+      await iterate<QueuedItemState>(
+        transaction.objectStore(name).index('sessionId'),
+        IDBKeyRange.only(sessionId),
+        'next',
+        (entry, cursor) => {
+          if (entry.status === 'pending' && entry.parked) {
+            cursor.update({ ...entry, parked: false, nextAttemptAt: 0 });
+          }
+        },
+      );
+    }
+  });
 }
 
 /**
- * Queue health, for the UI.
+ * Move never-sent items produced from `fromMs` on to another session.
  *
- * `pending` is what the popup surfaces as "N screenshots waiting to upload";
- * `failed` is the count that will never be sent and is worth telling the user
- * about separately, because it means data loss rather than a delay.
+ * Used when monitoring continues in a new server session. Only items that were
+ * never sent move: those provably are not stored anywhere, so moving them cannot
+ * store anything twice. Anything that was sent stays and lets the server's
+ * answer decide. A stop never moves — it belongs to the session it ends.
  */
-export async function queueStats(): Promise<{
-  total: number;
-  pending: number;
-  failed: number;
-  oldestCapturedAt: string | null;
-  bytes: number;
-  lastError: string | null;
-}> {
-  const all = await listQueue();
-  // The most recent failure reason, carried out of the queue so the popup can
-  // show *why* uploads are stuck. A count on its own ("4 could not be
-  // uploaded") is not diagnosable by anyone, including the person who has to
-  // fix it — the reason lived only in an IndexedDB row nobody opens.
-  const lastError =
-    all
-      .filter((entry) => entry.lastError)
-      .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt)
-      .at(-1)?.lastError ?? null;
-  return {
-    total: all.length,
-    pending: all.filter((entry) => entry.status !== 'failed').length,
-    failed: all.filter((entry) => entry.status === 'failed').length,
-    oldestCapturedAt: all[0]?.capturedAt ?? null,
-    bytes: all.reduce((sum, entry) => sum + (entry.fileSize || 0), 0),
-    lastError,
-  };
+export async function retagSession(
+  fromSessionId: string,
+  toSessionId: string,
+  fromMs: number,
+): Promise<number> {
+  let moved = 0;
+  await write(DATA_STORES, async (transaction) => {
+    await iterate<QueuedSnapshotRecord>(
+      transaction.objectStore(SNAPSHOTS).index('sessionId'),
+      IDBKeyRange.only(fromSessionId),
+      'next',
+      (entry, cursor) => {
+        if (entry.status !== 'pending' || entry.everSent || entry.producedAtMs < fromMs) return;
+        cursor.update({ ...entry, sessionId: toSessionId, storageKey: null, uploaded: false });
+        moved++;
+      },
+    );
+    await iterate<QueuedActivityRecord>(
+      transaction.objectStore(ACTIVITIES).index('sessionId'),
+      IDBKeyRange.only(fromSessionId),
+      'next',
+      (entry, cursor) => {
+        if (entry.status !== 'pending' || entry.everSent) return;
+        if (Date.parse(entry.payload.startedAt) < fromMs) return;
+        cursor.update({ ...entry, sessionId: toSessionId });
+        moved++;
+      },
+    );
+    await iterate<QueuedEventRecord>(
+      transaction.objectStore(EVENTS).index('sessionId'),
+      IDBKeyRange.only(fromSessionId),
+      'next',
+      (entry, cursor) => {
+        if (entry.status !== 'pending' || entry.everSent || entry.kind === 'stop') return;
+        if (Date.parse(entry.at) < fromMs) return;
+        cursor.update({ ...entry, sessionId: toSessionId });
+        moved++;
+      },
+    );
+  });
+  return moved;
 }
 
 /**
- * Enforce the size bound by dropping the oldest *failed* entries first, then
- * the oldest pending ones.
+ * Work the stop of `sessionId` should wait for: pending events plus live data.
  *
- * Dropping the oldest is the right choice over refusing to enqueue: the newest
- * frame describes what the user is doing now, and a queue that refuses new
- * captures during an outage would turn a network problem into a monitoring
- * blackout that persists after the network returns.
+ * Backlog is deliberately excluded — see STOP_HOLD_MS.
  */
-async function trimQueue(): Promise<void> {
-  const all = await listQueue();
-  if (all.length < MAX_QUEUE_ENTRIES) return;
-
-  const overBy = all.length - MAX_QUEUE_ENTRIES + 1;
-  const doomed = [
-    ...all.filter((entry) => entry.status === 'failed'),
-    ...all.filter((entry) => entry.status !== 'failed'),
-  ].slice(0, overBy);
-
-  await Promise.all(doomed.map((entry) => removeSnapshot(entry.clientSnapshotId)));
-  console.warn(`[Monitoring] Queue full — dropped ${doomed.length} oldest snapshot(s)`);
+export async function sessionLiveWork(sessionId: string, now: number): Promise<number> {
+  const liveFrom = now - SYNC_POLICY.LIVE_WINDOW_MS;
+  let work = 0;
+  await read(DATA_STORES, async (transaction) => {
+    for (const name of DATA_STORES) {
+      await iterate<QueuedItemState & { kind?: MonitoringEventKind }>(
+        transaction.objectStore(name).index('sessionId'),
+        IDBKeyRange.only(sessionId),
+        'next',
+        (entry) => {
+          if (entry.status !== 'pending' || entry.parked) return;
+          if (name === EVENTS ? entry.kind !== 'stop' : entry.producedAtMs >= liveFrom) work++;
+        },
+      );
+    }
+  });
+  return work;
 }
 
-/** Remove every entry for a session. Used after a session is fully settled. */
-export async function purgeSessionQueue(sessionId: string): Promise<number> {
-  const all = await listQueue();
-  const mine = all.filter((entry) => entry.sessionId === sessionId);
-  await Promise.all(mine.map((entry) => removeSnapshot(entry.clientSnapshotId)));
-  return mine.length;
+// ─── Stats and upkeep ─────────────────────────────────────────────────────────
+
+export interface OutboxStats {
+  pendingSnapshots: number;
+  deadSnapshots: number;
+  pendingActivities: number;
+  deadActivities: number;
+  pendingEvents: number;
+  /** Oldest item still waiting, of any kind. */
+  oldestPendingAtMs: number | null;
+  snapshotBytes: number;
 }
 
-/** Entries whose session is not the current one — abandoned by a crash. */
-export async function purgeStaleSessions(currentSessionId: string | null): Promise<number> {
-  const all = await listQueue();
-  const stale = all.filter((entry) => entry.sessionId !== currentSessionId);
-  await Promise.all(stale.map((entry) => removeSnapshot(entry.clientSnapshotId)));
-  return stale.length;
+export async function outboxStats(): Promise<OutboxStats> {
+  return read(DATA_STORES, async (transaction) => {
+    const count = (name: string, status: QueuedItemStatus) =>
+      request(transaction.objectStore(name).index('status').count(IDBKeyRange.only(status)));
+
+    const oldest = async (name: string): Promise<number | null> => {
+      let found: number | null = null;
+      const source =
+        name === EVENTS
+          ? transaction.objectStore(name)
+          : transaction.objectStore(name).index('producedAtMs');
+      await iterate<QueuedItemState>(source, null, 'next', (entry) => {
+        if (entry.status !== 'pending') return true;
+        found = entry.producedAtMs;
+        return false;
+      });
+      return found;
+    };
+
+    const [pendingSnapshots, deadSnapshots, pendingActivities, deadActivities, pendingEvents] =
+      await Promise.all([
+        count(SNAPSHOTS, 'pending'),
+        count(SNAPSHOTS, 'dead'),
+        count(ACTIVITIES, 'pending'),
+        count(ACTIVITIES, 'dead'),
+        count(EVENTS, 'pending'),
+      ]);
+    const oldestTimes = (
+      await Promise.all([oldest(SNAPSHOTS), oldest(ACTIVITIES), oldest(EVENTS)])
+    ).filter((value): value is number => value != null);
+
+    return {
+      pendingSnapshots,
+      deadSnapshots,
+      pendingActivities,
+      deadActivities,
+      pendingEvents,
+      oldestPendingAtMs: oldestTimes.length > 0 ? Math.min(...oldestTimes) : null,
+      snapshotBytes: knownSnapshotBytes,
+    };
+  });
+}
+
+/**
+ * Periodic upkeep: re-measure the store, expire what can never be delivered,
+ * and purge dead entries once they have been kept long enough to inspect.
+ */
+export async function maintainOutbox(now = Date.now()): Promise<void> {
+  let bytes = 0;
+  await write(DATA_STORES, async (transaction) => {
+    for (const name of DATA_STORES) {
+      await iterate<QueuedItemState & { fileSize?: number }>(
+        transaction.objectStore(name),
+        null,
+        'next',
+        (entry, cursor) => {
+          if (entry.status === 'dead') {
+            if (entry.deadAt != null && now - entry.deadAt > SYNC_POLICY.DEAD_RETENTION_MS) {
+              cursor.delete();
+              return;
+            }
+          } else if (
+            (entry.parked || entry.attempts >= SYNC_POLICY.MAX_ATTEMPTS_WHILE_REACHABLE) &&
+            now - entry.producedAtMs > SYNC_POLICY.PARKED_MAX_AGE_MS
+          ) {
+            cursor.update({
+              ...entry,
+              status: 'dead',
+              deadAt: now,
+              lastError: `No session would accept this after ${Math.round(
+                SYNC_POLICY.PARKED_MAX_AGE_MS / 3_600_000,
+              )}h: ${entry.lastError ?? 'session closed'}`,
+            });
+          }
+          if (name === SNAPSHOTS) bytes += entry.fileSize || 0;
+        },
+      );
+    }
+  });
+  knownSnapshotBytes = bytes;
+}
+
+/** Bound a row store by dropping its oldest dead rows, then its oldest pending ones. */
+async function enforceRowBound(name: string, max: number): Promise<void> {
+  const count = await read(name, (transaction) => request(transaction.objectStore(name).count()));
+  if (count < max) return;
+  let overBy = count - max + 1;
+  let dropped = 0;
+  await write(name, async (transaction) => {
+    const store = transaction.objectStore(name);
+    for (const status of ['dead', 'pending'] as const) {
+      if (overBy <= 0) break;
+      await iterate<QueuedItemState>(
+        store.index('status'),
+        IDBKeyRange.only(status),
+        'next',
+        (_, cursor) => {
+          if (overBy <= 0) return false;
+          cursor.delete();
+          overBy--;
+          dropped++;
+          return true;
+        },
+      );
+    }
+  });
+  console.warn(`[Monitoring] Outbox ${name} over its bound — dropped ${dropped} oldest row(s)`);
+}
+
+function nextDue<T extends QueuedItemState>(
+  name: string,
+  options: { lane: SyncLane; now: number; limit: number },
+  direction: IDBCursorDirection,
+): Promise<T[]> {
+  const boundary = options.now - SYNC_POLICY.LIVE_WINDOW_MS;
+  const range =
+    options.lane === 'live'
+      ? IDBKeyRange.lowerBound(boundary)
+      : IDBKeyRange.upperBound(boundary, true);
+  return read(name, async (transaction) => {
+    const picked: T[] = [];
+    if (options.limit <= 0) return picked;
+    await iterate<T>(
+      transaction.objectStore(name).index('producedAtMs'),
+      range,
+      direction,
+      (entry) => {
+        if (entry.status === 'pending' && entry.nextAttemptAt <= options.now) picked.push(entry);
+        return picked.length < options.limit;
+      },
+    );
+    return picked;
+  });
 }

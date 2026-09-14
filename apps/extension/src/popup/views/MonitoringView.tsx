@@ -179,6 +179,79 @@ function captureLabel(state: MonitoringState): { text: string; tone: 'ok' | 'war
   }
 }
 
+/** "3 screenshots and 12 activity records" — what is waiting, in words. */
+function describeWaiting(state: MonitoringState): string {
+  const parts: string[] = [];
+  if (state.queuedSnapshots > 0) {
+    parts.push(`${state.queuedSnapshots} screenshot${state.queuedSnapshots === 1 ? '' : 's'}`);
+  }
+  if (state.pendingSyncItems > 0) {
+    parts.push(
+      `${state.pendingSyncItems} activity record${state.pendingSyncItems === 1 ? '' : 's'}`,
+    );
+  }
+  return parts.join(' and ');
+}
+
+/** Behind by more than the few minutes a normal upload takes. */
+const SYNC_BEHIND_MS = 3 * 60_000;
+
+/**
+ * What is saved on this computer and not yet on the server.
+ *
+ * Shown whether or not a session is running: data kept through an outage is
+ * still uploading after the session that produced it has stopped, and the
+ * person should be able to see that it is safe and on its way. A frame that is
+ * simply mid-upload is not worth a line, so nothing shows until sync is
+ * genuinely behind or the server is unreachable.
+ */
+function SyncNotice({ state }: { state: MonitoringState }) {
+  const waiting = state.queuedSnapshots + state.pendingSyncItems;
+  const behind =
+    Boolean(state.offlineSince) ||
+    (state.syncBacklogSince != null &&
+      Date.now() - new Date(state.syncBacklogSince).getTime() > SYNC_BEHIND_MS);
+  const showWaiting = waiting > 0 && behind;
+  if (!showWaiting && state.failedSnapshots === 0 && !state.uploadError) return null;
+
+  return (
+    <div className="space-y-1">
+      {showWaiting && (
+        <p className="flex items-center gap-1.5 text-[11px] text-amber-300">
+          {state.offlineSince ? (
+            <WifiOff size={11} className="shrink-0" />
+          ) : (
+            <Loader2 size={11} className="shrink-0 animate-spin" />
+          )}
+          {state.offlineSince
+            ? `${describeWaiting(state)} saved on this computer`
+            : `Uploading ${describeWaiting(state)} gradually`}
+        </p>
+      )}
+      {showWaiting && state.syncBacklogSince && (
+        <p className="pl-[18px] text-[11px] leading-4 text-dark-400">
+          Oldest from {formatClock(state.syncBacklogSince)}. Nothing is lost — it uploads in small
+          batches once the server responds.
+        </p>
+      )}
+      {state.failedSnapshots > 0 && (
+        <p className="flex items-center gap-1.5 text-[11px] text-red-300">
+          <AlertTriangle size={11} className="shrink-0" />
+          {state.failedSnapshots} screenshot{state.failedSnapshots === 1 ? '' : 's'} refused by the
+          server
+        </p>
+      )}
+      {/* The reason, not just the count. A number on its own is not something
+          anyone can act on. */}
+      {state.uploadError && (
+        <p className="pl-[18px] text-[11px] leading-4 text-dark-400 break-words">
+          {state.uploadError}
+        </p>
+      )}
+    </div>
+  );
+}
+
 interface MonitoringViewProps {
   onBack: () => void;
 }
@@ -371,30 +444,9 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
               <Metric label="Activity" value={state.currentActivityLabel ?? '—'} />
             </div>
 
-            {/* Queue depth is real information: these screenshots exist but have
-                not reached the server yet. */}
-            {state.queuedSnapshots > 0 && (
-              <p className="flex items-center gap-1.5 text-[11px] text-amber-300">
-                <AlertTriangle size={11} />
-                {state.queuedSnapshots} screenshot{state.queuedSnapshots === 1 ? '' : 's'} waiting
-                to upload
-              </p>
-            )}
-            {state.failedSnapshots > 0 && (
-              <p className="flex items-center gap-1.5 text-[11px] text-red-300">
-                <AlertTriangle size={11} />
-                {state.failedSnapshots} screenshot{state.failedSnapshots === 1 ? '' : 's'} could not
-                be uploaded
-              </p>
-            )}
-            {/* The reason, not just the count. A number on its own is not
-                something anyone can act on, and the reason was otherwise
-                readable only by opening the offscreen document's IndexedDB. */}
-            {state.uploadError && (
-              <p className="pl-[18px] text-[11px] leading-4 text-dark-400 break-words">
-                {state.uploadError}
-              </p>
-            )}
+            {/* Queue depth is real information: this data exists but has not
+                reached the server yet. */}
+            <SyncNotice state={state} />
 
             {isPaused && (
               <p className="text-[11px] leading-4 text-dark-400">
@@ -444,6 +496,8 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
                 </select>
               )}
             </div>
+
+            <SyncNotice state={state} />
           </div>
         )}
 
@@ -459,9 +513,10 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
             <div className="text-xs text-dark-300 space-y-1">
               <p>Monitoring has been active for {formatDuration(elapsed)}.</p>
               <p>{state.screenshotCount} screenshots captured.</p>
-              {state.queuedSnapshots > 0 && (
+              {state.queuedSnapshots + state.pendingSyncItems > 0 && (
                 <p className="text-amber-300">
-                  {state.queuedSnapshots} still uploading — these will be finished before stopping.
+                  {describeWaiting(state)} not uploaded yet — saved on this computer, and they keep
+                  uploading after you stop.
                 </p>
               )}
             </div>

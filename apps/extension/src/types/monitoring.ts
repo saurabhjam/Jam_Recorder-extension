@@ -130,6 +130,19 @@ export interface MonitoringActivityPayload {
   endedAt: string;
 }
 
+/**
+ * One stretch the user paused, sent with a stop.
+ *
+ * Read by the server only when it has to re-settle a session it had already
+ * expired: the pause and resume that happened after the expiry could not be
+ * delivered as they happened, and without these the re-settled session would
+ * count that paused time as monitored.
+ */
+export interface MonitoringPauseInterval {
+  startedAt: string;
+  endedAt: string;
+}
+
 export interface ActivityBatchResponse {
   accepted: number;
   duplicates: number;
@@ -426,8 +439,23 @@ export interface MonitoringState {
   lastActivityAt: string | null;
   /** Start of the inactive stretch currently open on the server, if any. */
   openInactivityStartedAt: string | null;
-  /** Set when the last sync attempt failed, so the UI can say "syncing". */
+  /**
+   * When the server stopped being reachable, or null while it is.
+   *
+   * Monitoring carries on regardless — everything is kept on this machine and
+   * sent once the server answers again — so this is shown as "syncing", not as
+   * an error.
+   */
   offlineSince: string | null;
+  /**
+   * The last time the server acknowledged a heartbeat for this session.
+   *
+   * The server ends an expired session exactly there, so this is where the
+   * client begins accounting for the time the server did not see.
+   */
+  lastServerContactAt: string | null;
+  /** Every pause in the current session, for re-settling an expired one. */
+  pauseHistory: Array<{ from: string; to: string | null }>;
   capture: CaptureHealth;
   native: NativeAgentState;
   /** The server's inactivity threshold for this session, in seconds. */
@@ -436,6 +464,10 @@ export interface MonitoringState {
   queuedSnapshots: number;
   /** Screenshots that will never upload — real data loss, surfaced separately. */
   failedSnapshots: number;
+  /** Activity rows and session events saved on this machine, not yet sent. */
+  pendingSyncItems: number;
+  /** When the oldest unsent item was produced — how far behind sync is. */
+  syncBacklogSince: string | null;
   /**
    * Why the last upload attempt failed, shown under the counts.
    *
@@ -479,11 +511,15 @@ export const INITIAL_MONITORING_STATE: MonitoringState = {
   lastActivityAt: null,
   openInactivityStartedAt: null,
   offlineSince: null,
+  lastServerContactAt: null,
+  pauseHistory: [],
   capture: INITIAL_CAPTURE_HEALTH,
   native: INITIAL_NATIVE_AGENT_STATE,
   inactivityThresholdSeconds: INACTIVITY_THRESHOLD_SECONDS,
   queuedSnapshots: 0,
   failedSnapshots: 0,
+  pendingSyncItems: 0,
+  syncBacklogSince: null,
   uploadError: null,
   currentActivityLabel: null,
   error: null,
@@ -493,7 +529,15 @@ export const INITIAL_MONITORING_STATE: MonitoringState = {
 
 export const MONITORING_STORAGE_KEYS = {
   STATE: 'st_monitoring_state',
+  /**
+   * The old activity buffer. Activity now goes to the IndexedDB outbox; this key
+   * is only read once, to move rows an older build left behind.
+   */
   ACTIVITY_BUFFER: 'st_monitoring_activity',
+  /** Stretches this client was running, for re-settling an expired session. */
+  LIVENESS: 'st_monitoring_liveness',
+  /** Whether the server is reachable, and when to try it or the backlog next. */
+  SYNC_HEALTH: 'st_monitoring_sync_health',
   OPEN_ACTIVITY: 'st_monitoring_open_activity',
   /**
    * The project this session writes to.
@@ -516,6 +560,12 @@ export const MONITORING_STORAGE_KEYS = {
  */
 export const MONITORING_ALARMS = {
   TICK: 'st_monitoring_tick',
+  /**
+   * Outbox drain. Separate from TICK because it must outlive the session: data
+   * saved during an outage is still owed to the server after the user stops,
+   * and TICK is cleared on stop.
+   */
+  SYNC: 'st_monitoring_sync',
 } as const;
 
 /** Max activities per batch request, per the API contract. */
