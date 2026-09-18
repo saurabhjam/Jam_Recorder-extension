@@ -52,6 +52,12 @@ export interface MonitoringSessionResource {
   intervalSeconds: number;
   status: MonitoringSessionStatus;
   lastHeartbeatAt: string | null;
+  /**
+   * Why it ended. ADMIN means a project manager or administrator stopped it,
+   * and the client must stay stopped rather than recover into a new session.
+   * Absent on an older server.
+   */
+  endReason?: 'CLIENT' | 'EXPIRED' | 'ADMIN' | 'ROLLOVER' | null;
 }
 
 export interface DailyMonitoringReportResource {
@@ -440,6 +446,22 @@ export interface MonitoringState {
   /** Start of the inactive stretch currently open on the server, if any. */
   openInactivityStartedAt: string | null;
   /**
+   * The agent reported idleness the OS did not yet confirm. Held rather than
+   * opened, so a wrong or stale report cannot mark a working person inactive;
+   * the next reconcile opens or drops it.
+   */
+  pendingIdleSince: string | null;
+  /**
+   * Inactivity is never attributed to time before this: the session start, or
+   * the last resume. Idleness before then was not monitored time.
+   */
+  inactivityNotBefore: string | null;
+  /**
+   * Why the last session ended on its own, shown once in the popup — e.g. an
+   * automatic stop after an hour of inactivity. Null after a normal stop.
+   */
+  stopNotice: string | null;
+  /**
    * When the server stopped being reachable, or null while it is.
    *
    * Monitoring carries on regardless — everything is kept on this machine and
@@ -510,6 +532,9 @@ export const INITIAL_MONITORING_STATE: MonitoringState = {
   lastScreenshotAt: null,
   lastActivityAt: null,
   openInactivityStartedAt: null,
+  pendingIdleSince: null,
+  inactivityNotBefore: null,
+  stopNotice: null,
   offlineSince: null,
   lastServerContactAt: null,
   pauseHistory: [],

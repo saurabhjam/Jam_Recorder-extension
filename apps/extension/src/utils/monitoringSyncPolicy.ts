@@ -86,11 +86,12 @@ export const SYNC_POLICY = {
 
   /**
    * A gap in the liveness log longer than this means the machine slept or the
-   * browser was closed. Matches the server's heartbeat timeout, so a gap short
-   * enough that the server would have kept the session is treated the same way
-   * here.
+   * browser was closed. Matches the server's heartbeat timeout (five missed
+   * one-minute heartbeats), so a gap short enough that the server would have
+   * kept the session is treated the same way here — and anything longer is not
+   * credited as monitored time when an expired session is re-settled.
    */
-  LIVENESS_GAP_MS: 15 * 60_000,
+  LIVENESS_GAP_MS: 5 * 60_000,
   MAX_LIVENESS_SEGMENTS: 200,
 
   /**

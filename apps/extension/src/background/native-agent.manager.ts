@@ -32,7 +32,9 @@ import {
   type NativeCapabilities,
   type NativeIdleEvent,
   type NativePermissions,
+  type NativeScreenFrame,
 } from '@/types/monitoring';
+import { agentHeartbeatStale } from '@/utils/monitoringInactivity';
 
 interface Handlers {
   onActivity: (activity: NativeActivity) => void;
@@ -589,7 +591,7 @@ export function startNativeMonitoring(
  */
 export function waitForNativeAgent(timeoutMs = 6000): Promise<boolean> {
   if (isNativeAgentTracking() && state.capabilities) return Promise.resolve(true);
-  if (state.status === 'not-installed' || state.status === 'unsupported-platform') {
+  if (state.status === 'unavailable' || state.status === 'unsupported-platform') {
     return Promise.resolve(false);
   }
 
@@ -678,24 +680,50 @@ export function disconnectNativeAgent(): void {
   setState({ ...INITIAL_NATIVE_AGENT_STATE });
 }
 
+/** Silence longer than this, while this worker was running, means the agent is wedged. */
+const AGENT_STALE_AFTER_MS = 90_000;
+
+/** When the staleness check last ran, to tell a wedged agent from a sleeping machine. */
+let lastStaleCheckAt = 0;
+
 /**
  * Is the port open but silent?
  *
  * A port can stay nominally connected while the agent process is wedged. The
- * heartbeat is the only evidence it is alive, so three missed beats is treated
- * as dead and reconnected — otherwise the UI would report a healthy agent that
- * has not sent activity for an hour.
+ * heartbeat is the only evidence it is alive, so silence past the limit is
+ * treated as dead and reconnected — otherwise the UI would report a healthy
+ * agent that has not sent activity for an hour.
+ *
+ * But only silence this worker lived through. After a sleep every clock has
+ * jumped and no heartbeat can have arrived, and reconnecting then killed a
+ * perfectly healthy agent — and with the process went its open activity
+ * interval and any idle period it was tracking, whose end then never came.
+ * That lost end is what left sessions "inactive" for their whole remainder.
  */
 export function isNativeAgentStale(now = Date.now()): boolean {
-  if (!port || !isNativeAgentTracking()) return false;
-  if (lastHeartbeatAt === 0) return false;
-  return now - lastHeartbeatAt > 90_000;
+  if (!port || !isNativeAgentTracking()) {
+    lastStaleCheckAt = now;
+    return false;
+  }
+  const verdict = agentHeartbeatStale({
+    nowMs: now,
+    lastHeartbeatMs: lastHeartbeatAt,
+    lastCheckMs: lastStaleCheckAt,
+    staleAfterMs: AGENT_STALE_AFTER_MS,
+  });
+  lastStaleCheckAt = now;
+  if (verdict === 'woke-from-sleep') {
+    // Give the agent a full window to speak up now that the machine is awake.
+    lastHeartbeatAt = now;
+    return false;
+  }
+  return verdict === 'stale';
 }
 
 /** Re-establish a stale connection. Called by the manager's alarm tick. */
 export function recoverNativeAgentIfStale(): void {
   if (!isNativeAgentStale()) return;
-  console.warn('[NativeAgent] no heartbeat in 90s — reconnecting');
+  console.warn('[NativeAgent] no heartbeat while awake — reconnecting');
   if (port) {
     try {
       port.disconnect();

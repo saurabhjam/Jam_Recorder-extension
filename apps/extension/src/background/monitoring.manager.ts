@@ -29,11 +29,14 @@
  * claim "Monitoring Active" with no screenshots for an hour. Both are tracked
  * and both are published.
  *
- * ── Inactivity starts at the threshold, not at last input ────────────────────
- * A user whose last keypress was 10:24 and who returns at 10:46 is reported
- * inactive 10:29–10:46. The first five minutes had not yet qualified as
- * anything, and back-dating them would over-report inactivity by the full
- * threshold on every single period.
+ * ── Inactivity is checked against the OS every minute ────────────────────────
+ * Idle events from the agent and from `chrome.idle` are hints. Every decision
+ * about opening or closing a period is made in `utils/monitoringInactivity.ts`,
+ * one at a time, and a minute-by-minute reconcile compares the open period with
+ * the OS's own idle counter — so a lost "idle ended", which once left people
+ * "inactive" for the rest of a session they were working through, is corrected
+ * within a minute whatever the cause. Sixty minutes of continuous inactivity
+ * stops the session on its own.
  */
 
 import { generateId } from '@/utils';
@@ -53,6 +56,8 @@ import {
 } from '@/types/monitoring';
 import {
   startMonitoring as apiStart,
+  stopMonitoring as apiStop,
+  fetchMonitoringSession,
   sendHeartbeat,
   getMonitoringProject,
   setMonitoringProject,
@@ -74,14 +79,32 @@ import {
   settledEndMs,
   type LivenessSegment,
 } from '@/utils/monitoringSyncPolicy';
+import {
+  INACTIVITY_POLICY,
+  agentIdleStarted,
+  autoStopAt,
+  awayStopAt,
+  browserIdleChanged,
+  idleBoundsFromProbes,
+  idleEnded,
+  parseLiveSessionId,
+  probeLadder,
+  reconcileInactivity,
+  type IdleBounds,
+  type InactivityDecision,
+  type InactivityTracker,
+  type OsIdleState,
+} from '@/utils/monitoringInactivity';
 import { getAssignedProjects, resolveDefaultProject } from '@/services/projects';
 import {
   configureSync,
+  deliverSessionEvents,
   drainSync,
   flushSessionSync,
   handleSyncAlarm,
   noteServerReachable,
   noteServerUnreachable,
+  sessionsAwaitingStop,
   startSyncSweep,
   stopSyncSweep,
   type SyncStatus,
@@ -134,6 +157,13 @@ let hydrated = false;
 let startInFlight: Promise<MonitoringState> | null = null;
 let stopInFlight: Promise<MonitoringState> | null = null;
 let continuationInFlight: Promise<void> | null = null;
+
+// Registered synchronously while the module loads, not when a session starts.
+// An MV3 worker is woken BY this event; a listener added later, after an
+// await, is not there when the waking event is dispatched — and the "active"
+// that was lost that way left a period open for the rest of the session. The
+// handler checks the session state itself.
+chrome.idle?.onStateChanged?.addListener(onIdleStateChanged);
 
 // ─── State plumbing ───────────────────────────────────────────────────────────
 
@@ -296,22 +326,30 @@ export function configureMonitoringOffscreen(_bridge: {
     // would be recorded as the 5-minute threshold. The agent reports the real
     // start — when input actually stopped — and the real duration.
     onIdle: (event: NativeIdleEvent) => {
-      void (async () => {
+      void withInactivity(async () => {
         await hydrate();
-        if (state.status !== 'monitoring' || !state.project || !state.sessionId) return;
-
         if (event.idle) {
-          if (state.openInactivityStartedAt) return;
-          await queueSessionEvent('inactivity-start', event.startedAt);
-          await persist({ openInactivityStartedAt: event.startedAt });
+          if (state.status !== 'monitoring') return;
+          // Checked against the OS before it is believed — see agentIdleStarted.
+          const bounds = await probeOsIdle();
+          await applyInactivity(
+            agentIdleStarted(
+              inactivityTracker(),
+              event.startedAt,
+              bounds,
+              state.inactivityThresholdSeconds,
+            ),
+            'agent idle',
+          );
           return;
         }
-
-        if (!state.openInactivityStartedAt) return;
-        const endedAt = event.endedAt ?? new Date().toISOString();
-        await queueSessionEvent('inactivity-end', endedAt);
-        await persist({ openInactivityStartedAt: null, lastActivityAt: endedAt });
-      })();
+        // An end is honoured in any state: an open period must always be
+        // closable, whoever opened it and whatever the session is doing.
+        await applyInactivity(
+          idleEnded(inactivityTracker(), event.endedAt ?? new Date().toISOString()),
+          'agent active',
+        );
+      });
     },
 
     // A captured frame goes straight into the durable outbox, then sync takes
@@ -382,6 +420,120 @@ async function queueSessionEvent(
   void drainSync('live');
 }
 
+// ─── Inactivity ───────────────────────────────────────────────────────────────
+
+/**
+ * One inactivity decision at a time.
+ *
+ * Agent events, `chrome.idle` events, the reconcile and the lifecycle all read
+ * the tracker, may await an OS probe, and then act. Interleaved, two of them
+ * could each see nothing open and each open a period; serialized, the second
+ * sees what the first did.
+ */
+let inactivityChain: Promise<unknown> = Promise.resolve();
+
+function withInactivity<T>(run: () => Promise<T>): Promise<T | undefined> {
+  const next = inactivityChain.then(run, run).catch((err) => {
+    console.warn('[Monitoring] inactivity update failed:', err);
+    return undefined;
+  });
+  inactivityChain = next;
+  return next;
+}
+
+function inactivityTracker(): InactivityTracker {
+  return {
+    openSince: state.openInactivityStartedAt,
+    pendingSince: state.pendingIdleSince,
+    notBefore: state.inactivityNotBefore ?? state.startedAt,
+  };
+}
+
+/** Queue what a decision says, and remember the tracker it leaves behind. */
+async function applyInactivity(decision: InactivityDecision, context: string): Promise<void> {
+  const before = inactivityTracker();
+  if (decision.commands.length > 0 && (!state.sessionId || !state.project)) return;
+
+  let lastClosedAt: string | null = null;
+  for (const command of decision.commands) {
+    await queueSessionEvent(
+      command.kind === 'open' ? 'inactivity-start' : 'inactivity-end',
+      command.at,
+    );
+    if (command.kind === 'close') lastClosedAt = command.at;
+  }
+  if (decision.commands.length > 0 || decision.reason) {
+    console.log(
+      `[Monitoring] inactivity (${context}): ${decision.reason ?? 'no change'}`,
+      decision.commands,
+    );
+  }
+
+  const after = decision.tracker;
+  if (after.openSince === before.openSince && after.pendingSince === before.pendingSince) return;
+  await persist({
+    openInactivityStartedAt: after.openSince,
+    pendingIdleSince: after.pendingSince,
+    ...(lastClosedAt ? { lastActivityAt: lastClosedAt } : {}),
+  });
+}
+
+/**
+ * The OS's own idle counter, bracketed.
+ *
+ * `chrome.idle.queryState(n)` answers "was there input within n seconds" from
+ * the same OS source the agent reads, with no dependency on the agent, the
+ * port, or any event having been delivered. Null when it cannot be read.
+ */
+async function probeOsIdle(): Promise<IdleBounds | null> {
+  if (!chrome.idle?.queryState) return null;
+  const ladder = probeLadder(
+    state.inactivityThresholdSeconds,
+    INACTIVITY_POLICY.AUTO_STOP_AFTER_MS / 1000,
+  );
+  try {
+    const probes = await Promise.all(
+      ladder.map(async (intervalSeconds) => ({
+        intervalSeconds,
+        state: (await chrome.idle.queryState(intervalSeconds)) as OsIdleState,
+      })),
+    );
+    return idleBoundsFromProbes(probes);
+  } catch (err) {
+    console.warn('[Monitoring] could not read the OS idle state:', err);
+    return null;
+  }
+}
+
+/**
+ * The safety net: bring inactivity in line with the OS, then stop the session
+ * if it has been inactive for the whole limit.
+ *
+ * Returns true when it stopped the session.
+ */
+async function reconcileAndMaybeAutoStop(): Promise<boolean> {
+  const stopAt = await withInactivity(async () => {
+    await hydrate();
+    if (state.status !== 'monitoring') return null;
+    const bounds = await probeOsIdle();
+    const now = Date.now();
+    await applyInactivity(
+      reconcileInactivity(inactivityTracker(), bounds, now, state.inactivityThresholdSeconds),
+      'reconcile',
+    );
+    return autoStopAt(inactivityTracker(), bounds, now, state.inactivityThresholdSeconds);
+  });
+  if (stopAt == null) return false;
+
+  const minutes = Math.round(INACTIVITY_POLICY.AUTO_STOP_AFTER_MS / 60_000);
+  console.warn(`[Monitoring] inactive for ${minutes} minutes — stopping the session`);
+  await stopMonitoringSession({
+    at: new Date(stopAt),
+    notice: `Monitoring stopped automatically after ${minutes} minutes of inactivity. Start it again when you are back.`,
+  });
+  return true;
+}
+
 // ─── Liveness ─────────────────────────────────────────────────────────────────
 
 /**
@@ -400,6 +552,33 @@ async function noteAlive(atMs = Date.now()): Promise<LivenessSegment[]> {
   const segments = extendLiveness(await readLiveness(), atMs);
   await chrome.storage.local.set({ [MONITORING_STORAGE_KEYS.LIVENESS]: segments });
   return segments;
+}
+
+/**
+ * End the session if this machine was not running it for the auto-stop limit.
+ *
+ * Shut down, asleep, Chrome closed or crashed, extension killed — the liveness
+ * log stops in every case, and `awayStopAt` decides. The stop is dated to the
+ * last moment the machine was alive; the server, which will usually have
+ * expired the session by then, re-settles it to exactly that.
+ */
+async function endIfAwayTooLong(): Promise<boolean> {
+  if (state.status !== 'monitoring' && state.status !== 'paused') return false;
+  const segments = await readLiveness();
+  const lastAlive = segments.length > 0 ? segments[segments.length - 1].to : null;
+  const stopAt = awayStopAt(lastAlive, Date.now());
+  if (stopAt == null) return false;
+
+  const since = new Date(stopAt).toLocaleString([], {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+  console.warn(`[Monitoring] not running since ${since} — ending the session there`);
+  await stopMonitoringSession({
+    at: new Date(stopAt),
+    notice: `Monitoring stopped because this computer was off, asleep or not running Chrome from ${since}. Start it again when you are ready.`,
+  });
+  return true;
 }
 
 /** The end this client can vouch for, for a stop issued at `atMs`. */
@@ -440,6 +619,9 @@ async function runStart(options: {
   intervalSeconds: MonitoringInterval;
   project?: string;
 }): Promise<MonitoringState> {
+  // A Start right after a Stop waits for it rather than refusing: the stop is
+  // what lets the server open the next session at all.
+  if (stopInFlight) await stopInFlight.catch(() => undefined);
   await hydrate();
 
   if (state.status === 'monitoring' || state.status === 'paused') return state;
@@ -477,15 +659,26 @@ async function runStart(options: {
     intervalSeconds: options.intervalSeconds,
     capture: { ...getCaptureHealth(), status: 'requesting', error: null },
     error: null,
+    stopNotice: null,
   });
 
   // ── 1. Backend session ───────────────────────────────────────────────────
+  //
+  // Only a session id the server returned may put this client in 'monitoring'.
+  // The old handling of MONITORING_ALREADY_ACTIVE set 'monitoring' with NO
+  // session id — the popup said "Monitoring Active" while every frame and
+  // interval was dropped for having nowhere to go, and the server showed the
+  // previous session running on, empty. That refusal is now resolved instead.
   try {
-    const response = await apiStart(
+    // Our own earlier sessions are settled before a new one opens: a stop still
+    // queued from a moment ago, or from while offline, lands as the proper stop
+    // it was — not as an expiry the server works out for itself.
+    for (const earlier of await sessionsAwaitingStop()) await deliverSessionEvents(earlier);
+
+    const response = await startResolvingConflict(
       project,
       clientSessionId,
       options.intervalSeconds,
-      new Date().toISOString(),
     );
     const now = Date.now();
     await persist({
@@ -500,6 +693,9 @@ async function runStart(options: {
       pausedMs: 0,
       pausedAt: null,
       pauseHistory: [],
+      openInactivityStartedAt: null,
+      pendingIdleSince: null,
+      inactivityNotBefore: response.session.startedAt,
       lastServerContactAt: new Date(now).toISOString(),
       screenshotCount: response.session.screenshotCount ?? 0,
       lastScreenshotAt: null,
@@ -511,16 +707,17 @@ async function runStart(options: {
     });
     await noteServerReachable();
   } catch (err) {
-    if (err instanceof MonitoringApiError && err.code === 'MONITORING_ALREADY_ACTIVE') {
-      // A session is already running for this user. Re-read rather than
-      // reporting a failure for something that is working.
-      await persist({ status: 'monitoring', error: null });
-    } else {
-      await noteServerUnreachable(err);
-      const message = err instanceof Error ? err.message : 'Could not start monitoring';
-      await persist({ status: 'idle', error: message });
-      return state;
-    }
+    await noteServerUnreachable(err);
+    const message =
+      err instanceof MonitoringApiError && err.code === 'MONITORING_ALREADY_ACTIVE'
+        ? 'A previous monitoring session is still open on the server and could not be closed. Wait a minute and start again.'
+        : err instanceof MonitoringApiError && err.status === 0
+          ? 'Cannot reach the BestQ server. Check your internet connection and try again.'
+          : err instanceof Error
+            ? err.message
+            : 'Could not start monitoring';
+    await persist({ status: 'idle', error: message });
+    return state;
   }
 
   // ── 2. Agent, capture, activity, heartbeat ───────────────────────────────
@@ -551,6 +748,52 @@ async function runStart(options: {
   });
   setMonitoringBadge();
   return state;
+}
+
+/**
+ * Start a session, settling whatever the server says is still live first.
+ *
+ * MONITORING_ALREADY_ACTIVE almost always means our own previous session: its
+ * stop is still in the outbox — the Stop was pressed moments ago, or offline —
+ * or the browser crashed before it could stop. Either way this client is the
+ * one to settle it: our own queued stops are delivered in order, and a live
+ * session we hold no stop for (another crashed browser of this user) is stopped
+ * at its last heartbeat, so it is not credited time nobody was monitored. The
+ * start is then tried once more. If a session on another device was genuinely
+ * running, it notices at its next heartbeat and stops there — the most recent
+ * Start wins, rather than leaving two clients writing one day.
+ */
+async function startResolvingConflict(
+  project: string,
+  clientSessionId: string,
+  intervalSeconds: MonitoringInterval,
+): Promise<StartMonitoringResponse> {
+  try {
+    return await apiStart(project, clientSessionId, intervalSeconds, new Date().toISOString());
+  } catch (err) {
+    if (!(err instanceof MonitoringApiError) || err.code !== 'MONITORING_ALREADY_ACTIVE') throw err;
+
+    const liveId = parseLiveSessionId(err.message);
+    console.warn(
+      `[Monitoring] start refused: session ${liveId ?? '(unnamed)'} is still live — settling it`,
+    );
+
+    const ours = await sessionsAwaitingStop();
+    for (const sessionId of ours) await deliverSessionEvents(sessionId);
+
+    if (liveId && !ours.includes(liveId)) {
+      let endedAt = new Date().toISOString();
+      try {
+        const live = await fetchMonitoringSession(project, liveId);
+        if (live.lastHeartbeatAt) endedAt = live.lastHeartbeatAt;
+      } catch {
+        /* unreadable — settle it now rather than not at all */
+      }
+      await apiStop(project, liveId, endedAt);
+    }
+
+    return apiStart(project, clientSessionId, intervalSeconds, new Date().toISOString());
+  }
 }
 
 async function beginCapture(): Promise<void> {
@@ -627,15 +870,20 @@ async function defaultProjectOrNull(): Promise<string | null> {
  * server cannot take right now stays in the outbox and keeps uploading after
  * the session is gone locally. Stopping during an outage loses nothing.
  */
-export function stopMonitoringSession(): Promise<MonitoringState> {
+export function stopMonitoringSession(
+  options: { at?: Date; notice?: string } = {},
+): Promise<MonitoringState> {
   if (stopInFlight) return stopInFlight;
-  stopInFlight = runStop().finally(() => {
+  stopInFlight = runStop(options).finally(() => {
     stopInFlight = null;
   });
   return stopInFlight;
 }
 
-async function runStop(): Promise<MonitoringState> {
+async function runStop(options: { at?: Date; notice?: string }): Promise<MonitoringState> {
+  // A Stop pressed while a Start is still resolving would otherwise tear down
+  // first and then be undone by the start finishing after it.
+  if (startInFlight) await startInFlight.catch(() => undefined);
   await hydrate();
   if (state.status === 'idle') return state;
 
@@ -644,23 +892,27 @@ async function runStop(): Promise<MonitoringState> {
   // treated as part of a live session.
   await persist({ status: 'stopping' });
 
-  const stoppedAt = new Date();
+  const stoppedAt = options.at ?? new Date();
 
-  // 1. Close what is open, at the real stop time.
-  //    Awaited: the agent emits an interval only when it ends, so for a session
-  //    spent in a single application this flush produces the session's only
-  //    activity row, and it must be queued before the stop.
-  await flushNativeAgent();
-  await settleActivityWrites();
-  await closeOpenActivity(stoppedAt);
-  await closeOpenInactivity(stoppedAt);
+  // Everything up to the teardown is best effort. Whatever fails, the teardown
+  // below still runs and the state still ends 'idle' — a stop that threw
+  // half-way used to leave the popup showing a session that was neither
+  // running nor able to be started again.
+  try {
+    // 1. Close what is open, at the real stop time.
+    //    Awaited: the agent emits an interval only when it ends, so for a
+    //    session spent in a single application this flush produces the
+    //    session's only activity row, and it must be queued before the stop.
+    await flushNativeAgent();
+    await settleActivityWrites();
+    await closeOpenActivity(stoppedAt);
+    await closeOpenInactivity(stoppedAt);
 
-  if (project && sessionId) {
-    // 2. The stop, at the end this client can vouch for. Online that is simply
-    //    now; if the server expired the session during an outage, it is what
-    //    the server re-settles the session to.
-    const endedAt = new Date(await settledSessionEnd(stoppedAt.getTime())).toISOString();
-    try {
+    if (project && sessionId) {
+      // 2. The stop, at the end this client can vouch for. Online that is
+      //    simply the stop time; if the server expired the session during an
+      //    outage, it is what the server re-settles the session to.
+      const endedAt = new Date(await settledSessionEnd(stoppedAt.getTime())).toISOString();
       await enqueueEvent({
         sessionId,
         project,
@@ -668,28 +920,31 @@ async function runStop(): Promise<MonitoringState> {
         at: endedAt,
         pauses: pauseIntervals(endedAt),
       });
-    } catch (err) {
-      console.warn(
-        '[Monitoring] could not queue the stop; the server will expire the session:',
-        err,
-      );
-    }
 
-    // 3. A bounded chance for the live data and the stop to land now. Backlog
-    //    is not waited for — it keeps going in the background.
-    await flushSessionSync(sessionId);
+      // 3. A bounded chance for the live data to land first, then the stop is
+      //    delivered directly rather than left to the outbox's pacing: until
+      //    the server has it, the session stays live there, and a Start in the
+      //    meantime is refused. Offline, it stays queued and goes later.
+      await flushSessionSync(sessionId, 15_000);
+      await deliverSessionEvents(sessionId);
+    }
+  } catch (err) {
+    console.warn('[Monitoring] stop did not complete cleanly; finishing locally:', err);
   }
-  stopSyncSweep();
 
   // 4. Only now may capture go.
-  stopCapture();
-  stopNativeMonitoring();
-  stopIdleDetection();
-
-  await chrome.alarms.clear(MONITORING_ALARMS.TICK);
-  await clearActivityState();
-  await chrome.storage.local.remove([MONITORING_STORAGE_KEYS.LIVENESS]);
-  resetCaptureHealth();
+  try {
+    stopSyncSweep();
+    stopCapture();
+    stopNativeMonitoring();
+    stopIdleDetection();
+    await chrome.alarms.clear(MONITORING_ALARMS.TICK);
+    await clearActivityState();
+    await chrome.storage.local.remove([MONITORING_STORAGE_KEYS.LIVENESS]);
+    resetCaptureHealth();
+  } catch (err) {
+    console.warn('[Monitoring] teardown was incomplete:', err);
+  }
 
   await persist({
     ...INITIAL_MONITORING_STATE,
@@ -701,6 +956,7 @@ async function runStop(): Promise<MonitoringState> {
     syncBacklogSince: state.syncBacklogSince,
     uploadError: state.uploadError,
     offlineSince: state.offlineSince,
+    stopNotice: options.notice ?? null,
   });
   clearMonitoringBadge();
   void drainSync('sweep');
@@ -756,6 +1012,8 @@ export async function resumeMonitoringSession(): Promise<MonitoringState> {
     status: 'monitoring',
     pausedAt: null,
     pausedMs,
+    inactivityNotBefore: atIso,
+    pendingIdleSince: null,
     pauseHistory: state.pauseHistory.map((pause, index) =>
       index === state.pauseHistory.length - 1 && pause.to === null
         ? { ...pause, to: atIso }
@@ -817,8 +1075,27 @@ async function runContinuation(): Promise<void> {
   if ((state.status !== 'monitoring' && state.status !== 'paused') || !project || !closedId) {
     return;
   }
+  // Woken after the auto-stop limit — the first frame to arrive after a long
+  // sleep can bring us here before the minute tick does. That ends the session
+  // where it stopped; it does not continue it.
+  if (await endIfAwayTooLong()) return;
+
+  // An administrator's stop is honoured, not recovered from. Expiry, a midnight
+  // split and a takeover all close the session too, and those this client does
+  // recover from — so the reason is asked for rather than assumed. Unreadable
+  // (offline) means the continuation below cannot proceed either, and the next
+  // tick asks again.
+  const closed = await fetchMonitoringSession(project, closedId).catch(() => null);
+  if (closed?.endReason === 'ADMIN') {
+    console.warn(`[Monitoring] session ${closedId} was stopped by an administrator`);
+    await stopMonitoringSession({
+      notice:
+        'Your administrator stopped this monitoring session. Start it again when you are asked to.',
+    });
+    return;
+  }
+
   const wasPaused = state.status === 'paused';
-  const wasInactive = Boolean(state.openInactivityStartedAt);
   const at = new Date();
 
   // 1. Close what is open, into the old session.
@@ -895,6 +1172,8 @@ async function runContinuation(): Promise<void> {
       response.inactivityThresholdSeconds || state.inactivityThresholdSeconds,
     lastServerContactAt: new Date().toISOString(),
     openInactivityStartedAt: null,
+    pendingIdleSince: null,
+    inactivityNotBefore: response.session.startedAt,
     error: null,
   });
   await noteServerReachable();
@@ -909,18 +1188,6 @@ async function runContinuation(): Promise<void> {
     await queueSessionEvent('pause', response.session.startedAt);
   } else {
     await initializeCurrentActivity({ nativeTracking: isNativeAgentTracking() });
-    // Still away from the keyboard, the idle stretch continues in the new
-    // session from its first moment. Checked rather than assumed: reopening a
-    // period for someone who came back meanwhile would never be closed.
-    const idleNow = wasInactive
-      ? await chrome.idle
-          .queryState(Math.max(15, state.inactivityThresholdSeconds))
-          .catch(() => 'active' as const)
-      : 'active';
-    if (idleNow !== 'active') {
-      await queueSessionEvent('inactivity-start', response.session.startedAt);
-      await persist({ openInactivityStartedAt: response.session.startedAt });
-    }
   }
 
   await persist({
@@ -929,6 +1196,9 @@ async function runContinuation(): Promise<void> {
   });
   setMonitoringBadge();
   void drainSync('live');
+  // Still away from the keyboard, the idle stretch continues in the new
+  // session. Decided by the OS, not assumed from before the switch.
+  await reconcileAndMaybeAutoStop();
 }
 
 async function startContinuation(
@@ -973,8 +1243,16 @@ export async function handleMonitoringAlarm(): Promise<void> {
   const { project, sessionId } = state;
   if (!project || !sessionId) return;
 
+  // A machine that was off, asleep or not running Chrome for the whole limit:
+  // the session ends where it stopped being monitored, not now.
+  if (await endIfAwayTooLong()) return;
+
   // Proof of life, recorded locally before anything can fail.
   await noteAlive();
+
+  // Inactivity checked against the OS before the heartbeat reports it — and
+  // an hour of it ends the session here.
+  if (await reconcileAndMaybeAutoStop()) return;
 
   // A paused session still heartbeats: the client IS alive, and letting it
   // expire during a legitimate pause would truncate the day. The heartbeat is
@@ -984,6 +1262,7 @@ export async function handleMonitoringAlarm(): Promise<void> {
       clientTime: new Date().toISOString(),
       lastActivityAt: state.lastActivityAt ?? undefined,
       lastSnapshotAt: state.lastScreenshotAt ?? undefined,
+      idle: state.status === 'monitoring' && Boolean(state.openInactivityStartedAt),
     });
     await noteServerReachable();
     await persist({ lastServerContactAt: new Date().toISOString() });
@@ -1058,61 +1337,51 @@ async function runCaptureWatchdog(): Promise<void> {
  * OS-level idleness, via `chrome.idle`.
  *
  * The `idle` event fires when the detection interval has elapsed with no
- * keyboard or pointer input anywhere on the machine — the only honest
- * definition, since a user typing in another application would look idle to any
- * browser-event heuristic.
- *
- * The period starts NOW, at the moment the threshold is reached — never
- * back-dated to the last input, which would add the full threshold to every
- * inactive period the report shows.
+ * keyboard or pointer input anywhere on the machine. It opens a period only
+ * while the agent is not measuring idleness itself — the agent knows when input
+ * actually stopped, `chrome.idle` only that the threshold passed. "active",
+ * though, closes an open period whoever opened it: ignoring it because the agent
+ * "owned" detection is how a period the agent never saw stayed open for hours.
  */
 function onIdleStateChanged(newState: chrome.idle.IdleState): void {
-  void (async () => {
+  void withInactivity(async () => {
     await hydrate();
-    if (state.status !== 'monitoring' || !state.project || !state.sessionId) return;
-
-    // The agent owns inactivity whenever it is connected and can measure it:
-    // it reports a real OS-wide duration, while chrome.idle can only say a
-    // threshold was crossed. Running both would open two overlapping periods
-    // for one absence, which the backend rejects as overlapping.
-    if (nativeOwnsIdleDetection()) return;
-
-    if (newState === 'active') {
-      await closeOpenInactivity(new Date());
-      await persist({ lastActivityAt: new Date().toISOString() });
-      return;
-    }
-
-    // 'idle' or 'locked' — a locked screen is unambiguously away-from-keyboard.
-    if (state.openInactivityStartedAt) return;
-
-    const startedAt = new Date().toISOString();
-    await queueSessionEvent('inactivity-start', startedAt);
-    await persist({ openInactivityStartedAt: startedAt });
-  })();
+    if (state.status !== 'monitoring') return;
+    await applyInactivity(
+      browserIdleChanged(
+        inactivityTracker(),
+        newState as OsIdleState,
+        Date.now(),
+        nativeOwnsIdleDetection(),
+      ),
+      `chrome.idle ${newState}`,
+    );
+  });
 }
 
+/** Close any open period at `at` — for stop, pause and the session switch. */
 async function closeOpenInactivity(at: Date): Promise<void> {
-  if (!state.openInactivityStartedAt || !state.project || !state.sessionId) return;
   // A stretch that turns out to be under the threshold is discarded by the
   // server, which is why nothing is filtered here.
-  await queueSessionEvent('inactivity-end', at.toISOString());
-  await persist({ openInactivityStartedAt: null });
+  await withInactivity(async () => {
+    await hydrate();
+    await applyInactivity(idleEnded(inactivityTracker(), at.toISOString()), 'lifecycle');
+  });
 }
 
 function startIdleDetection(): void {
-  // chrome.idle enforces a 15s floor and is only the fallback for when the
-  // native agent is absent; the agent reports the true duration instead.
-  chrome.idle.setDetectionInterval(Math.max(15, state.inactivityThresholdSeconds));
-  if (!chrome.idle.onStateChanged.hasListener(onIdleStateChanged)) {
-    chrome.idle.onStateChanged.addListener(onIdleStateChanged);
+  // chrome.idle enforces a 15s floor. The listener itself is registered once,
+  // at module load; this only aligns the detection interval with the server's
+  // threshold.
+  try {
+    chrome.idle.setDetectionInterval(Math.max(15, state.inactivityThresholdSeconds));
+  } catch {
+    /* keeps its previous interval */
   }
 }
 
 function stopIdleDetection(): void {
-  if (chrome.idle.onStateChanged.hasListener(onIdleStateChanged)) {
-    chrome.idle.onStateChanged.removeListener(onIdleStateChanged);
-  }
+  // Nothing to remove: the handler ignores events outside a running session.
 }
 
 // ─── Activity entry points ────────────────────────────────────────────────────
@@ -1261,7 +1530,34 @@ export async function restoreMonitoringSession(): Promise<void> {
 
   void drainSync('sweep');
 
+  // A worker torn down mid-transition must not leave the session stuck there:
+  // 'stopping' used to refuse every later Start with "still stopping", and a
+  // 'starting' or session-less 'monitoring' showed a session that captured
+  // nothing.
+  if (state.status === 'stopping') {
+    void stopMonitoringSession();
+    return;
+  }
+  if (state.status === 'starting' && !startInFlight) {
+    // The client session id is kept, so starting again returns the same server
+    // session if the interrupted start had created one.
+    await persist({ status: 'idle', error: 'Monitoring did not finish starting. Start it again.' });
+    return;
+  }
+  if ((state.status === 'monitoring' || state.status === 'paused') && !state.sessionId) {
+    await persist({
+      ...INITIAL_MONITORING_STATE,
+      error: 'Monitoring was not connected to a server session. Start it again.',
+    });
+    clearMonitoringBadge();
+    return;
+  }
+
   if (state.status !== 'monitoring' && state.status !== 'paused') return;
+
+  // Chrome or the whole machine was restarted: an absence as long as the
+  // auto-stop limit ends the session where it stopped instead of resuming it.
+  if (await endIfAwayTooLong()) return;
 
   await armAlarm();
   startSyncSweep();

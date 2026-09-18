@@ -26,6 +26,7 @@ execFileSync(
     resolve(here, '..', 'src', 'utils', 'captureSchedule.ts'),
     resolve(here, '..', 'src', 'utils', 'encodeBudget.ts'),
     resolve(here, '..', 'src', 'utils', 'monitoringSyncPolicy.ts'),
+    resolve(here, '..', 'src', 'utils', 'monitoringInactivity.ts'),
     '--outDir',
     outDir,
     '--module',
@@ -41,6 +42,15 @@ execFileSync(
 execFileSync(process.execPath, [resolve(here, 'captureSchedule.test.mjs')], { stdio: 'inherit' });
 execFileSync(process.execPath, [resolve(here, 'encodeBudget.test.mjs')], { stdio: 'inherit' });
 execFileSync(process.execPath, [resolve(here, 'monitoringSyncPolicy.test.mjs')], {
+  stdio: 'inherit',
+});
+execFileSync(process.execPath, [resolve(here, 'monitoringInactivity.test.mjs')], {
+  stdio: 'inherit',
+});
+
+// The real background code end to end, against a simulated agent, OS, server
+// and chrome.*. Skips itself, with a note, when fake-indexeddb is not available.
+execFileSync(process.execPath, [resolve(here, 'e2e', 'monitoring.e2e.test.mjs')], {
   stdio: 'inherit',
 });
 

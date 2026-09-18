@@ -18,6 +18,7 @@ import type {
   MonitoringActivityPayload,
   MonitoringInterval,
   MonitoringPauseInterval,
+  MonitoringSessionResource,
   SnapshotUploadResponse,
   StartMonitoringResponse,
 } from '@/types/monitoring';
@@ -174,12 +175,33 @@ export function startMonitoring(
 export function sendHeartbeat(
   project: string,
   sessionId: string,
-  payload: { clientTime: string; lastActivityAt?: string; lastSnapshotAt?: string },
+  payload: {
+    clientTime: string;
+    lastActivityAt?: string;
+    lastSnapshotAt?: string;
+    /**
+     * Whether this client has an inactive period open right now.
+     *
+     * `false` lets the server close a period this client no longer has open —
+     * the self-healing path for an "idle ended" that never arrived. Checked by
+     * the client against the OS every minute before it is sent, so it is the
+     * better-informed of the two.
+     */
+    idle?: boolean;
+  },
 ): Promise<void> {
   return request<void>(project, `/sessions/${sessionId}/heartbeat`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });
+}
+
+/** One session's own record — used to settle a stale live session at its last heartbeat. */
+export function fetchMonitoringSession(
+  project: string,
+  sessionId: string,
+): Promise<MonitoringSessionResource> {
+  return request<MonitoringSessionResource>(project, `/sessions/${sessionId}`, { method: 'GET' });
 }
 
 export function pauseMonitoring(project: string, sessionId: string, at: string): Promise<void> {

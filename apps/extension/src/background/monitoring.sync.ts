@@ -925,3 +925,44 @@ export async function flushSessionSync(sessionId: string, timeoutMs = 20_000): P
     await drainSync('flush');
   }
 }
+
+/**
+ * Send one session's pending events now, in order, ignoring pacing and holds.
+ *
+ * For the moments the lifecycle cannot wait on the outbox: a Stop must reach
+ * the server before the popup reports it done, and a Start that the server
+ * refuses because an earlier session of ours is still live must be able to
+ * settle that session first. Earlier events go before the stop, so the stop
+ * cannot close an inactive period at the wrong time because its real end was
+ * still queued behind it.
+ *
+ * Returns true when nothing of the session is left pending.
+ */
+export async function deliverSessionEvents(sessionId: string): Promise<boolean> {
+  const session = await getSyncSession(sessionId);
+  const chain = (await listPendingEvents()).filter((event) => event.sessionId === sessionId);
+  // A session the server closed is re-settled first, exactly as the drain does.
+  if (session?.closedRemotely) {
+    chain.sort((a, b) => Number(b.kind === 'stop') - Number(a.kind === 'stop'));
+  }
+
+  const pass: Pass = {
+    now: Date.now(),
+    budget: Number.POSITIVE_INFINITY,
+    sends: 0,
+    halted: false,
+    sawAnswer: false,
+    backlogTouched: false,
+  };
+  for (const event of chain) {
+    if ((await sendEvent(event, session, pass)) !== 'done') return false;
+  }
+  await publish();
+  return true;
+}
+
+/** Sessions with a stop still waiting to be delivered. */
+export async function sessionsAwaitingStop(): Promise<string[]> {
+  const events = await listPendingEvents();
+  return [...new Set(events.filter((e) => e.kind === 'stop').map((e) => e.sessionId))];
+}

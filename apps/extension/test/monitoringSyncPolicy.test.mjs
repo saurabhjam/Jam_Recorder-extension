@@ -157,7 +157,7 @@ t('a gap longer than the heartbeat timeout starts a new run', () => {
 
 t('a short sleep does not break the run', () => {
   let segments = ticksEveryMinute(T0, T0 + 5 * MIN);
-  segments = ticksEveryMinute(T0 + 15 * MIN, T0 + 20 * MIN, segments);
+  segments = ticksEveryMinute(T0 + 8 * MIN, T0 + 20 * MIN, segments);
   eq(segments.length, 1);
 });
 

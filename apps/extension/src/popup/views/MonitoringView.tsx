@@ -36,7 +36,8 @@ import {
 import { Button } from '@/components/ui/Button';
 import { formatDuration } from '@/utils';
 import { INITIAL_MONITORING_STATE, MONITORING_INTERVAL_SECONDS } from '@/types/monitoring';
-import type { MonitoringState } from '@/types/monitoring';
+import type { MonitoringState, MonitoringStatus } from '@/types/monitoring';
+import { fetchOwnDailyReport } from '@/services/monitoring.api';
 import {
   getAssignedProjects,
   resolveDefaultProject,
@@ -75,6 +76,65 @@ function useElapsedSeconds(state: MonitoringState): number {
       ? Date.now() - new Date(state.pausedAt).getTime()
       : 0;
   return Math.max(0, Math.floor((now - started - state.pausedMs - pausedNow) / 1000));
+}
+
+/** How often the day's total is re-read from the server while the popup is open. */
+const TODAY_TOTAL_REFRESH_MS = 60_000;
+
+/**
+ * Today's total monitoring time for this user, as the server counts it.
+ *
+ * Every session of the day, not just the one running now — a person who
+ * monitored 9–12, stopped for lunch and started again sees their day, not the
+ * last forty minutes. Paused time is excluded, exactly as in the portal's daily
+ * report, so the two always show the same number.
+ *
+ * Re-read on open, on every start/stop/pause/resume and once a minute; between
+ * reads it ticks locally while monitoring. Null until the first read lands, or
+ * when the server cannot be reached — the caller then falls back to this
+ * session's own time.
+ */
+function useTodayTotalSeconds(project: string | null, status: MonitoringStatus): number | null {
+  const [base, setBase] = useState<{ seconds: number; readAt: number } | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const running = status === 'monitoring';
+
+  useEffect(() => {
+    if (!project) {
+      return undefined;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const report = await fetchOwnDailyReport(project);
+        if (!cancelled) {
+          setBase({ seconds: report.totalMonitoringSeconds ?? 0, readAt: Date.now() });
+        }
+      } catch {
+        // Offline or signed out: keep the last reading.
+      }
+    };
+    void load();
+    const timer = setInterval(load, TODAY_TOTAL_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [project, status]);
+
+  useEffect(() => {
+    if (!running) {
+      return undefined;
+    }
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+
+  if (!base) {
+    return null;
+  }
+  const sinceRead = running ? Math.max(0, Math.floor((now - base.readAt) / 1000)) : 0;
+  return base.seconds + sinceRead;
 }
 
 function formatClock(iso: string | null): string {
@@ -264,6 +324,10 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
   const [busy, setBusy] = useState(false);
   const [confirmingStop, setConfirmingStop] = useState(false);
   const elapsed = useElapsedSeconds(state);
+  const todayTotal = useTodayTotalSeconds(state.project ?? project, state.status);
+  // The day's total from the server; this session's own time only when the
+  // server has not answered yet (e.g. offline).
+  const totalSeconds = todayTotal ?? elapsed;
 
   const refresh = useCallback(async () => {
     const next = await sendToBackground<MonitoringState>('MONITORING_GET_STATE');
@@ -431,7 +495,7 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
             </div>
 
             <div className="grid grid-cols-2 gap-3">
-              <Metric label="Monitoring time" value={formatDuration(elapsed)} />
+              <Metric label="Total monitoring today" value={formatDuration(totalSeconds)} />
               <Metric label="Screenshots" value={String(state.screenshotCount)} />
               <Metric label="Interval" value={`${state.intervalSeconds}s`} />
               <Metric
@@ -460,6 +524,12 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
           <div className="rounded-xl border border-white/10 bg-dark-800/60 p-4 space-y-3">
             <div>
               <p className="text-sm font-semibold text-white">Entire Screen Monitoring</p>
+              {todayTotal !== null && (
+                <p className="mt-1 text-xs text-dark-300">
+                  Total monitoring today:{' '}
+                  <span className="font-semibold text-white">{formatDuration(todayTotal)}</span>
+                </p>
+              )}
               <p className="mt-1 text-xs text-dark-300 leading-5">
                 Your entire screen is captured while monitoring is active — always the whole screen,
                 never a single tab or window. The BestQ desktop agent takes the screenshots, so
@@ -501,6 +571,15 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
           </div>
         )}
 
+        {/* Why the last session ended when nobody pressed Stop — e.g. an hour
+            without input. Cleared by the next Start. */}
+        {isIdle && state.stopNotice && (
+          <p className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+            {state.stopNotice}
+          </p>
+        )}
+
         {state.error && !captureBroken && (
           <p className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
             {state.error}
@@ -511,7 +590,7 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
           <div className="rounded-xl border border-white/10 bg-dark-900 p-4 space-y-3">
             <p className="text-sm font-semibold text-white">Stop monitoring?</p>
             <div className="text-xs text-dark-300 space-y-1">
-              <p>Monitoring has been active for {formatDuration(elapsed)}.</p>
+              <p>Total monitoring today: {formatDuration(totalSeconds)}.</p>
               <p>{state.screenshotCount} screenshots captured.</p>
               {state.queuedSnapshots + state.pendingSyncItems > 0 && (
                 <p className="text-amber-300">
