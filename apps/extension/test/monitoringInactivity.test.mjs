@@ -21,6 +21,7 @@ import {
   parseLiveSessionId,
   agentHeartbeatStale,
   awayStopAt,
+  offlineStopAt,
 } from './.build/monitoringInactivity.js';
 
 let pass = 0, fail = 0;
@@ -263,6 +264,17 @@ t('a gap under the limit is recovered from, not stopped', () => {
 t('a gap of the limit or more ends the session at the last moment it was alive', () => {
   eq(awayStopAt(T0, T0 + 60 * MIN), T0);
   eq(awayStopAt(T0, T0 + 14 * HOUR()), T0);
+});
+
+// ── Network loss ──
+t('online, or not yet offline for the grace period → keep monitoring', () => {
+  eq(offlineStopAt(T0, T0 + 5 * MIN, true), null);
+  eq(offlineStopAt(T0, T0 + 30 * SEC, false), null);
+  eq(offlineStopAt(null, T0, false), null);
+});
+t('offline past the grace period → stop at the moment the network was lost', () => {
+  eq(offlineStopAt(T0, T0 + 61 * SEC, false), T0);
+  eq(offlineStopAt(T0, T0 + HOUR(), false), T0);
 });
 
 // ── Session hand-off ──

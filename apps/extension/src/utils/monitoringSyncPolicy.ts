@@ -86,12 +86,12 @@ export const SYNC_POLICY = {
 
   /**
    * A gap in the liveness log longer than this means the machine slept or the
-   * browser was closed. Matches the server's heartbeat timeout (five missed
+   * browser was closed. Matches the server's heartbeat timeout (three missed
    * one-minute heartbeats), so a gap short enough that the server would have
    * kept the session is treated the same way here — and anything longer is not
    * credited as monitored time when an expired session is re-settled.
    */
-  LIVENESS_GAP_MS: 5 * 60_000,
+  LIVENESS_GAP_MS: 3 * 60_000,
   MAX_LIVENESS_SEGMENTS: 200,
 
   /**
@@ -324,6 +324,45 @@ export function pickThinningVictims(
     alive.splice(best, 1);
   }
   return victims;
+}
+
+// ─── Activity payloads ────────────────────────────────────────────────────────
+
+/**
+ * The API's own size limits for an activity row (`MonitoringActivityRQ`).
+ *
+ * A browser URL or page title over these fails bean validation, and the server
+ * then refuses the WHOLE batch with a plain 400 — no monitoring error code —
+ * which used to park every row in it for two days, showing "Uploading N
+ * activity records" long after everything else had landed.
+ */
+export const ACTIVITY_FIELD_LIMITS = {
+  clientActivityId: 128,
+  applicationName: 256,
+  applicationId: 256,
+  browserName: 128,
+  browserProfile: 256,
+  windowTitle: 1024,
+  domain: 256,
+  url: 2048,
+  pageTitle: 1024,
+} as const;
+
+/**
+ * An activity row trimmed to what the API accepts.
+ *
+ * Truncation loses nothing a report shows — a 3,000-character URL is almost all
+ * query string — whereas refusal loses the row and everything batched with it.
+ */
+export function sanitizeActivity<
+  T extends Partial<Record<keyof typeof ACTIVITY_FIELD_LIMITS, unknown>>,
+>(activity: T): T {
+  const out: Record<string, unknown> = { ...activity };
+  for (const [field, max] of Object.entries(ACTIVITY_FIELD_LIMITS)) {
+    const value = out[field];
+    if (typeof value === 'string' && value.length > max) out[field] = value.slice(0, max);
+  }
+  return out as T;
 }
 
 // ─── Activity batch responses ─────────────────────────────────────────────────

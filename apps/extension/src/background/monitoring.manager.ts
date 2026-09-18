@@ -84,6 +84,7 @@ import {
   agentIdleStarted,
   autoStopAt,
   awayStopAt,
+  offlineStopAt,
   browserIdleChanged,
   idleBoundsFromProbes,
   idleEnded,
@@ -96,6 +97,7 @@ import {
   type OsIdleState,
 } from '@/utils/monitoringInactivity';
 import { getAssignedProjects, resolveDefaultProject } from '@/services/projects';
+import { sanitizeActivity } from '@/utils/monitoringSyncPolicy';
 import {
   configureSync,
   deliverSessionEvents,
@@ -164,6 +166,26 @@ let continuationInFlight: Promise<void> | null = null;
 // that was lost that way left a period open for the rest of the session. The
 // handler checks the session state itself.
 chrome.idle?.onStateChanged?.addListener(onIdleStateChanged);
+
+// The device's own connectivity. The minute tick checks `navigator.onLine`
+// regardless; these catch the exact moment while the worker is awake (the
+// agent's port keeps it so during monitoring).
+if (typeof self !== 'undefined' && typeof self.addEventListener === 'function') {
+  self.addEventListener('offline', () => {
+    void (async () => {
+      await hydrate();
+      if (!isMonitoringSessionLive() || state.networkLostAt) return;
+      await persist({ networkLostAt: new Date().toISOString() });
+      setTimeout(() => void endIfOffline(), INACTIVITY_POLICY.NETWORK_LOSS_GRACE_MS + 1_000);
+    })();
+  });
+  self.addEventListener('online', () => {
+    void (async () => {
+      await hydrate();
+      if (state.networkLostAt) await persist({ networkLostAt: null });
+    })();
+  });
+}
 
 // ─── State plumbing ───────────────────────────────────────────────────────────
 
@@ -234,10 +256,14 @@ async function settleActivityWrites(): Promise<void> {
   }
 }
 
-export function configureMonitoringOffscreen(_bridge: {
+export function configureMonitoringOffscreen(bridge: {
   ensureDocument: () => Promise<void>;
   send: (type: string, payload?: unknown) => Promise<unknown>;
+  /** True while a screen recording is showing its own badge. */
+  isRecording?: () => boolean;
 }): void {
+  if (bridge.isRecording) recordingOwnsBadgeHook = bridge.isRecording;
+
   // Closed activity intervals go straight to the outbox, filed under whatever
   // session is current at the moment they close.
   configureActivitySink(async (activity) => {
@@ -246,7 +272,7 @@ export function configureMonitoringOffscreen(_bridge: {
       console.warn('[Monitoring] an activity interval closed with no session to file it under');
       return;
     }
-    await enqueueActivity(state.sessionId, state.project, activity);
+    await enqueueActivity(state.sessionId, state.project, sanitizeActivity(activity));
   });
 
   configureSync({
@@ -281,6 +307,8 @@ export function configureMonitoringOffscreen(_bridge: {
         if (sessionId === state.sessionId) await continueAfterRemoteClose();
       })();
     },
+    isCurrentSession: (sessionId) =>
+      sessionId === state.sessionId && state.status !== 'idle' && state.status !== 'error',
   });
 
   configureNativeAgent({
@@ -577,6 +605,41 @@ async function endIfAwayTooLong(): Promise<boolean> {
   await stopMonitoringSession({
     at: new Date(stopAt),
     notice: `Monitoring stopped because this computer was off, asleep or not running Chrome from ${since}. Start it again when you are ready.`,
+  });
+  return true;
+}
+
+function formatStopTime(ms: number): string {
+  return new Date(ms).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+/**
+ * End the session if this device has been offline past the grace period.
+ *
+ * Losing the network ends monitoring, dated to when it was lost. A backend that
+ * is down while the device is online does not count — that keeps monitoring
+ * and uploads later — and neither does a switch between networks that is over
+ * within the grace period.
+ */
+async function endIfOffline(): Promise<boolean> {
+  await hydrate();
+  if (state.status !== 'monitoring' && state.status !== 'paused') return false;
+  const online = typeof navigator === 'undefined' || navigator.onLine !== false;
+  if (online) {
+    if (state.networkLostAt) await persist({ networkLostAt: null });
+    return false;
+  }
+
+  const recorded = state.networkLostAt ? Date.parse(state.networkLostAt) : NaN;
+  const lostAt = Number.isFinite(recorded) ? recorded : Date.now();
+  if (!state.networkLostAt) await persist({ networkLostAt: new Date(lostAt).toISOString() });
+
+  const stopAt = offlineStopAt(lostAt, Date.now(), false);
+  if (stopAt == null) return false;
+  console.warn('[Monitoring] this device lost its network — ending the session');
+  await stopMonitoringSession({
+    at: new Date(stopAt),
+    notice: `Monitoring stopped because this computer lost its internet connection at ${formatStopTime(stopAt)}. Start it again once you are back online.`,
   });
   return true;
 }
@@ -959,6 +1022,10 @@ async function runStop(options: { at?: Date; notice?: string }): Promise<Monitor
     stopNotice: options.notice ?? null,
   });
   clearMonitoringBadge();
+  // Anything of this session parked while it might still have continued is
+  // re-judged now that it has ended — accepted, or dropped as captured after
+  // the end — instead of showing as "uploading" until its next retry.
+  if (sessionId) await unparkSession(sessionId).catch(() => undefined);
   void drainSync('sweep');
   return state;
 }
@@ -1091,6 +1158,24 @@ async function runContinuation(): Promise<void> {
     await stopMonitoringSession({
       notice:
         'Your administrator stopped this monitoring session. Start it again when you are asked to.',
+    });
+    return;
+  }
+
+  // Expired: the server stopped hearing from this machine — network gone,
+  // laptop asleep or shut down. That ends monitoring; it is not resumed in a new
+  // session behind the person's back. The session ends where the server last
+  // heard from us. (An older server sends no reason, but the status says it.)
+  if (
+    closed?.endReason === 'EXPIRED' ||
+    (closed && !closed.endReason && closed.status === 'EXPIRED')
+  ) {
+    const lastHeard = state.lastServerContactAt ? Date.parse(state.lastServerContactAt) : NaN;
+    const at = Number.isFinite(lastHeard) ? lastHeard : Date.now();
+    console.warn(`[Monitoring] session ${closedId} expired while this machine was unreachable`);
+    await stopMonitoringSession({
+      at: new Date(at),
+      notice: `Monitoring stopped because this computer was offline, asleep or switched off from ${formatStopTime(at)}. Start it again when you are ready.`,
     });
     return;
   }
@@ -1246,6 +1331,9 @@ export async function handleMonitoringAlarm(): Promise<void> {
   // A machine that was off, asleep or not running Chrome for the whole limit:
   // the session ends where it stopped being monitored, not now.
   if (await endIfAwayTooLong()) return;
+
+  // This device lost its network: past the grace period, monitoring ends.
+  if (await endIfOffline()) return;
 
   // Proof of life, recorded locally before anything can fail.
   await noteAlive();
@@ -1597,7 +1685,34 @@ export function isMonitoringSessionLive(): boolean {
  * once and must not look like the same thing. A capture problem turns it amber
  * so a broken session is visible without opening the popup.
  */
+/** Whether a screen recording currently owns the toolbar badge. Set by index.ts. */
+let recordingOwnsBadgeHook: () => boolean = () => false;
+
+/** Never throws: read during module load, the hook's variable may not exist yet. */
+function recordingOwnsBadge(): boolean {
+  try {
+    return recordingOwnsBadgeHook();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Show monitoring's badge if a session is running, clear it if not.
+ *
+ * For callers outside monitoring — above all a recording finishing, which used
+ * to clear the badge outright and leave a running session with no MON on the
+ * toolbar.
+ */
+export async function refreshMonitoringBadge(): Promise<void> {
+  await hydrate();
+  if (isMonitoringSessionLive()) setMonitoringBadge();
+  else if (!recordingOwnsBadge()) clearMonitoringBadge();
+}
+
 function setMonitoringBadge(): void {
+  // A recording in progress shows REC; monitoring's badge returns when it ends.
+  if (recordingOwnsBadge()) return;
   const broken =
     state.capture.status === 'reconnect' ||
     state.capture.status === 'failed' ||

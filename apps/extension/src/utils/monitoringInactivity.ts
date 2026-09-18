@@ -50,6 +50,13 @@ export const INACTIVITY_POLICY = {
    * own way, so at the crossing the OS may still read a few seconds short.
    */
   CONFIRM_SLACK_SECONDS: 20,
+
+  /**
+   * How long the device may be offline before monitoring stops itself. Long
+   * enough for a Wi-Fi ↔ hotspot switch; short enough that losing the network
+   * ends the session within a minute or two, as intended.
+   */
+  NETWORK_LOSS_GRACE_MS: 60_000,
 } as const;
 
 export type OsIdleState = 'active' | 'idle' | 'locked';
@@ -386,6 +393,24 @@ export function awayStopAt(
 ): number | null {
   if (lastAliveMs == null || !Number.isFinite(lastAliveMs)) return null;
   return nowMs - lastAliveMs >= limitMs ? lastAliveMs : null;
+}
+
+/**
+ * When monitoring should stop because the device lost its network, or null.
+ *
+ * Only a device that is itself offline (`navigator.onLine` false) counts: a
+ * backend that is down while the device is online keeps monitoring and uploads
+ * later. The stop is dated to when the network was lost, not when it was
+ * noticed to have stayed lost.
+ */
+export function offlineStopAt(
+  networkLostAtMs: number | null,
+  nowMs: number,
+  online: boolean,
+  graceMs: number = INACTIVITY_POLICY.NETWORK_LOSS_GRACE_MS,
+): number | null {
+  if (online || networkLostAtMs == null || !Number.isFinite(networkLostAtMs)) return null;
+  return nowMs - networkLostAtMs >= graceMs ? networkLostAtMs : null;
 }
 
 // ─── Session hand-off ─────────────────────────────────────────────────────────

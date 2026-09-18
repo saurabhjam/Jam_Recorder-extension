@@ -28,6 +28,8 @@ import {
   pickThinningVictims,
   parseBatchErrors,
   successorFor,
+  sanitizeActivity,
+  ACTIVITY_FIELD_LIMITS,
 } from './.build/monitoringSyncPolicy.js';
 
 let pass = 0, fail = 0;
@@ -220,6 +222,22 @@ t('frames in the protected live window are never thinned', () => {
 });
 
 // ── Activity batch responses ──
+t('activity rows are trimmed to the API limits instead of failing their batch', () => {
+  const row = sanitizeActivity({
+    clientActivityId: 'a-1',
+    url: 'https://jira.example.com/browse/X?' + 'q'.repeat(5000),
+    pageTitle: 't'.repeat(3000),
+    windowTitle: 'w'.repeat(2000),
+    domain: 'jira.example.com',
+    startedAt: 'x',
+  });
+  eq(row.url.length, ACTIVITY_FIELD_LIMITS.url);
+  eq(row.pageTitle.length, ACTIVITY_FIELD_LIMITS.pageTitle);
+  eq(row.windowTitle.length, ACTIVITY_FIELD_LIMITS.windowTitle);
+  eq(row.domain, 'jira.example.com');
+  eq(row.startedAt, 'x');
+});
+
 t('per-row batch errors are keyed by clientActivityId', () => {
   const parsed = parseBatchErrors([
     'abc123: MONITORING_SESSION_NOT_ACTIVE: activity started after the session ended',

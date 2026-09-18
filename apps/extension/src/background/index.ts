@@ -38,6 +38,7 @@ import {
   handleMonitoringAlarm,
   handleMonitoringSyncAlarm,
   handleMonitoringOffscreenMessage,
+  refreshMonitoringBadge,
   noteActivePage,
   noteBrowserBlurred,
   reconnectMonitoringCapture,
@@ -129,6 +130,7 @@ function sendToOffscreen(type: string, payload?: unknown): Promise<unknown> {
 configureMonitoringOffscreen({
   ensureDocument: ensureOffscreenDocument,
   send: sendToOffscreen,
+  isRecording: () => isRecordingActive,
 });
 
 // Run on every worker start, not only `onStartup` — the worker is woken by
@@ -540,8 +542,13 @@ function setBadge(text: string, color: string): void {
   chrome.action.setBadgeBackgroundColor({ color });
 }
 
+/**
+ * A recording's badge is done with. Monitoring's MON comes back if a session is
+ * running — clearing outright used to leave a live monitoring session with no
+ * badge at all until its next minute tick, or none if the worker slept first.
+ */
 function clearBadge(): void {
-  chrome.action.setBadgeText({ text: '' });
+  void refreshMonitoringBadge();
 }
 
 // ─── Timer ────────────────────────────────────────────────────────────────────

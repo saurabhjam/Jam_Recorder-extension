@@ -85,6 +85,7 @@ import {
   probeDelayMs,
   recoveryDelayMs,
   successorFor,
+  sanitizeActivity,
   type FailureKind,
   type SyncLane,
 } from '@/utils/monitoringSyncPolicy';
@@ -115,6 +116,15 @@ interface SyncHooks {
   onSnapshotStored: (sessionId: string, capturedAt: string) => void | Promise<void>;
   /** The server has just said this session no longer accepts data. */
   onSessionClosed: (sessionId: string) => void | Promise<void>;
+  /**
+   * Is this the session monitoring is running in right now?
+   *
+   * Data a closed session refuses is worth holding only while monitoring may
+   * still continue from it — then a successor session can take it. For a
+   * session that has simply ended (stopped, by the user, an administrator or a
+   * lost connection) it was captured after the end and belongs nowhere.
+   */
+  isCurrentSession?: (sessionId: string) => boolean;
 }
 
 let hooks: SyncHooks | null = null;
@@ -337,6 +347,12 @@ async function settleFailure<T extends QueuedItemState>(context: {
       const successor = successorFor(session, context.producedAtMs);
       if (successor) {
         await context.rehome(successor);
+        return 'done';
+      }
+      if (hooks?.isCurrentSession && !hooks.isCurrentSession(context.sessionId)) {
+        // Captured after its session ended, with nowhere else to go. Holding it
+        // would only show as "uploading" for two days.
+        await context.save(kill(entry, `After its session ended: ${message}`));
         return 'done';
       }
       await context.save(park(entry, message));
@@ -664,16 +680,23 @@ async function sendActivityRows(rows: QueuedActivityRecord[], pass: Pass): Promi
 
   let response: ActivityBatchResponse | undefined;
   try {
+    // Trimmed at send time too, so rows queued by an older build — which could
+    // exceed the API's limits and sink their whole batch — go through now.
     response = await sendActivityBatch(
       project,
       sessionId,
-      rows.map((row) => row.payload),
+      rows.map((row) => sanitizeActivity(row.payload)),
     );
   } catch (err) {
     const kind = kindOf(err);
     const message = messageOf(err);
+    // A plain 400 on a batch is bean validation of one of its rows, not a proxy:
+    // it gets the same isolate-the-bad-row treatment as a monitoring verdict.
+    const invalidPayload =
+      kind === 'rejected' ||
+      (kind === 'unrecognised' && err instanceof MonitoringApiError && err.status === 400);
 
-    if (kind === 'rejected' && rows.length > 1) {
+    if (invalidPayload && rows.length > 1) {
       // One malformed row fails validation for the whole request. Halve until
       // it is alone, so it cannot take its neighbours down with it.
       await recordAnswer(pass);
@@ -693,6 +716,11 @@ async function sendActivityRows(rows: QueuedActivityRecord[], pass: Pass): Promi
         await patchActivities(rows.map((row) => kill(row, message)));
         return;
       case 'unrecognised':
+        if (invalidPayload) {
+          await recordAnswer(pass);
+          await patchActivities(rows.map((row) => kill(row, message)));
+          return;
+        }
         await patchActivities(rows.map((row) => park(row, message)));
         return;
       default: {
@@ -735,10 +763,13 @@ async function rehomeOrPark(
   message: string,
 ): Promise<void> {
   const session = await getSyncSession(sessionId);
+  const ended = Boolean(hooks?.isCurrentSession && !hooks.isCurrentSession(sessionId));
   let parked = false;
   const updated = rows.map((row) => {
     const successor = successorFor(session, Date.parse(row.payload.startedAt));
     if (successor) return { ...row, sessionId: successor };
+    // See settleFailure: after an ended session, there is nowhere to hold it for.
+    if (ended) return kill(row, `After its session ended: ${message}`);
     parked = true;
     return park(row, message);
   });

@@ -120,8 +120,8 @@ async function settle(rounds = 40) {
 // ─── Simulated server ─────────────────────────────────────────────────────────
 
 const THRESHOLD = 120;
-const HEARTBEAT_TIMEOUT = 5 * 60 * 1000;
-const DISCONNECTED_AFTER = 150 * 1000;
+const HEARTBEAT_TIMEOUT = 3 * 60 * 1000;
+const DISCONNECTED_AFTER = 120 * 1000;
 
 class FakeServer {
   constructor() {
@@ -296,6 +296,7 @@ class FakeServer {
           // Re-settle: never shorter, always COMPLETED.
           s.endedAt = Math.max(s.endedAt, Math.min(requested, NOW));
           s.status = 'COMPLETED';
+          s.endReason = 'CLIENT';
           return reply(200, {});
         }
         if (!isLive) return reply(200, {});
@@ -324,12 +325,25 @@ class FakeServer {
       }
       case '/inactivity/end': {
         if (!isLive && !this.acceptsLate(s)) return notActive();
-        if (!this.openPeriod(s)) return refuse(404, 'MONITORING_INACTIVITY_NOT_FOUND', 'nothing open');
+        if (!this.openPeriod(s)) {
+          // The period the sweeper cut at the last heartbeat is carried on to the real end.
+          const requested = Date.parse(body.endedAt);
+          const cut = !isLive && s.periods.find((p) => p.end === s.lastHeartbeatAt);
+          if (cut && requested > cut.end) {
+            cut.end = s.endedAt != null ? Math.min(requested, s.endedAt) : requested;
+            return reply(200, {});
+          }
+          return refuse(404, 'MONITORING_INACTIVITY_NOT_FOUND', 'nothing open');
+        }
         this.closeOpen(s, Date.parse(body.endedAt));
         return reply(200, {});
       }
       case '/activities/batch': {
         if (!isLive && !this.acceptsLate(s)) return notActive();
+        // Bean validation, as the real API does it: one over-long field refuses
+        // the whole batch with a plain 400 and no monitoring code.
+        const tooLong = body.activities.find((a) => (a.url?.length ?? 0) > 2048 || (a.pageTitle?.length ?? 0) > 1024);
+        if (tooLong) return reply(400, { errorCode: 4001, message: "Incorrect Request. [Field 'activities[0].url' should have size from 0 to 2048.]" });
         let accepted = 0, duplicates = 0;
         for (const a of body.activities) {
           if (s.activities.has(a.clientActivityId)) duplicates++;
@@ -384,6 +398,12 @@ class FakeOs {
   constructor() {
     this.lastInputAt = NOW;
     this.working = true;
+    /**
+     * After a wake-up the person's first keypress comes a little later. Until
+     * then the OS idle counter still includes the whole time asleep — which is
+     * what a real machine reports, and what the agent samples first.
+     */
+    this.inputResumesAt = 0;
   }
   idleSeconds() {
     return Math.max(0, (NOW - this.lastInputAt) / SEC);
@@ -584,7 +604,12 @@ function makeChrome(env) {
         hasListener: (f) => idleListeners.has(f),
       },
     },
-    action: { setBadgeText: async () => {}, setBadgeBackgroundColor: async () => {} },
+    action: {
+      setBadgeText: async ({ text }) => {
+        env.badge = text;
+      },
+      setBadgeBackgroundColor: async () => {},
+    },
     tabs: { query: async () => [] },
   };
 }
@@ -607,12 +632,28 @@ async function environment({ store, server, keepClock = false } = {}) {
   globalThis.chrome = env.chrome;
   globalThis.indexedDB = new fakeIdb.IDBFactory();
   globalThis.IDBKeyRange = fakeIdb.IDBKeyRange;
-  globalThis.fetch = (url, init) => env.server.fetch(url, init);
+  // The device's own connectivity: offline, `navigator.onLine` is false and no
+  // request leaves the machine.
+  env.online = true;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { get onLine() { return env.online; } },
+    configurable: true,
+    writable: true,
+  });
+  globalThis.fetch = (url, init) =>
+    env.online ? env.server.fetch(url, init) : Promise.reject(new TypeError('Failed to fetch'));
+  env.setOnline = (online) => { env.online = online; };
+  env.badge = '';
+  env.recording = false;
 
   // A fresh module instance per scenario: its own in-memory worker state, as
   // a fresh service worker would have.
   env.worker = await import(`${pathToFileURL(bundlePath).href}?scenario=${++scenarioCount}`);
-  env.worker.configureMonitoringOffscreen({ ensureDocument: async () => {}, send: async () => {} });
+  env.worker.configureMonitoringOffscreen({
+    ensureDocument: async () => {},
+    send: async () => {},
+    isRecording: () => env.recording,
+  });
   await env.worker.restoreMonitoringSession();
   await settle();
 
@@ -637,7 +678,7 @@ async function environment({ store, server, keepClock = false } = {}) {
     const end = NOW + ms;
     while (NOW < end) {
       NOW = Math.min(NOW + 5 * SEC, end);
-      if (env.os.working) env.os.lastInputAt = NOW;
+      if (env.os.working && NOW >= env.os.inputResumesAt) env.os.lastInputAt = NOW;
       env.agent.sample();
       if ((NOW - T0) % (30 * SEC) === 0) {
         env.agent.frame();
@@ -664,7 +705,8 @@ async function environment({ store, server, keepClock = false } = {}) {
       NOW = Math.min(NOW + MIN, end);
       env.server.sweep();
     }
-    env.os.lastInputAt = env.os.working ? NOW : env.os.lastInputAt;
+    // Waking is not input: the counter keeps the time asleep until the first keypress.
+    env.os.inputResumesAt = NOW + 20 * SEC;
     await settle();
   };
 
@@ -697,6 +739,15 @@ const ok = (cond, message) => { if (!cond) throw new Error(message ?? 'expected 
 const near = (actual, expected, tolerance, what) =>
   ok(Math.abs(actual - expected) <= tolerance, `${what}: ${actual} not within ${tolerance} of ${expected}`);
 const minutes = (seconds) => Math.round((seconds / 60) * 10) / 10;
+/** Inactive minutes across every session on the server, with the periods, for failure messages. */
+const inactiveReport = (server) => {
+  const total = [...server.sessions.values()].reduce((sum, s) => sum + server.inactiveSeconds(s.id), 0);
+  const detail = [...server.sessions.values()].map((s) =>
+    `${s.id.slice(-3)}[${s.status}/${s.endReason ?? '-'} ${((s.startedAt - T0) / MIN).toFixed(1)}→${s.endedAt == null ? 'live' : ((s.endedAt - T0) / MIN).toFixed(1)}] ` +
+    s.periods.map((p) => `${((p.start - T0) / MIN).toFixed(1)}→${p.end == null ? 'open' : ((p.end - T0) / MIN).toFixed(1)}`).join(','),
+  ).join(' | ');
+  return { minutes: minutes(total), detail };
+};
 
 // ─── Issue 1: working, but reported inactive ──────────────────────────────────
 
@@ -972,44 +1023,42 @@ async function machineGone(env, awayMs) {
   return next;
 }
 
-await scenario('internet lost for 20 min while working → session never stuck; nothing lost; recovers by itself', async () => {
+await scenario('internet lost while working → monitoring stops within ~2 min, session ends at the loss; nothing stuck', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(10 * MIN);
-  env.server.down = true; // this client's network, not the server:
-  env.server.sweeping = true; // the server keeps sweeping
-  env.server.down = false;
-  const realFetch = env.server.fetch.bind(env.server);
-  env.server.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
-  await env.advance(20 * MIN);
-  ok(env.session(first.sessionId).status === 'EXPIRED', 'the server stops showing it as live');
-  env.server.fetch = realFetch;
-  await env.advance(25 * MIN); // reconnect; backlog drains in paced batches
+  const lostAt = NOW;
+  env.setOnline(false);
+  await env.advance(3 * MIN);
   const state = await env.state();
-  ok(state.status === 'monitoring', `status ${state.status}`);
-  ok(state.sessionId !== first.sessionId, 'continued in a new session');
+  ok(state.status === 'idle', `status ${state.status} three minutes after the network went`);
+  ok(/lost its internet connection/.test(state.stopNotice ?? ''), `notice: ${state.stopNotice}`);
+  env.setOnline(true);
+  await env.advance(10 * MIN); // back online: queued data and the stop go up
   const old = env.session(first.sessionId);
-  ok(old.status === 'COMPLETED', `old session ${old.status}`);
-  ok(old.endedAt >= T0 + 29 * MIN, 'the outage was re-settled as monitored time (the person was working)');
-  ok(env.server.totalSnapshots() === env.agent.framesSent,
-    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
-  await env.stop();
+  ok(old.status === 'COMPLETED', `session ${old.status}`);
+  near((old.endedAt - lostAt) / MIN, 0, 1.2, 'session end vs the network loss (min)');
+  ok(env.server.sessions.size === 1, 'no new session was started by itself');
+  ok(env.session(first.sessionId).snapshots.size >= 19, 'everything from before the loss was uploaded');
+  const after = await env.state();
+  ok(after.queuedSnapshots + after.pendingSyncItems === 0,
+    `still "uploading": ${after.queuedSnapshots} screenshots, ${after.pendingSyncItems} records`);
+  ok(inactiveReport(env.server).minutes === 0, inactiveReport(env.server).detail);
   const again = await env.start();
-  ok(again.status === 'monitoring' && again.sessionId, 'can start again normally');
+  ok(again.status === 'monitoring' && again.sessionId !== first.sessionId, 'starts again normally');
   return env;
 });
 
-await scenario('network switch (Wi-Fi → hotspot, 40 s gap) → same session, nothing lost', async () => {
+await scenario('network switch (Wi-Fi → hotspot, 40 s offline) → same session, nothing lost', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(5 * MIN);
-  const realFetch = env.server.fetch.bind(env.server);
-  env.server.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+  env.setOnline(false);
   await env.advance(40 * SEC);
-  env.server.fetch = realFetch;
+  env.setOnline(true);
   await env.advance(8 * MIN);
   const state = await env.state();
-  ok(state.sessionId === first.sessionId, 'the same session');
+  ok(state.status === 'monitoring' && state.sessionId === first.sessionId, `${state.status}`);
   ok(env.session(first.sessionId).status === 'ACTIVE');
   ok(env.server.totalSnapshots() === env.agent.framesSent,
     `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
@@ -1033,25 +1082,29 @@ await scenario('laptop shut down for 3 h → server expires it within minutes; o
   ok(/off, asleep or not running Chrome/.test(state.stopNotice ?? ''), `notice ${state.stopNotice}`);
   const old = next.session(first.sessionId);
   near((old.endedAt - shutdownAt) / MIN, 0, 1.5, 'session end vs shutdown (min)');
+  const idle2 = inactiveReport(next.server);
+  ok(idle2.minutes === 0, `worked until shutdown, yet ${idle2.minutes} min inactive: ${idle2.detail}`);
   const started = await next.start();
   ok(started.status === 'monitoring' && started.sessionId !== first.sessionId, `start: ${started.error}`);
   return next;
 });
 
-await scenario('laptop asleep 20 min → wakes into a new session; the sleep is not counted as monitored', async () => {
+await scenario('laptop asleep 20 min → server ends it within minutes; on wake monitoring stays stopped', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(15 * MIN);
   const sleptAt = NOW;
-  await env.jump(20 * MIN); // agent and worker suspended, not killed
-  await env.advance(5 * MIN);
+  await env.jump(5 * MIN);
+  ok(env.session(first.sessionId).status === 'EXPIRED', `after 5 min asleep: ${env.session(first.sessionId).status}`);
+  await env.jump(15 * MIN);
+  await env.advance(3 * MIN);
   const state = await env.state();
-  ok(state.status === 'monitoring', `status ${state.status}`);
-  ok(state.sessionId !== first.sessionId, 'continued in a new session');
-  const old = env.session(first.sessionId);
-  near((old.endedAt - sleptAt) / MIN, 0, 1.5, 'old session end vs sleep (min)');
-  const fresh = env.session(state.sessionId);
-  ok(fresh.startedAt >= sleptAt + 19 * MIN, 'the new session starts at wake-up');
+  ok(state.status === 'idle', `status on wake ${state.status}`);
+  ok(/offline, asleep or switched off/.test(state.stopNotice ?? ''), `notice ${state.stopNotice}`);
+  ok(env.server.sessions.size === 1, 'no new session was started by itself');
+  near((env.session(first.sessionId).endedAt - sleptAt) / MIN, 0, 1.5, 'session end vs sleep (min)');
+  const after = await env.state();
+  ok(after.queuedSnapshots + after.pendingSyncItems === 0, 'nothing left "uploading"');
   return env;
 });
 
@@ -1068,7 +1121,7 @@ await scenario('Chrome crash or restart, back within 2 min → the same session 
   return next;
 });
 
-await scenario('browser closed for 40 min, reopened → resumes in a new session, the gap not credited', async () => {
+await scenario('browser closed 40 min, reopened → the session was ended; monitoring stays stopped', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(10 * MIN);
@@ -1076,8 +1129,9 @@ await scenario('browser closed for 40 min, reopened → resumes in a new session
   const next = await machineGone(env, 40 * MIN);
   await next.advance(3 * MIN);
   const state = await next.state();
-  ok(state.status === 'monitoring' && state.sessionId !== first.sessionId, `${state.status}`);
-  near((next.session(first.sessionId).endedAt - closedAt) / MIN, 0, 1.5, 'old end vs close (min)');
+  ok(state.status === 'idle', `${state.status}`);
+  ok(next.server.sessions.size === 1, 'no new session was started by itself');
+  near((next.session(first.sessionId).endedAt - closedAt) / MIN, 0, 1.5, 'session end vs close (min)');
   return next;
 });
 
@@ -1145,6 +1199,128 @@ await scenario('no heartbeat for hours with Chrome running but asleep → never 
   return env;
 });
 
+// ─── Inactivity across a disconnect: active time stays active ─────────────────
+
+await scenario('Wi-Fi drops while working → the session ends at the drop, with no inactivity', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(15 * MIN);
+  env.setOnline(false);
+  await env.advance(20 * MIN);
+  env.setOnline(true);
+  await env.advance(10 * MIN);
+  const idle = inactiveReport(env.server);
+  ok(idle.minutes === 0, `${idle.minutes} min inactive for someone who worked: ${idle.detail}`);
+  return env;
+});
+
+await scenario('laptop lid closed 20 min, opened, work → the sleep is not inactivity and work is active', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(30 * MIN);
+  await env.jump(20 * MIN);
+  await env.advance(15 * MIN);
+  await env.stop();
+  const idle = inactiveReport(env.server);
+  ok(idle.minutes <= 1, `${idle.minutes} min inactive: ${idle.detail}`);
+  return env;
+});
+
+await scenario('laptop lid closed 40 min, opened, work → no inactivity', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(30 * MIN);
+  await env.jump(40 * MIN);
+  await env.advance(15 * MIN);
+  await env.stop();
+  const idle = inactiveReport(env.server);
+  ok(idle.minutes <= 1, `${idle.minutes} min inactive: ${idle.detail}`);
+  return env;
+});
+
+await scenario('laptop shut down after 1 h of work, back 30 min later → first session has no inactivity', async () => {
+  const env = await environment();
+  const first = await env.start();
+  await env.advance(60 * MIN);
+  const next = await machineGone(env, 30 * MIN);
+  next.os.inputResumesAt = NOW + 20 * SEC;
+  await next.advance(10 * MIN);
+  await next.stop();
+  ok(next.server.inactiveSeconds(first.sessionId) === 0, inactiveReport(next.server).detail);
+  const idle = inactiveReport(next.server);
+  ok(idle.minutes <= 1, `${idle.minutes} min inactive: ${idle.detail}`);
+  return next;
+});
+
+await scenario('idle, then Wi-Fi drops while still idle → inactive up to the drop, the session ends there', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(15 * MIN);
+  env.os.working = false;
+  await env.advance(5 * MIN);
+  env.setOnline(false);
+  await env.advance(5 * MIN);
+  env.os.working = true;
+  env.setOnline(true);
+  await env.advance(10 * MIN);
+  const idle = inactiveReport(env.server);
+  // Idle from 15 until the session ended at the loss (seen at the next minute tick).
+  near(idle.minutes, 6, 1.5, `inactive minutes (${idle.detail})`);
+  return env;
+});
+
+await scenario('walks away (idle), laptop sleeps 30 min, wakes, agent restarted, works 1 h → only the real idle', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(30 * MIN);
+  env.os.working = false;
+  await env.advance(6 * MIN); // idle period opens (threshold 2 min)
+  await env.jump(30 * MIN); // lid closes
+  env.os.working = true;
+  env.agent.crash(); // the old stale-heartbeat check killed it on wake
+  await new Promise((r) => setTimeout(r, 1200));
+  await env.advance(60 * MIN);
+  await env.stop();
+  const idle = inactiveReport(env.server);
+  // Idle from 30 min until the lid closed at 36 — not the sleep, not the hour of work after.
+  near(idle.minutes, 6, 1.5, `inactive minutes (${idle.detail})`);
+  return env;
+});
+
+// ─── Uploads that never finished; the MON badge ───────────────────────────────
+
+await scenario('a page with a very long URL and title does not hold up its batch', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(MIN);
+  await env.worker.noteActivePage({ id: 1, url: 'https://jira.example.com/browse/X?' + 'q'.repeat(5000), title: 't'.repeat(3000) });
+  await env.advance(MIN);
+  await env.worker.noteActivePage({ id: 2, url: 'https://example.com/other', title: 'Other' });
+  await env.advance(3 * MIN);
+  const state = await env.state();
+  const rows = [...[...env.server.sessions.values()][0].activities.values()];
+  ok(rows.some((a) => a.url?.startsWith('https://jira.example.com') && a.url.length === 2048), 'the long row landed, trimmed');
+  ok(state.pendingSyncItems === 0, `${state.pendingSyncItems} activity records still "uploading"`);
+  return env;
+});
+
+await scenario('MON shows while monitoring, survives a recording, and clears when stopped', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(MIN);
+  ok(env.badge === 'MON', `badge "${env.badge}" while monitoring`);
+  env.recording = true; // a screen recording starts and shows REC
+  env.badge = 'REC';
+  await env.advance(2 * MIN);
+  ok(env.badge === 'REC', `the minute tick overwrote the recording badge: "${env.badge}"`);
+  env.recording = false; // recording ends: index.ts calls refreshMonitoringBadge()
+  await env.worker.refreshMonitoringBadge();
+  ok(env.badge === 'MON', `badge "${env.badge}" after the recording ended`);
+  await env.stop();
+  ok(env.badge === '', `badge "${env.badge}" after stopping`);
+  return env;
+});
+
 // ─── An administrator stops a member's monitoring ─────────────────────────────
 
 await scenario('admin stops a member while they work → extension stops within a minute and does not restart', async () => {
@@ -1184,14 +1360,15 @@ await scenario('admin clears a member whose laptop is off → ends at the last b
   return next;
 });
 
-await scenario('an expiry is still recovered from (only ADMIN means stay stopped)', async () => {
+await scenario('a server expiry ends monitoring here too — it is not resumed in a new session', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(5 * MIN);
   env.server.expire(first.sessionId);
   await env.advance(2 * MIN);
   const state = await env.state();
-  ok(state.status === 'monitoring' && state.sessionId !== first.sessionId, `${state.status}`);
+  ok(state.status === 'idle', `${state.status}`);
+  ok(env.server.sessions.size === 1, 'no new session was started by itself');
   return env;
 });
 

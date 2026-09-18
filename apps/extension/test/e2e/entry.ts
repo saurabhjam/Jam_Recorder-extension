@@ -17,6 +17,8 @@ export {
   restoreMonitoringSession,
   handleMonitoringAlarm,
   handleMonitoringSyncAlarm,
+  noteActivePage,
+  refreshMonitoringBadge,
 } from '../../src/background/monitoring.manager';
 
 import { stopSyncSweep } from '../../src/background/monitoring.sync';

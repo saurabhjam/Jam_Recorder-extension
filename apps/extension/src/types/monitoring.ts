@@ -462,6 +462,11 @@ export interface MonitoringState {
    */
   stopNotice: string | null;
   /**
+   * When this device was seen to lose its network, while monitoring. Cleared
+   * when it comes back; past a short grace period the session ends there.
+   */
+  networkLostAt: string | null;
+  /**
    * When the server stopped being reachable, or null while it is.
    *
    * Monitoring carries on regardless — everything is kept on this machine and
@@ -535,6 +540,7 @@ export const INITIAL_MONITORING_STATE: MonitoringState = {
   pendingIdleSince: null,
   inactivityNotBefore: null,
   stopNotice: null,
+  networkLostAt: null,
   offlineSince: null,
   lastServerContactAt: null,
   pauseHistory: [],
