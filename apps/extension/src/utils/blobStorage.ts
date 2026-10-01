@@ -35,6 +35,41 @@ export function systemBlobKey(recordingId: string): string {
   return `${recordingId}::sys`;
 }
 
+/**
+ * The id a recording's processed (trimmed/re-mixed) file is stored under.
+ *
+ * Separate from the recording's own id so both exist at once: the original is
+ * the thing that must never be lost, and it stays on disk until the server has
+ * confirmed the processed one. The suffix keeps it out of the Drafts recovery
+ * sweep, which looks for recordings, not derivatives.
+ */
+export function exportIdFor(recordingId: string): string {
+  return `${recordingId}__export`;
+}
+
+/**
+ * Write a blob to OPFS under `id`, replacing anything already there.
+ *
+ * Used for the processed file, so an upload that has to be retried later — in
+ * another session, after a crash — never has to re-run a trim that can take as
+ * long as the recording itself.
+ */
+export async function saveBlobToOPFS(id: string, blob: Blob): Promise<boolean> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(recordingOpfsName(id), { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return true;
+  } catch (err) {
+    // Out of disk, or no OPFS here. The original is still on disk and the
+    // upload still goes ahead from memory; only the cheap retry is lost.
+    console.warn('[Storage] could not store the processed file:', err);
+    return false;
+  }
+}
+
 export function openRecordingIDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(IDB_NAME, 1);
@@ -139,6 +174,10 @@ export async function listStoredRecordings(): Promise<Array<{ id: string; size: 
       if (handle.kind !== 'file') continue;
       const match = /^recording-(.+)\.webm$/.exec(handle.name);
       if (!match?.[1]) continue;
+      // Processed copies live here too (see exportIdFor). They are derivatives
+      // of a recording that is itself on disk, so offering one as a recovered
+      // recording would show the same capture twice.
+      if (match[1].endsWith('__export')) continue;
       try {
         const file = await (handle as FileSystemFileHandle).getFile();
         if (file.size > 0) found.push({ id: match[1], size: file.size });

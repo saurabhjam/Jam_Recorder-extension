@@ -74,6 +74,7 @@ import {
   type MonitoringEventKind,
   newestCapturedAtMs,
 } from '@/utils/monitoringQueue';
+import { badgeFor, sameBadge, type BadgeView } from '@/utils/monitoringBadge';
 import {
   SYNC_POLICY,
   currentRunStartMs,
@@ -211,6 +212,10 @@ async function hydrate(): Promise<void> {
 async function persist(updates: Partial<MonitoringState>): Promise<void> {
   state = { ...state, ...updates };
   hydrated = true;
+  // Every change to what monitoring is doing goes through here, so this is the
+  // one place the badge has to be derived from to be right everywhere: a stop,
+  // a pause, a lost agent, a failed capture, a session the server ended.
+  renderBadge();
   await chrome.storage.local.set({ [MONITORING_STORAGE_KEYS.STATE]: state });
   chrome.runtime.sendMessage({ type: 'MONITORING_STATE_CHANGED', payload: state }).catch(() => {
     // No popup open; it re-reads state when next opened.
@@ -1076,7 +1081,6 @@ async function runStop(options: {
     offlineSince: state.offlineSince,
     stopNotice: options.notice ?? null,
   });
-  clearMonitoringBadge();
   // Anything of this session parked while it might still have continued is
   // re-judged now that it has ended — accepted, or dropped as captured after
   // the end — instead of showing as "uploading" until its next retry.
@@ -1411,6 +1415,10 @@ export async function handleMonitoringAlarm(): Promise<void> {
   // Proof of life, recorded locally before anything can fail.
   await noteAlive();
 
+  // Capture can stop without anything else changing — a killed agent, a denied
+  // permission — and the badge must not keep saying MON through it.
+  renderBadge();
+
   // Inactivity checked against the OS before the heartbeat reports it — and
   // an hour of it ends the session here.
   if (await reconcileAndMaybeAutoStop()) return;
@@ -1675,6 +1683,13 @@ export async function restoreMonitoringSession(): Promise<void> {
   state = await readState();
   hydrated = true;
 
+  // Before anything else, make the toolbar agree with what was persisted. A
+  // worker that was torn down mid-session — a crash, an update, a machine put
+  // to sleep — leaves whatever badge it last drew on the toolbar, and a MON
+  // that outlives its session is exactly the thing people trust and should not.
+  shownBadge = null;
+  renderBadge();
+
   // Rows an older build buffered in chrome.storage belong to the session that
   // was live when they were written, so they can only be moved while it is.
   if (state.sessionId && state.project) {
@@ -1710,7 +1725,6 @@ export async function restoreMonitoringSession(): Promise<void> {
       ...INITIAL_MONITORING_STATE,
       error: 'Monitoring was not connected to a server session. Start it again.',
     });
-    clearMonitoringBadge();
     return;
   }
 
@@ -1779,25 +1793,55 @@ function recordingOwnsBadge(): boolean {
  */
 export async function refreshMonitoringBadge(): Promise<void> {
   await hydrate();
-  if (isMonitoringSessionLive()) setMonitoringBadge();
-  else if (!recordingOwnsBadge()) clearMonitoringBadge();
+  shownBadge = null; // whatever is on the toolbar now was not put there by us
+  renderBadge();
 }
 
+/** Last badge written, so chrome.action is called only on a real change. */
+let shownBadge: BadgeView | null = null;
+
+/**
+ * Put the badge in step with the state, from whatever is in `state` right now.
+ *
+ * Deliberately synchronous and tolerant: it runs inside persist(), inside the
+ * minute tick and during restore, including in a worker that woke seconds ago,
+ * and a badge that cannot be drawn must never break a stop.
+ */
+function renderBadge(): void {
+  const view = badgeFor({
+    status: state.status,
+    captureStatus: state.capture.status,
+    agentStatus: state.native.status,
+    lastCaptureAtMs: parseMs(state.capture.lastSuccessfulCaptureAt ?? state.lastScreenshotAt),
+    intervalSeconds: state.intervalSeconds,
+    nowMs: Date.now(),
+    recordingOwnsBadge: recordingOwnsBadge(),
+  });
+  // A recording owns the badge: leave it be, and forget what we last drew so
+  // the badge is written again as soon as the recording gives it back.
+  if (view == null) {
+    shownBadge = null;
+    return;
+  }
+  if (sameBadge(view, shownBadge)) return;
+  shownBadge = view;
+  try {
+    chrome.action.setBadgeText({ text: view.text }).catch(() => {});
+    if (view.color) {
+      chrome.action.setBadgeBackgroundColor({ color: view.color }).catch(() => {});
+    }
+  } catch {
+    /* no chrome.action in this context */
+  }
+}
+
+function parseMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** Kept for the call sites that ask for the badge after changing something. */
 function setMonitoringBadge(): void {
-  // A recording in progress shows REC; monitoring's badge returns when it ends.
-  if (recordingOwnsBadge()) return;
-  const broken =
-    state.capture.status === 'reconnect' ||
-    state.capture.status === 'failed' ||
-    state.failedSnapshots > 0;
-  const paused = state.status === 'paused';
-  const text = broken ? 'MON!' : paused ? '❚❚' : 'MON';
-  chrome.action.setBadgeText({ text }).catch(() => {});
-  chrome.action
-    .setBadgeBackgroundColor({ color: broken ? '#d78706' : paused ? '#7a6cc4' : '#00829b' })
-    .catch(() => {});
-}
-
-function clearMonitoringBadge(): void {
-  chrome.action.setBadgeText({ text: '' }).catch(() => {});
+  renderBadge();
 }

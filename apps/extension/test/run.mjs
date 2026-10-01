@@ -28,6 +28,9 @@ execFileSync(
     resolve(here, '..', 'src', 'utils', 'monitoringSyncPolicy.ts'),
     resolve(here, '..', 'src', 'utils', 'monitoringInactivity.ts'),
     resolve(here, '..', 'src', 'utils', 'authRefreshPolicy.ts'),
+    resolve(here, '..', 'src', 'utils', 'monitoringBadge.ts'),
+    resolve(here, '..', 'src', 'utils', 'recordingUploadPolicy.ts'),
+    resolve(here, '..', 'src', 'utils', 'webmDuration.ts'),
     '--outDir',
     outDir,
     '--module',
@@ -49,10 +52,21 @@ execFileSync(process.execPath, [resolve(here, 'monitoringInactivity.test.mjs')],
   stdio: 'inherit',
 });
 execFileSync(process.execPath, [resolve(here, 'authRefreshPolicy.test.mjs')], { stdio: 'inherit' });
+execFileSync(process.execPath, [resolve(here, 'monitoringBadge.test.mjs')], { stdio: 'inherit' });
+execFileSync(process.execPath, [resolve(here, 'recordingUploadPolicy.test.mjs')], {
+  stdio: 'inherit',
+});
+execFileSync(process.execPath, [resolve(here, 'webmDuration.test.mjs')], { stdio: 'inherit' });
 
 // The real background code end to end, against a simulated agent, OS, server
 // and chrome.*. Skips itself, with a note, when fake-indexeddb is not available.
 execFileSync(process.execPath, [resolve(here, 'e2e', 'monitoring.e2e.test.mjs')], {
+  stdio: 'inherit',
+});
+
+// The recording upload queue against a simulated server, offscreen document
+// and clock: server outages, lapsed sign-ins, crashes, duplicates, trimming.
+execFileSync(process.execPath, [resolve(here, 'e2e', 'uploads.e2e.test.mjs')], {
   stdio: 'inherit',
 });
 

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { STORAGE_KEYS, MAX_DRAFTS, type AuthTokens, type DraftRecording } from '@/types';
 import { downloadBlob } from '@/utils';
 import { loadRecordingBlob, deleteRecordingBlob, listStoredRecordings } from '@/utils/blobStorage';
+import { listUploadJobs } from '@/background/recordings.uploader';
+import type { UploadJob } from '@/utils/recordingUploadPolicy';
 
 async function readDrafts(): Promise<DraftRecording[]> {
   const result = await chrome.storage.local.get([STORAGE_KEYS.DRAFTS_INDEX]);
@@ -11,12 +13,35 @@ async function readDrafts(): Promise<DraftRecording[]> {
 /** Drain blobs evicted from the 5-slot list by whichever earlier session
  *  registered them — this popup may be the first DOM-context page to open
  *  since. */
+/**
+ * Never delete a file the server has not confirmed it holds.
+ *
+ * The cleanup list is written by whoever evicted the draft, which may have been
+ * a different session minutes or days ago. Checking the upload queue here is
+ * the second lock on the same door: even if something queues a recording for
+ * deletion by mistake, a video still owed to the server survives it.
+ */
+async function withoutPendingUploads(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return ids;
+  try {
+    const jobs = await listUploadJobs();
+    const owed = new Set(
+      jobs.filter((job) => job.stage !== 'confirmed').map((job) => job.recordingId),
+    );
+    return ids.filter((id) => !owed.has(id));
+  } catch {
+    return ids;
+  }
+}
+
 async function drainPendingCleanup(): Promise<void> {
   const result = await chrome.storage.local.get([STORAGE_KEYS.PENDING_BLOB_CLEANUP]);
   const pending = (result[STORAGE_KEYS.PENDING_BLOB_CLEANUP] as string[] | undefined) ?? [];
   if (pending.length === 0) return;
-  await Promise.all(pending.map((id) => deleteRecordingBlob(id)));
-  await chrome.storage.local.set({ [STORAGE_KEYS.PENDING_BLOB_CLEANUP]: [] });
+  const safe = await withoutPendingUploads(pending);
+  await Promise.all(safe.map((id) => deleteRecordingBlob(id)));
+  const kept = pending.filter((id) => !safe.includes(id));
+  await chrome.storage.local.set({ [STORAGE_KEYS.PENDING_BLOB_CLEANUP]: kept });
 }
 
 /**
@@ -148,6 +173,55 @@ export function useDrafts() {
     }
   }, []);
 
+  /**
+   * What the background queue still owes the server, by recording.
+   *
+   * The popup is where someone looks when a save "did not work", so it has to
+   * answer honestly: waiting, uploading, or uploaded — never "failed", because
+   * the video is on this machine and the queue is still trying.
+   */
+  const [uploads, setUploads] = useState<Record<string, UploadJob>>({});
+
+  useEffect(() => {
+    const read = async () => {
+      try {
+        const response = (await chrome.runtime.sendMessage({ type: 'LIST_RECORDING_UPLOADS' })) as
+          | { jobs?: UploadJob[] }
+          | undefined;
+        const byId: Record<string, UploadJob> = {};
+        for (const job of response?.jobs ?? []) byId[job.recordingId] = job;
+        setUploads(byId);
+      } catch {
+        /* the worker is asleep; the next change wakes this up */
+      }
+    };
+    void read();
+    const listener = (message: { type?: string }) => {
+      if (message?.type === 'RECORDING_UPLOADS_CHANGED') void read();
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    // Uploads move on their own, on an alarm, so this also polls gently.
+    const timer = setInterval(() => void read(), 5_000);
+    return () => {
+      chrome.runtime.onMessage.removeListener(listener);
+      clearInterval(timer);
+    };
+  }, []);
+
+  const retryUpload = useCallback(async (recordingId: string) => {
+    setBusyId(recordingId);
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'RECORDING_UPLOAD_RETRY',
+        payload: { recordingId },
+      });
+    } catch {
+      /* the queue retries on its own anyway */
+    } finally {
+      setBusyId(null);
+    }
+  }, []);
+
   const discard = useCallback(async (recordingId: string) => {
     setBusyId(recordingId);
     try {
@@ -157,6 +231,11 @@ export function useDrafts() {
       await chrome.storage.local.set({ [STORAGE_KEYS.DRAFTS_INDEX]: next });
       setDrafts(next);
       if (target?.status === 'draft') {
+        // An explicit discard by the person is the one case where an unuploaded
+        // recording is deleted — so the queue is told to stop owing it first.
+        await chrome.runtime
+          .sendMessage({ type: 'RECORDING_UPLOAD_FORGET', payload: { recordingId } })
+          .catch(() => {});
         await deleteRecordingBlob(recordingId);
       }
     } finally {
@@ -166,10 +245,12 @@ export function useDrafts() {
 
   return {
     drafts,
+    uploads,
     isLoading,
     busyId,
     openInEditor,
     download: (d: DraftRecording) => void download(d),
     discard: (id: string) => void discard(id),
+    retryUpload: (id: string) => void retryUpload(id),
   };
 }

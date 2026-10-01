@@ -20,7 +20,7 @@
  * shared, and the grant itself is restricted to screens.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   Monitor,
@@ -32,9 +32,10 @@ import {
   WifiOff,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
-import { formatDuration } from '@/utils';
+import { cn, formatDuration } from '@/utils';
 import { INITIAL_MONITORING_STATE, MONITORING_INTERVAL_SECONDS } from '@/types/monitoring';
 import type { MonitoringState, MonitoringStatus } from '@/types/monitoring';
 import { fetchOwnDailyReport } from '@/services/monitoring.api';
@@ -316,6 +317,117 @@ interface MonitoringViewProps {
   onBack: () => void;
 }
 
+/**
+ * Pick a project, with a search box.
+ *
+ * A native <select> was fine for the handful of projects people had at first
+ * and useless at thirty: the list is alphabetical, it cannot be filtered, and
+ * finding anything past the first screen means scrolling it by eye. Typing
+ * narrows it instead, matching anywhere in the name.
+ */
+function ProjectPicker({
+  projects,
+  selected,
+  onSelect,
+  disabled,
+}: {
+  projects: ProjectOption[];
+  selected: string | null;
+  onSelect: (name: string) => void;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const containerRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const needle = query.trim().toLowerCase();
+  const matches = needle
+    ? projects.filter((option) => option.name.toLowerCase().includes(needle))
+    : projects;
+
+  useEffect(() => {
+    if (!open) return;
+    // Straight to typing: the search box is the reason the list opened.
+    searchRef.current?.focus();
+    const onClick = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [open]);
+
+  const choose = (name: string) => {
+    onSelect(name);
+    setOpen(false);
+    setQuery('');
+  };
+
+  return (
+    <div ref={containerRef} className="relative">
+      <button
+        type="button"
+        id="monitoring-project"
+        disabled={disabled}
+        onClick={() => setOpen((value) => !value)}
+        className="w-full h-9 px-2.5 flex items-center justify-between gap-2 rounded-lg bg-dark-900/80 border border-jam-500/20 text-sm text-white hover:border-jam-500/40 focus:outline-none focus:border-jam-500/60 disabled:opacity-60"
+      >
+        <span className="truncate">{selected ?? 'Select a project'}</span>
+        <ChevronDown
+          size={14}
+          className={cn('shrink-0 text-dark-400 transition-transform', open && 'rotate-180')}
+        />
+      </button>
+
+      {open && (
+        <div className="absolute z-50 mt-1 w-full rounded-lg border border-white/10 bg-dark-900 shadow-xl overflow-hidden">
+          <div className="p-1.5 border-b border-white/6">
+            <input
+              ref={searchRef}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setOpen(false);
+                // Enter takes the only thing left, which is what typing a name
+                // nearly to the end is for.
+                if (event.key === 'Enter' && matches.length > 0) choose(matches[0].name);
+              }}
+              placeholder="Search projects…"
+              className="w-full h-8 px-2 rounded-md bg-dark-950/80 border border-white/8 text-xs text-white placeholder:text-dark-500 focus:outline-none focus:border-jam-500/50"
+            />
+          </div>
+          <div className="max-h-48 overflow-y-auto scrollbar-thin py-1">
+            {matches.length === 0 ? (
+              <p className="px-3 py-2 text-xs text-dark-500">No project matches “{query}”</p>
+            ) : (
+              matches.map((option) => (
+                <button
+                  key={option.name}
+                  type="button"
+                  onClick={() => choose(option.name)}
+                  className={cn(
+                    'w-full px-3 py-1.5 flex items-center justify-between gap-2 text-left text-xs',
+                    option.name === selected
+                      ? 'bg-jam-500/15 text-jam-200'
+                      : 'text-dark-200 hover:bg-white/6',
+                  )}
+                >
+                  <span className="truncate">{option.name}</span>
+                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-dark-500">
+                    {option.projectRole?.replace(/_/g, ' ').toLowerCase()}
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function MonitoringView({ onBack }: MonitoringViewProps) {
   const [state, setState] = useState<MonitoringState>(INITIAL_MONITORING_STATE);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
@@ -347,11 +459,26 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const options = await getAssignedProjects();
+      // What is already known, immediately — then the server's answer, so a
+      // project someone was added to today is there without signing out first.
+      const stored = await getAssignedProjects();
       if (cancelled) return;
-      setProjects(options);
-      setProject(await resolveDefaultProject(options));
-      setProjectsLoading(false);
+      if (stored.length > 0) {
+        setProjects(stored);
+        setProject(await resolveDefaultProject(stored));
+        setProjectsLoading(false);
+      }
+      const fresh = await getAssignedProjects({ refresh: true });
+      if (cancelled) return;
+      setProjects(fresh);
+      setProject((current) =>
+        current && fresh.some((option) => option.name === current) ? current : null,
+      );
+      const chosen = await resolveDefaultProject(fresh);
+      if (!cancelled) {
+        setProject((current) => current ?? chosen);
+        setProjectsLoading(false);
+      }
     })();
     return () => {
       cancelled = true;
@@ -552,18 +679,12 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
                   one before monitoring.
                 </p>
               ) : (
-                <select
-                  id="monitoring-project"
-                  value={project ?? ''}
-                  onChange={(event) => setProject(event.target.value)}
-                  className="w-full h-9 px-2.5 rounded-lg bg-dark-900/80 border border-jam-500/20 text-sm text-white focus:outline-none focus:border-jam-500/60"
-                >
-                  {projects.map((option) => (
-                    <option key={option.name} value={option.name}>
-                      {option.name}
-                    </option>
-                  ))}
-                </select>
+                <ProjectPicker
+                  projects={projects}
+                  selected={project}
+                  onSelect={setProject}
+                  disabled={state.status === 'starting'}
+                />
               )}
             </div>
 

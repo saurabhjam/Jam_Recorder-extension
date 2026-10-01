@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { probeVideoFile } from '@/utils/videoProbe';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Monitor,
@@ -258,16 +259,24 @@ export function HomeView({ onNavigate }: HomeViewProps) {
     try {
       const id = generateId();
       await saveBlobToIDB(id, file);
+      // Read the file's own length and a frame from it. Without this an
+      // uploaded video arrived with neither: the library showed 00:00 against
+      // it and its card had no still — the file knew both all along, nothing
+      // had asked.
+      const probe = await probeVideoFile(file);
       await chrome.storage.local.set({
         [STORAGE_KEYS.EDITOR_DATA]: {
           recordingId: id,
-          thumbnailDataUrl: null,
-          duration: 0,
+          thumbnailDataUrl: probe.thumbnailDataUrl,
+          duration: probe.durationSeconds ?? 0,
           blobSize: file.size,
           title: file.name.replace(/\.[^./\\]+$/, ''),
           recordingType: 'tab',
           consoleLogs: [],
           networkCaptures: [],
+          // Its audio is whatever the file carries; there is no side track to
+          // fold in, so the editor must not try to re-encode one.
+          audioMixed: true,
         },
       });
       await chrome.windows.create({

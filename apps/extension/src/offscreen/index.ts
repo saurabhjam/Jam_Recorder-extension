@@ -26,6 +26,8 @@ import {
   micBlobKey,
   systemBlobKey,
   loadBlobFromOPFS,
+  loadRecordingBlob,
+  deleteRecordingBlob,
 } from '@/utils/blobStorage';
 import { buildShareUrl, API_BASE_URL as REPORTS_URL } from '@/config';
 
@@ -118,6 +120,15 @@ let systemChunks: Blob[] = [];
 // when a mic was in use). Reported to the editor so it knows the main blob is
 // already complete and must not play/mix the mic a second time.
 let micMixedIntoMain = false;
+/**
+ * Did this recording actually capture system audio?
+ *
+ * Not "was the toggle on" — whether a system/tab audio source was really part
+ * of the mix. The editor needs it to stop offering an Audio control for sound
+ * that was never recorded, which is how a recording made with audio switched
+ * off still came back showing audio as enabled.
+ */
+let systemAudioRecorded = false;
 let sink: RecordingSink | null = null; // streams recorder chunks to disk (OPFS) or memory
 let mimeType = 'video/webm';
 let isRecordingActive = false;
@@ -449,6 +460,7 @@ async function createRecordingStream(
   const micTracks = micStream?.getAudioTracks() ?? [];
   const hasMic = micTracks.length > 0;
   micMixedIntoMain = false;
+  systemAudioRecorded = hasCaptureAudio || needsDynamicTabAudio;
 
   // Nothing to mix at all (no system audio now or later, no mic) → record the
   // capture stream as-is.
@@ -822,6 +834,8 @@ async function stopRecording(metadata: {
   // Grab the parallel audio tracks before cleanup() tears the streams down.
   const { micBlob, systemBlob } = await finalizeAuxRecordings();
   const audioMixed = micMixedIntoMain;
+  const hasSystemAudio = systemAudioRecorded;
+  const hasMicAudio = micMixedIntoMain;
 
   const activeSink = sink;
   let finalBlob: Blob;
@@ -877,6 +891,10 @@ async function stopRecording(metadata: {
     // The main file already carries every audio source, so the editor can upload it
     // untouched instead of re-encoding to fold the mic back in.
     audioMixed,
+    // What sound this recording actually contains, so the editor offers
+    // controls for the sources that are really there and no others.
+    hasSystemAudio,
+    hasMicAudio,
   });
   // Upload is now triggered explicitly by the editor — offscreen is done here.
 }
@@ -1270,6 +1288,141 @@ function sendToBackground(type: string, payload?: unknown): void {
   });
 }
 
+// ─── Uploading a queued recording ─────────────────────────────────────────────
+
+/**
+ * Push one queued recording to the server, on behalf of the background worker.
+ *
+ * This runs here because this is a DOM context: it can read the file out of
+ * OPFS, and it can report progress. The decisions — when to try, how long to
+ * wait, what a failure means, when the local copy may go — all belong to the
+ * worker, which is the part that survives this document being closed.
+ *
+ * Resumable by construction: each phase that lands is reported back even when a
+ * later one fails, so a retry picks up at the first phase that did not. The
+ * bytes, which are the expensive part, are sent at most once.
+ */
+async function uploadQueuedRecording(job: {
+  recordingId: string;
+  uploadId: string;
+  exportId?: string | null;
+  project?: string;
+  recordBody?: Record<string, unknown>;
+  videoFileName?: string | null;
+  backendRecordId?: string | null;
+}): Promise<{ videoFileName: string; backendRecordId: string; videoUrl: string }> {
+  const project = job.project ?? (await getProject((await getAccessToken()) ?? ''));
+  const fail = (message: string, status: number, partial: Record<string, unknown> = {}) => {
+    const error = new Error(message) as Error & { status?: number; partial?: unknown };
+    error.status = status;
+    error.partial = partial;
+    return error;
+  };
+
+  const token = await getAccessToken();
+  if (!token) throw fail('Not signed in', 401);
+
+  let videoFileName = job.videoFileName ?? null;
+
+  // Phase 1 — the bytes. Skipped outright when a previous attempt got them in.
+  if (!videoFileName) {
+    const blob = await loadUploadSource(job.recordingId, job.exportId ?? null);
+    if (!blob || blob.size === 0) {
+      // Nothing to send and nothing to retry with. Reported as a permanent
+      // refusal so the queue stops rather than retrying an empty file forever;
+      // the recording, if it exists at all, stays in Drafts.
+      throw fail('The recording file is no longer on this computer', 410);
+    }
+    const form = new FormData();
+    form.append(
+      'file',
+      new File([blob], `recording-${job.recordingId}.webm`, {
+        type: (blob.type || 'video/webm').split(';')[0],
+      }),
+    );
+    let response: Response;
+    try {
+      response = await fetch(`${REPORTS_URL}/v1/${project}/files/upload`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, Accept: 'text/plain, application/json, */*' },
+        body: form,
+      });
+    } catch (err) {
+      throw fail(err instanceof Error ? err.message : 'Network error', 0);
+    }
+    if (!response.ok) {
+      throw fail(`Video upload failed (${response.status})`, response.status);
+    }
+    videoFileName = (await response.text()).trim();
+    if (!videoFileName) throw fail('The server accepted the upload but named no file', 502);
+  }
+
+  const videoUrl = `${REPORTS_URL}/v1/${project}/files/${videoFileName}`;
+
+  // Phase 2 — the record. Any failure from here on reports the file name back,
+  // so the retry never re-sends the video.
+  if (job.backendRecordId) {
+    return { videoFileName, backendRecordId: job.backendRecordId, videoUrl };
+  }
+
+  const body = {
+    title: 'Recording',
+    description: 'Recording captured with BestQ',
+    type: 'video',
+    mimeType: 'video/webm',
+    status: 'completed',
+    isPublic: false,
+    allowDownload: true,
+    viewCount: 0,
+    ...(job.recordBody ?? {}),
+    // Decided here, because they depend on the upload that just happened.
+    url: videoUrl,
+    shareId: job.uploadId,
+    updatedAt: new Date().toISOString(),
+  };
+
+  let created: Response;
+  try {
+    created = await fetch(`${REPORTS_URL}/v1/${project}/records`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    throw fail(err instanceof Error ? err.message : 'Network error', 0, { videoFileName });
+  }
+  if (!created.ok) {
+    throw fail(`Could not create the recording (${created.status})`, created.status, {
+      videoFileName,
+    });
+  }
+  const payload = (await created.json()) as { id?: string };
+  if (!payload.id) {
+    throw fail('The server created no record id', 502, { videoFileName });
+  }
+  return { videoFileName, backendRecordId: payload.id, videoUrl };
+}
+
+/**
+ * The file to upload: the processed one when there is one, the recording
+ * itself otherwise.
+ *
+ * The original is still read as a fallback even when an export was expected —
+ * a trimmed file that went missing is a reason to upload the full recording,
+ * never a reason to upload nothing.
+ */
+async function loadUploadSource(
+  recordingId: string,
+  exportId: string | null,
+): Promise<Blob | null> {
+  if (exportId) {
+    const exported = await loadRecordingBlob(exportId);
+    if (exported && exported.size > 0) return exported;
+    console.warn('[Offscreen] the processed file is gone — uploading the original recording');
+  }
+  return loadRecordingBlob(recordingId);
+}
+
 chrome.runtime.onMessage.addListener((message: OffscreenIncomingMessage, _sender, sendResponse) => {
   if (message.target !== 'offscreen') return false;
 
@@ -1358,6 +1511,36 @@ chrome.runtime.onMessage.addListener((message: OffscreenIncomingMessage, _sender
     //
     // Recording still uses getDisplayMedia below, where choosing a tab or a
     // window is exactly what the user wants.
+
+    case 'OFFSCREEN_UPLOAD_JOB': {
+      uploadQueuedRecording(message.payload as Parameters<typeof uploadQueuedRecording>[0])
+        .then((result) => sendResponse({ success: true, result }))
+        .catch((err: Error & { status?: number; partial?: unknown }) =>
+          sendResponse({
+            success: false,
+            failure: {
+              message: err?.message ?? 'Upload failed',
+              status: err?.status ?? 0,
+              partial: err?.partial ?? {},
+            },
+          }),
+        );
+      return true;
+    }
+
+    case 'OFFSCREEN_DISCARD_RECORDING': {
+      const { recordingId, exportId } = message.payload as {
+        recordingId: string;
+        exportId: string | null;
+      };
+      Promise.all([
+        deleteRecordingBlob(recordingId),
+        exportId ? deleteRecordingBlob(exportId) : Promise.resolve(),
+      ])
+        .then(() => sendResponse({ success: true }))
+        .catch(() => sendResponse({ success: true }));
+      return true;
+    }
 
     case 'OFFSCREEN_PROCESS_QUEUE': {
       processOfflineQueue()

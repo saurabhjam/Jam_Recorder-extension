@@ -30,8 +30,35 @@ import {
   loadBlobFromIDB,
   micBlobKey,
   systemBlobKey,
+  exportIdFor,
+  saveBlobToOPFS,
 } from '@/utils/blobStorage';
+import { getFreshAccessToken } from '@/services/tokens';
+import { listUploadJobs } from '@/background/recordings.uploader';
+import { UPLOAD_POLICY, classifyUploadFailure } from '@/utils/recordingUploadPolicy';
+import { withWebmDuration } from '@/utils/webmDuration';
 import { STORAGE_KEYS, type DraftRecording } from '@/types';
+
+/**
+ * Never delete a file the server has not confirmed it holds.
+ *
+ * The cleanup list is written by whoever evicted the draft, which may have been
+ * a different session minutes or days ago. Checking the upload queue here is
+ * the second lock on the same door: even if something queues a recording for
+ * deletion by mistake, a video still owed to the server survives it.
+ */
+async function withoutPendingUploads(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) return ids;
+  try {
+    const jobs = await listUploadJobs();
+    const owed = new Set(
+      jobs.filter((job) => job.stage !== 'confirmed').map((job) => job.recordingId),
+    );
+    return ids.filter((id) => !owed.has(id));
+  } catch {
+    return ids;
+  }
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,6 +74,9 @@ interface EditorData {
   visitedUrls?: VisitedUrl[];
   /** The recorded file's own audio track already carries system audio AND mic. */
   audioMixed?: boolean;
+  /** Which sources this recording's sound actually came from, if it is known. */
+  hasSystemAudio?: boolean;
+  hasMicAudio?: boolean;
 }
 
 interface VisitedUrl {
@@ -388,6 +418,22 @@ async function readAudioMixed(recordingId: string): Promise<boolean> {
 }
 
 /**
+ * The uploaded video's URL for a recording that has already been saved.
+ *
+ * Read from the Drafts entry, which is where a saved recording's server-side
+ * whereabouts are recorded.
+ */
+async function findSavedVideoUrl(recordingId: string): Promise<string | null> {
+  try {
+    const result = await chrome.storage.local.get([STORAGE_KEYS.DRAFTS_INDEX]);
+    const drafts = (result[STORAGE_KEYS.DRAFTS_INDEX] as DraftRecording[] | undefined) ?? [];
+    return drafts.find((d) => d.recordingId === recordingId)?.videoUrl ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The editor payload for `recordingId`, or null when there is none for it.
  *
  * EDITOR_DATA is a single slot holding whatever was recorded LAST, so it answers for
@@ -416,6 +462,8 @@ async function loadEditorData(recordingId: string): Promise<EditorData | null> {
     networkCaptures: [],
     visitedUrls: [],
     audioMixed: draft.audioMixed,
+    hasSystemAudio: draft.hasSystemAudio,
+    hasMicAudio: draft.hasMicAudio,
   };
 }
 
@@ -548,6 +596,8 @@ export function EditorApp() {
     AssignedProjectInfo
   > | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  /** Was the video playing when a scrub began? */
+  const resumeAfterScrubRef = useRef(false);
   // A thumbnail captured from the <video> in-editor, used when the recording has
   // none of its own — e.g. a video the user uploaded from local disk (which
   // arrives with thumbnailDataUrl: null). Captured once on first load.
@@ -631,8 +681,11 @@ export function EditorApp() {
       const result = await chrome.storage.local.get([STORAGE_KEYS.PENDING_BLOB_CLEANUP]);
       const pending = (result[STORAGE_KEYS.PENDING_BLOB_CLEANUP] as string[] | undefined) ?? [];
       if (pending.length === 0) return;
-      await Promise.all(pending.map((id) => deleteRecordingBlob(id)));
-      await chrome.storage.local.set({ [STORAGE_KEYS.PENDING_BLOB_CLEANUP]: [] });
+      const safe = await withoutPendingUploads(pending);
+      await Promise.all(safe.map((id) => deleteRecordingBlob(id)));
+      // Anything still owed to the server stays on the list and on disk.
+      const kept = pending.filter((id) => !safe.includes(id));
+      await chrome.storage.local.set({ [STORAGE_KEYS.PENDING_BLOB_CLEANUP]: kept });
     })();
   }, []);
 
@@ -650,15 +703,59 @@ export function EditorApp() {
     return () => clearInterval(id);
   }, [data, recordingId]);
 
+  // ── Keep this recording's local copy while the window is open ─────────────
+  //
+  // The player plays the file on disk. Reclaiming it the moment the upload was
+  // confirmed left the <video> pointing at a resource that no longer exists —
+  // which is why a saved recording could not be played, resumed or scrubbed
+  // afterwards. The hold is released when the window closes, and lapses on its
+  // own if it never does.
+  useEffect(() => {
+    if (!recordingId || recordingId === 'unknown') return;
+    const tell = (release: boolean) =>
+      chrome.runtime
+        .sendMessage({ type: 'HOLD_RECORDING_FILE', payload: { recordingId, release } })
+        .catch(() => {});
+    void tell(false);
+    const onUnload = () => void tell(true);
+    window.addEventListener('pagehide', onUnload);
+    return () => {
+      window.removeEventListener('pagehide', onUnload);
+      void tell(true);
+    };
+  }, [recordingId]);
+
   // ── Load video blob from IDB ───────────────────────────────────────────────
   useEffect(() => {
     if (!recordingId || recordingId === 'unknown') return;
     let objectUrl: string | null = null;
+    let cancelled = false;
+    const show = (blob: Blob) => {
+      if (cancelled) return;
+      objectUrl = URL.createObjectURL(blob);
+      setVideoUrl(objectUrl);
+    };
     const tryLoad = async () => {
+      if (cancelled || objectUrl) return;
       const blob = await loadRecordingBlob(recordingId);
-      if (blob) {
-        objectUrl = URL.createObjectURL(blob);
-        setVideoUrl(objectUrl);
+      if (blob && blob.size > 0) {
+        show(blob);
+        return;
+      }
+      // No local copy — an older recording whose file was reclaimed after it
+      // was uploaded. The server has it, and the file endpoint needs a bearer
+      // token, so it is fetched rather than handed to the <video> as a src.
+      const saved = await findSavedVideoUrl(recordingId);
+      if (!saved || cancelled) return;
+      try {
+        const token = await getFreshAccessToken();
+        const res = await fetch(saved, {
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        });
+        if (!res.ok) return;
+        show(await res.blob());
+      } catch {
+        /* offline: the player stays empty rather than showing a broken element */
       }
     };
     void tryLoad();
@@ -667,6 +764,7 @@ export function EditorApp() {
       void tryLoad();
     }, 1500);
     return () => {
+      cancelled = true;
       clearTimeout(retryTimer);
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
@@ -936,8 +1034,7 @@ export function EditorApp() {
   // Result is cached back onto the stored user for instant population next time.
   const refreshProjects = useCallback(async () => {
     try {
-      const r = await chrome.storage.local.get([AUTH_TOKENS_KEY]);
-      const token = (r[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)?.accessToken;
+      const token = await getFreshAccessToken();
       if (!token) return;
       const res = await fetch(`${API_BASE}/users`, {
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
@@ -959,6 +1056,13 @@ export function EditorApp() {
       /* network unavailable — keep whatever projects we already have */
     }
   }, []);
+
+  // The list a person is about to choose from is asked for up front, not only
+  // when they open the dropdown: a project they were added to this morning
+  // should already be in it the first time they look.
+  useEffect(() => {
+    void refreshProjects();
+  }, [refreshProjects]);
 
   // Upload just the video file (the big, slow part) and return the MinIO
   // filename the server assigns. Retried with backoff; a 4xx fails fast.
@@ -1080,6 +1184,99 @@ export function EditorApp() {
     [recordingId, videoDuration, data, trimStart, trimEnd, muteSystemAudio, muteMic, audioMixed],
   );
 
+  /**
+   * Put the recording's real length into the file before it is uploaded.
+   *
+   * MediaRecorder cannot write a duration while it records, so what it produces
+   * reports `Infinity` — a saved recording then shows 00:00 and its progress
+   * bar cannot be dragged, because a player with no duration has no timeline to
+   * seek within. The patched copy is checked by actually loading it before it
+   * is trusted; if it does not come back with a finite duration, the original
+   * is uploaded untouched.
+   */
+  const withKnownDuration = useCallback(async (blob: Blob, seconds: number): Promise<Blob> => {
+    if (!(seconds > 0) || !blob.type.includes('webm')) return blob;
+    try {
+      const patched = await withWebmDuration(blob, seconds);
+      if (patched === blob) return blob;
+      const url = URL.createObjectURL(patched);
+      try {
+        const probe = document.createElement('video');
+        probe.preload = 'metadata';
+        probe.src = url;
+        await waitForEvent(probe, 'loadedmetadata', 10_000);
+        const reported = probe.duration;
+        if (!Number.isFinite(reported) || reported <= 0) {
+          console.warn(
+            '[Editor] the patched recording did not report a duration — keeping the original',
+          );
+          return blob;
+        }
+        return patched;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      console.warn('[Editor] could not write the duration into the recording:', err);
+      return blob;
+    }
+  }, []);
+
+  /**
+   * Tell the background queue about this upload. Never throws: the queue is a
+   * safety net, and a save must not fail because the net could not be hung.
+   */
+  const queueUpload = useCallback(async (payload: Record<string, unknown>): Promise<void> => {
+    try {
+      await chrome.runtime.sendMessage({ type: 'QUEUE_RECORDING_UPLOAD', payload });
+    } catch (err) {
+      console.warn('[Editor] could not hand the upload to the background queue:', err);
+    }
+  }, []);
+
+  /**
+   * Run the export with a deadline, and fall back to the recording itself.
+   *
+   * Trimming is a real-time re-record, so it has a natural budget: twice the
+   * clip plus a minute. Past that something is wrong — a stalled decoder, a
+   * throttled background tab, a browser that will not finish — and the right
+   * answer is the untouched recording, not a bar that sits at 30% forever.
+   */
+  const exportWithDeadline = useCallback(
+    async (onProgress: (f: number) => void): Promise<{ blob: Blob; trimmed: boolean }> => {
+      const seconds = videoDuration || data?.duration || 0;
+      const original = await loadRecordingBlob(recordingId);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const blob = await Promise.race([
+          getExportBlob(onProgress),
+          new Promise<Blob>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('export-timeout')),
+              UPLOAD_POLICY.TRIM_BUDGET_MS(seconds),
+            );
+          }),
+        ]);
+        // Identity cannot answer this: the export path loads the recording for
+        // itself, so even an untouched save comes back as a different Blob
+        // object over the same bytes. Size and type do answer it, and getting
+        // it wrong would write a second full copy of every recording to disk.
+        const changed = !original || blob.size !== original.size || blob.type !== original.type;
+        return { blob, trimmed: changed };
+      } catch (err) {
+        if (!original || original.size === 0) throw err;
+        console.warn('[Editor] export did not finish in time — saving the recording itself:', err);
+        setExportNotice(
+          'The trim was taking too long, so the full recording was saved instead — nothing was lost.',
+        );
+        return { blob: original, trimmed: false };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+    [getExportBlob, recordingId, videoDuration, data],
+  );
+
   // Returns the record's share URL on success (so callers like "Save & Copy
   // Link" can copy it immediately), or null if the save was skipped/failed.
   const handleSave = useCallback(async (): Promise<string | null> => {
@@ -1097,12 +1294,14 @@ export function EditorApp() {
     setUploadError(null);
     setExportNotice(null);
     try {
-      const tokenResult = await chrome.storage.local.get([AUTH_TOKENS_KEY, AUTH_USER_KEY]);
-      const token = (tokenResult[AUTH_TOKENS_KEY] as { accessToken?: string } | undefined)
-        ?.accessToken;
+      const tokenResult = await chrome.storage.local.get([AUTH_USER_KEY]);
       const userId = (tokenResult[AUTH_USER_KEY] as { id?: string } | undefined)?.id ?? null;
+      // Refreshed if it is near expiry, rather than read raw: a token that
+      // lapsed while the editor was open used to end the save outright, with
+      // the person told to sign in again for a session that was still valid.
+      const token = await getFreshAccessToken();
       if (!token) {
-        setUploadError('Not authenticated — please sign in.');
+        setUploadError('Not signed in — sign in and this recording will upload.');
         return null;
       }
 
@@ -1110,11 +1309,30 @@ export function EditorApp() {
       // from disk; only an actual trim or mute re-encodes, and only then does the
       // bar show "Trimming" (that phase drives 0–15%).
       setSaveStage('preparing');
-      const blob = await getExportBlob((f) => {
+      const exported = await exportWithDeadline((f) => {
         setSaveStage('trimming');
         setUploadPercent(Math.round(f * 15));
       });
-      if (!blob || blob.size === 0) throw new Error('Recording not found in local storage');
+      const exportedBlob = exported.blob;
+      if (!exportedBlob || exportedBlob.size === 0) {
+        throw new Error('Recording not found in local storage');
+      }
+      // The length the person will see, and the one the file itself will carry.
+      const savedSeconds = exported.trimmed
+        ? (trimEnd - trimStart) * (videoDuration || data.duration || 0)
+        : videoDuration || data.duration || 0;
+      const blob = await withKnownDuration(exportedBlob, savedSeconds);
+
+      // A processed file is written to disk before it is uploaded, so a retry
+      // hours later never re-runs a trim — and the ORIGINAL stays exactly where
+      // it is until the server confirms it has this one.
+      let exportId: string | null = null;
+      if (blob !== exportedBlob || exported.trimmed) {
+        // Stored as it will be uploaded — duration and all — so a retry days
+        // later sends the same bytes without redoing any of this work.
+        const id = exportIdFor(recordingId);
+        if (await saveBlobToOPFS(id, blob)) exportId = id;
+      }
 
       const mime = blob.type || 'video/webm';
       const mimeBase = mime.split(';')[0] ?? 'video/webm';
@@ -1126,12 +1344,56 @@ export function EditorApp() {
       const project = selectedProjectName;
       const projectId = assignedProjects?.[project]?.projectId ?? null;
 
+      // Hand the upload to the background queue BEFORE sending anything. From
+      // here on this tab is a convenience, not the only thing standing between
+      // the recording and the server: close it, lose the network, crash, or
+      // restart the machine, and the queue still finishes the job.
+      const baseRecord: Record<string, unknown> = {
+        title: title || data.title,
+        description: description.trim().slice(0, 125) || 'Recording captured with BestQ',
+        tags: tags.join(','),
+        type: 'video',
+        mimeType: mimeBase,
+        status: 'completed',
+        userId,
+        projectId: projectId !== null ? String(projectId) : '1',
+        isPublic: visibility === 'public',
+        allowDownload: true,
+        viewCount: 0,
+        size: blob.size,
+        duration: Math.round((trimEnd - trimStart) * (videoDuration || data.duration || 0)),
+        links: JSON.stringify(
+          (data.visitedUrls ?? []).map((v) => ({
+            time: formatTime(v.timestamp),
+            title: v.title,
+            url: v.url,
+          })),
+        ),
+        metadata: JSON.stringify({
+          browser: 'chrome',
+          source: (data.recordingType ?? 'tab').toLowerCase(),
+          harEntries: data.networkCaptures?.length ?? 0,
+          consoleLogEntries: data.consoleLogs?.length ?? 0,
+        }),
+        createdAt: isoNow,
+      };
+      await queueUpload({
+        recordingId,
+        exportId,
+        project,
+        title: title || data.title,
+        sizeBytes: blob.size,
+        recordBody: baseRecord,
+      });
+
       // Step 2: upload the video → MinIO filename (drives 15–80% of the bar).
       setSaveStage('uploading');
       const videoFileName = await uploadVideoFile(project, token, blob, (p) =>
         setUploadPercent(15 + Math.round(p * 0.65)),
       );
       setUploadPercent(80);
+      // The expensive part is done; a retry from here creates the record only.
+      await queueUpload({ recordingId, videoFileName, exportId, project });
 
       // Step 3: upload HAR (network logs) → get MinIO filename
       setUploadPercent(82);
@@ -1317,6 +1579,10 @@ export function EditorApp() {
       }
       const createBody = (await createRes.json()) as { id: string };
       const backendId = createBody.id;
+      // Written down before anything else can fail. Everything after this —
+      // minting a share link, saving visibility — is finishing touches, and a
+      // retry that did not know the record existed would create a second one.
+      await queueUpload({ recordingId, videoFileName, backendRecordId: backendId, project });
 
       // Step 6: build the share link. The base record URL is always set; if the
       // user chose Public before saving, mint the share token now (inline) so the
@@ -1358,8 +1624,18 @@ export function EditorApp() {
           publicShareUrl: publicUrl,
         } satisfies ShareVisibilityState,
       });
-      // Uploaded successfully — reclaim the local disk copy (OPFS/IDB).
-      void deleteRecordingBlob(recordingId);
+      // Confirmed by the server. The queue owns the deletion, so there is one
+      // moment in the whole extension at which a recording's file may go, and
+      // it is this one — after the record exists, never before.
+      void chrome.runtime
+        .sendMessage({
+          type: 'RECORDING_UPLOAD_CONFIRMED',
+          payload: { recordingId, backendRecordId: backendId, videoFileName },
+        })
+        .catch(() => {
+          // The queue will confirm it on its own next pass; worst case the file
+          // stays on disk a little longer.
+        });
       // It stays in the Drafts list, just promoted to "saved" (Download/Copy
       // Link instead of Save/Download) rather than disappearing from it.
       void promoteDraftToSaved(recordingId, {
@@ -1371,7 +1647,17 @@ export function EditorApp() {
       });
       return finalLink;
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : 'Upload failed');
+      // Nothing here loses the recording: it is on disk and the background
+      // queue has the job. Only a refusal the server will repeat is worth
+      // calling a failure; everything else is simply not done yet.
+      const status = (err as { status?: number })?.status ?? 0;
+      const message = err instanceof Error ? err.message : 'Upload failed';
+      const kind = classifyUploadFailure({ status, message });
+      setUploadError(
+        kind === 'fatal'
+          ? `${message} The recording is still saved on this computer.`
+          : 'Saved on this computer. The upload will finish by itself once the server can be reached — you can close this window.',
+      );
       return null;
     } finally {
       setIsSaving(false);
@@ -1385,7 +1671,9 @@ export function EditorApp() {
     shareUrl,
     selectedProjectName,
     assignedProjects,
-    getExportBlob,
+    exportWithDeadline,
+    queueUpload,
+    withKnownDuration,
     uploadVideoFile,
     trimStart,
     trimEnd,
@@ -1464,6 +1752,17 @@ export function EditorApp() {
   // matching side track instead; on an older recording the video is system-only and
   // the mic always plays alongside it. Undecided (`null`) plays the video alone —
   // never a side track, which on a mixed recording would double the mic.
+  /**
+   * Is there system sound in this recording at all?
+   *
+   * Unknown for recordings made before this was recorded — those keep the old
+   * behaviour and offer the control, since the alternative is hiding audio that
+   * is really there. Deliberately NOT turned into a mute: muting a source that
+   * does not exist changes nothing about the output but would push the save
+   * onto the slow re-encoding path for no reason.
+   */
+  const systemAudioAvailable = data?.hasSystemAudio ?? true;
+
   const previewVideoMuted = audioMixed === true ? muteMic || muteSystemAudio : muteSystemAudio;
   const previewAuxUrl =
     audioMixed === null
@@ -1492,21 +1791,65 @@ export function EditorApp() {
     }
   }, [previewAuxUrl, isPlaying]);
 
-  const togglePlay = useCallback(() => {
+  /**
+   * The length to seek within.
+   *
+   * `video.duration` is the right answer when the file carries one. A recording
+   * made before durations were written into the file reports Infinity, and the
+   * browser still knows how much it can seek over — `seekable` — so that stands
+   * in, and what the recording itself reported stands in for that. Without this
+   * every seek on such a file computed `fraction * Infinity`, which is NaN, and
+   * the scrubber silently did nothing at all.
+   */
+  const seekableSeconds = useCallback((): number => {
+    const v = videoRef.current;
+    if (v && Number.isFinite(v.duration) && v.duration > 0) return v.duration;
+    if (v && v.seekable.length > 0) {
+      const end = v.seekable.end(v.seekable.length - 1);
+      if (Number.isFinite(end) && end > 0) return end;
+    }
+    if (videoDuration > 0) return videoDuration;
+    return data?.duration ?? 0;
+  }, [videoDuration, data]);
+
+  const handleSeek = useCallback(
+    (fraction: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      const length = seekableSeconds();
+      if (!(length > 0)) return;
+      const target = Math.max(0, Math.min(length - 0.05, fraction * length));
+      try {
+        v.currentTime = target;
+        // The displayed position follows the pointer immediately; waiting for
+        // `timeupdate` makes a drag feel like it is lagging behind.
+        setCurrentTime(target);
+      } catch {
+        /* the element is not ready to seek yet */
+      }
+    },
+    [seekableSeconds],
+  );
+
+  /**
+   * Play, pause, or start again from the beginning when it has ended.
+   *
+   * A finished video that is told to play simply stays where it is, which is
+   * why the button looked dead after a clip had run through once.
+   */
+  const togglePlayPause = useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) {
-      void v.play();
+      const length = seekableSeconds();
+      if (v.ended || (length > 0 && v.currentTime >= length - 0.05)) v.currentTime = 0;
+      void v.play().catch((err) => console.warn('[Editor] could not play:', err));
     } else {
       v.pause();
     }
-  }, []);
+  }, [seekableSeconds]);
 
-  const handleSeek = useCallback((fraction: number) => {
-    const v = videoRef.current;
-    if (!v || !v.duration) return;
-    v.currentTime = fraction * v.duration;
-  }, []);
+  const togglePlay = useCallback(() => togglePlayPause(), [togglePlayPause]);
 
   // When the recording carries no thumbnail of its own (e.g. a video uploaded
   // from local disk), grab a frame from the loaded <video> so the saved record
@@ -1694,7 +2037,11 @@ export function EditorApp() {
             muted={muteSystemAudio}
             onToggle={() => setMuteSystemAudio((v) => !v)}
             label="Audio"
-            available
+            // Only offered when the recording really has system sound. A
+            // recording made with audio switched off used to come back showing
+            // Audio as enabled, which said the opposite of what happened.
+            available={systemAudioAvailable}
+            unavailableHint="This recording has no system audio (it was switched off when the recording started)"
             icon={
               muteSystemAudio ? (
                 <svg
@@ -1838,7 +2185,13 @@ export function EditorApp() {
                   muted={previewVideoMuted}
                   style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
                   onTimeUpdate={() => {
-                    setCurrentTime(videoRef.current?.currentTime ?? 0);
+                    const at = videoRef.current?.currentTime ?? 0;
+                    // While the duration is being coaxed out of a file that
+                    // carries none, the playhead is parked far past the end.
+                    // That is a probe, not a position.
+                    if (Number.isFinite(at) && (totalDur <= 0 || at <= totalDur + 1)) {
+                      setCurrentTime(at);
+                    }
                     // Nudge the side track back in step if it drifts (seek, stall…).
                     const mic = auxAudioRef.current;
                     const vid = videoRef.current;
@@ -1851,6 +2204,37 @@ export function EditorApp() {
                     captureThumbnailFrame();
                     const mic = auxAudioRef.current;
                     if (mic && videoRef.current) mic.currentTime = videoRef.current.currentTime;
+                  }}
+                  onLoadedMetadata={() => {
+                    const video = videoRef.current;
+                    if (!video || Number.isFinite(video.duration)) return;
+                    // A recording made before durations were written into the
+                    // file reports Infinity, and a player with no duration
+                    // cannot seek at all. Asking it to jump past the end makes
+                    // it scan to the real one; then it rewinds and behaves.
+                    const restore = () => {
+                      video.removeEventListener('durationchange', learn);
+                      clearTimeout(giveUp);
+                      // Always put the playhead back, whether or not a duration
+                      // turned up: leaving it parked past the end of the clip
+                      // would look exactly like a video that refuses to play.
+                      try {
+                        video.currentTime = 0;
+                      } catch {
+                        /* nothing more to do */
+                      }
+                    };
+                    const learn = () => {
+                      if (!Number.isFinite(video.duration)) return;
+                      restore();
+                    };
+                    const giveUp = setTimeout(restore, 3_000);
+                    video.addEventListener('durationchange', learn);
+                    try {
+                      video.currentTime = 1e101;
+                    } catch {
+                      restore();
+                    }
                   }}
                   onDurationChange={() => {
                     const d = videoRef.current?.duration ?? 0;
@@ -2023,8 +2407,21 @@ export function EditorApp() {
             </span>
             {/* Seekbar */}
             <SeekBar
-              current={videoDuration > 0 ? currentTime / videoDuration : 0}
+              current={totalDur > 0 ? Math.min(1, currentTime / totalDur) : 0}
               onSeek={handleSeek}
+              onScrubStart={() => {
+                // Pause while dragging so the video does not race the pointer,
+                // and resume afterwards if it had been playing.
+                const v = videoRef.current;
+                resumeAfterScrubRef.current = !!v && !v.paused;
+                v?.pause();
+              }}
+              onScrubEnd={() => {
+                if (!resumeAfterScrubRef.current) return;
+                resumeAfterScrubRef.current = false;
+                void videoRef.current?.play().catch(() => {});
+              }}
+              durationSeconds={totalDur}
               disabled={!videoUrl}
             />
             <button
@@ -2644,63 +3041,149 @@ export function EditorApp() {
 
 // ─── SeekBar ──────────────────────────────────────────────────────────────────
 
+/**
+ * The playback scrubber, with the behaviour people expect from a video player.
+ *
+ * What was here before only handled a click on a four-pixel strip: no dragging,
+ * no keyboard, and a hit area so thin that half the attempts to grab it missed.
+ * Now a press anywhere jumps there and starts a scrub that follows the pointer
+ * until it is released — outside the bar and outside the window included, which
+ * is what pointer capture is for — and the arrow keys step through the clip.
+ */
 function SeekBar({
   current,
   onSeek,
+  onScrubStart,
+  onScrubEnd,
   disabled,
+  durationSeconds,
 }: {
   current: number;
   onSeek: (f: number) => void;
+  onScrubStart?: () => void;
+  onScrubEnd?: () => void;
   disabled: boolean;
+  durationSeconds: number;
 }) {
   const barRef = useRef<HTMLDivElement>(null);
-  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (disabled || !barRef.current) return;
-    const rect = barRef.current.getBoundingClientRect();
-    const f = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    onSeek(f);
+  const [scrubbing, setScrubbing] = useState(false);
+
+  const fractionAt = (clientX: number): number => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return 0;
+    return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
   };
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    event.preventDefault();
+    barRef.current?.setPointerCapture(event.pointerId);
+    setScrubbing(true);
+    onScrubStart?.();
+    onSeek(fractionAt(event.clientX));
+  };
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrubbing || disabled) return;
+    onSeek(fractionAt(event.clientX));
+  };
+
+  const endScrub = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!scrubbing) return;
+    try {
+      barRef.current?.releasePointerCapture(event.pointerId);
+    } catch {
+      /* already released */
+    }
+    setScrubbing(false);
+    onScrubEnd?.();
+  };
+
+  const step = (seconds: number) => {
+    if (disabled || !(durationSeconds > 0)) return;
+    const at = current * durationSeconds + seconds;
+    onSeek(Math.max(0, Math.min(1, at / durationSeconds)));
+  };
+
+  const percent = `${Math.max(0, Math.min(1, current)) * 100}%`;
+
   return (
     <div
       ref={barRef}
-      onClick={handleClick}
+      role="slider"
+      tabIndex={disabled ? -1 : 0}
+      aria-label="Seek"
+      aria-valuemin={0}
+      aria-valuemax={Math.round(durationSeconds)}
+      aria-valuenow={Math.round(current * durationSeconds)}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endScrub}
+      onPointerCancel={endScrub}
+      onKeyDown={(event) => {
+        if (event.key === 'ArrowRight') step(5);
+        else if (event.key === 'ArrowLeft') step(-5);
+        else if (event.key === 'Home') onSeek(0);
+        else if (event.key === 'End') onSeek(0.999);
+        else return;
+        event.preventDefault();
+      }}
       style={{
         flex: 1,
-        height: '4px',
-        background: 'rgba(255,255,255,0.1)',
-        borderRadius: '2px',
+        // A tall, transparent hit area around a thin visible track: the bar
+        // looks the same and is four times easier to hit.
+        height: '16px',
+        display: 'flex',
+        alignItems: 'center',
         cursor: disabled ? 'not-allowed' : 'pointer',
         position: 'relative',
         opacity: disabled ? 0.4 : 1,
+        touchAction: 'none',
+        outline: 'none',
       }}
     >
       <div
         style={{
-          position: 'absolute',
-          left: 0,
-          top: 0,
-          height: '100%',
-          width: `${current * 100}%`,
-          background: '#8b5cf6',
-          borderRadius: '2px',
-          transition: 'width 0.1s linear',
+          position: 'relative',
+          width: '100%',
+          height: scrubbing ? '6px' : '4px',
+          background: 'rgba(255,255,255,0.1)',
+          borderRadius: '3px',
+          transition: 'height 0.1s ease',
         }}
-      />
-      {!disabled && (
+      >
         <div
           style={{
             position: 'absolute',
-            top: '50%',
-            left: `${current * 100}%`,
-            transform: 'translate(-50%, -50%)',
-            width: '10px',
-            height: '10px',
-            borderRadius: '50%',
+            left: 0,
+            top: 0,
+            height: '100%',
+            width: percent,
             background: '#8b5cf6',
-            boxShadow: '0 0 0 2px rgba(139,92,246,0.4)',
+            borderRadius: '3px',
+            // No animation while dragging: the thumb must sit under the finger,
+            // not catch up with it.
+            transition: scrubbing ? 'none' : 'width 0.1s linear',
           }}
         />
-      )}
+        {!disabled && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '50%',
+              left: percent,
+              transform: 'translate(-50%, -50%)',
+              width: scrubbing ? '14px' : '10px',
+              height: scrubbing ? '14px' : '10px',
+              borderRadius: '50%',
+              background: '#8b5cf6',
+              boxShadow: '0 0 0 2px rgba(139,92,246,0.4)',
+              transition: 'width 0.1s ease, height 0.1s ease',
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -3336,9 +3819,17 @@ function ProjectSelector({
   disabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
   const ref = useRef<HTMLDivElement>(null);
-  const entries = projects ? Object.entries(projects) : [];
-  const hasProjects = entries.length > 0;
+  const searchRef = useRef<HTMLInputElement>(null);
+  const allEntries = projects ? Object.entries(projects) : [];
+  const hasProjects = allEntries.length > 0;
+  // Typing narrows the list. With thirty-odd projects, scrolling an
+  // alphabetical list by eye is the slowest part of saving a recording.
+  const needle = query.trim().toLowerCase();
+  const entries = needle
+    ? allEntries.filter(([name]) => name.toLowerCase().includes(needle))
+    : allEntries;
 
   // Refresh the project list from the API each time the dropdown opens.
   const toggleOpen = () => {
@@ -3350,7 +3841,11 @@ function ProjectSelector({
   };
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      setQuery('');
+      return;
+    }
+    searchRef.current?.focus();
     const onDocClick = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
@@ -3450,6 +3945,34 @@ function ProjectSelector({
               padding: '6px',
             }}
           >
+            {hasProjects && (
+              <div style={{ padding: '2px 2px 6px' }}>
+                <input
+                  ref={searchRef}
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') setOpen(false);
+                    if (e.key === 'Enter' && entries.length > 0) {
+                      onSelect(entries[0][0]);
+                      setOpen(false);
+                    }
+                  }}
+                  placeholder="Search projects…"
+                  style={{
+                    width: '100%',
+                    padding: '7px 9px',
+                    borderRadius: '8px',
+                    background: '#0b0b12',
+                    border: '1px solid rgba(255,255,255,0.1)',
+                    color: 'white',
+                    fontSize: '12px',
+                    fontFamily: 'inherit',
+                    outline: 'none',
+                  }}
+                />
+              </div>
+            )}
             {!hasProjects && (
               <div
                 style={{
@@ -3460,6 +3983,18 @@ function ProjectSelector({
                 }}
               >
                 No projects available
+              </div>
+            )}
+            {hasProjects && entries.length === 0 && (
+              <div
+                style={{
+                  padding: '12px 10px',
+                  fontSize: '12px',
+                  color: 'rgba(148,163,184,0.6)',
+                  textAlign: 'center',
+                }}
+              >
+                No project matches “{query}”
               </div>
             )}
             {entries.map(([name, info]) => {

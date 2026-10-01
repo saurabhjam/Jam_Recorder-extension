@@ -127,6 +127,14 @@ export interface DraftRecording {
    * treats a missing flag as exactly that.
    */
   audioMixed?: boolean;
+  /**
+   * Which sources this recording's sound actually came from.
+   *
+   * Absent on older recordings, where it is unknowable after the fact and the
+   * editor falls back to offering both controls.
+   */
+  hasSystemAudio?: boolean;
+  hasMicAudio?: boolean;
   backendRecordId?: string;
   shareUrl?: string;
   videoUrl?: string;
@@ -205,6 +213,15 @@ export type MessageType =
   | 'START_GOOGLE_LOGIN'
   | 'OAUTH_LOGIN_COMPLETE'
   | 'CAPTURE_FLUSH'
+  // Recording uploads — editor/popup ⇄ background. The queue that owns them
+  // lives in the worker, so an upload outlives the tab that started it.
+  | 'QUEUE_RECORDING_UPLOAD'
+  | 'RECORDING_UPLOAD_CONFIRMED'
+  | 'RECORDING_UPLOAD_RETRY'
+  | 'RECORDING_UPLOAD_FORGET'
+  | 'LIST_RECORDING_UPLOADS'
+  | 'HOLD_RECORDING_FILE'
+  | 'RECORDING_UPLOADS_CHANGED'
   // Screen monitoring — popup ⇄ background. The popup only sends intents; the
   // session itself is owned by the background (see monitoring.manager.ts).
   | 'MONITORING_START'

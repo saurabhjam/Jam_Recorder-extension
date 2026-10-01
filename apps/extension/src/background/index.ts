@@ -25,7 +25,22 @@ import type {
   CaptureData,
   DraftRecording,
 } from '@/types';
-import { STORAGE_KEYS, MAX_DRAFTS } from '@/types';
+import { STORAGE_KEYS, MAX_DRAFTS, AUTH_REFRESH_ALARM } from '@/types';
+import {
+  RECORDING_UPLOAD_ALARM,
+  configureUploader,
+  confirmRecordingUpload,
+  enqueueRecordingUpload,
+  forgetRecordingUpload,
+  handleRecordingUploadAlarm,
+  holdLocalCopy,
+  listUploadJobs,
+  releaseLocalCopy,
+  notifyUploadsOnline,
+  resumeRecordingUpload,
+  restoreRecordingUploads,
+  UploadAttemptError,
+} from '@/background/recordings.uploader';
 import { generateId, isRestrictedUrl } from '@/utils';
 import {
   configureMonitoringOffscreen,
@@ -137,6 +152,49 @@ configureMonitoringOffscreen({
 // alarms, messages and navigation events far more often than by a browser
 // launch, and a live session needs its alarm and idle listener back each time.
 void restoreMonitoringSession();
+
+// ─── Recording uploads ────────────────────────────────────────────────────────
+//
+// The queue lives in recordings.uploader.ts, which decides when to try and what
+// a failure means. These are its hands: the offscreen document, which is where
+// the file and the network are. The document is created on demand — the worker
+// can do that without a user gesture — so a retry works hours later with no
+// window open anywhere.
+
+configureUploader({
+  attempt: async (job) => {
+    await ensureOffscreenDocument();
+    const response = (await sendToOffscreen('OFFSCREEN_UPLOAD_JOB', job)) as {
+      success?: boolean;
+      result?: { videoFileName: string; backendRecordId: string; videoUrl?: string };
+      failure?: { message: string; status: number; partial?: Record<string, unknown> };
+    };
+    if (response?.success && response.result) return response.result;
+    const failure = response?.failure;
+    throw new UploadAttemptError(
+      failure?.message ?? 'Upload failed',
+      failure?.status ?? 0,
+      (failure?.partial ?? {}) as Partial<{ videoFileName: string; backendRecordId: string }>,
+    );
+  },
+  discardLocal: async (recordingId, exportId) => {
+    await ensureOffscreenDocument();
+    await sendToOffscreen('OFFSCREEN_DISCARD_RECORDING', { recordingId, exportId });
+  },
+});
+
+// Pick up anything a previous session left owing, on every worker start.
+void restoreRecordingUploads();
+
+// The machine is back on the network: everything that was waiting for that can
+// go now rather than at its next backoff.
+// Guarded the same way monitoring guards its own: a throw at module scope here
+// would take the entire service worker down with it.
+if (typeof self !== 'undefined' && typeof self.addEventListener === 'function') {
+  self.addEventListener('online', () => {
+    void notifyUploadsOnline();
+  });
+}
 
 // ─── Recording State ──────────────────────────────────────────────────────────
 
@@ -651,6 +709,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void handleMonitoringSyncAlarm();
     return;
   }
+  // The sign-in check. Without this listener the alarm fired into nothing: the
+  // refresh only ever happened reactively, off the back of a 401, which is
+  // exactly the request that had already failed.
+  if (alarm.name === AUTH_REFRESH_ALARM) {
+    void authManager.handleRefreshAlarm();
+    return;
+  }
+  // Recordings waiting to go up — a server that was down, a network that was
+  // gone, a sign-in that had lapsed. Armed only while something is owed.
+  if (alarm.name === RECORDING_UPLOAD_ALARM) {
+    void handleRecordingUploadAlarm();
+    return;
+  }
   if (alarm.name !== URL_POLL_ALARM) return;
   void (async () => {
     await ensureRecordingStateRestored();
@@ -1023,10 +1094,19 @@ async function injectFloatingToolbar(targetTabId?: number): Promise<boolean> {
       target: { tabId },
       files: ['src/content/index.js'],
     });
-    await new Promise<void>((r) => setTimeout(r, 150));
-    const retry = await sendShow();
-    if (retry.delivered) markToolbarShown(targetTab);
-    return retry.mounted;
+    // A freshly injected script registers its listener within a few
+    // milliseconds. Waiting a flat 150ms for it made the controls appear long
+    // after the recording had started; asking early and often gets them up as
+    // soon as the script is ready, and costs nothing when it is ready at once.
+    for (let wait = 10; wait <= 160; wait *= 2) {
+      await new Promise<void>((r) => setTimeout(r, wait));
+      const retry = await sendShow();
+      if (retry.delivered) {
+        markToolbarShown(targetTab);
+        if (retry.mounted) return true;
+      }
+    }
+    return false;
   } catch (err) {
     console.error('[Background] Could not inject toolbar into tab', tabId, err);
     return false;
@@ -1241,24 +1321,37 @@ async function recordVisitedUrl(tabId: number, urlHint?: string): Promise<void> 
  */
 async function hideFloatingToolbar(): Promise<void> {
   const hideMsg = { type: 'HIDE_TOOLBAR' } satisfies ExtensionMessage;
-  const tabIds = new Set(toolbarShownOnTabs);
-  if (currentRecordingTabId) tabIds.add(currentRecordingTabId);
+  const known = new Set(toolbarShownOnTabs);
+  if (currentRecordingTabId) known.add(currentRecordingTabId);
 
-  try {
-    for (const tab of await chrome.tabs.query({})) {
-      if (tab.id != null) tabIds.add(tab.id);
-    }
-  } catch {
-    /* fall back to the tracked set below */
-  }
-
+  // The tabs that actually have one are cleared first, and waited for.
   await Promise.all(
-    Array.from(tabIds).map((tabId) =>
+    Array.from(known).map((tabId) =>
       chrome.tabs.sendMessage(tabId, hideMsg).catch(() => {
         /* ignore — tab may already be closed, or never had a toolbar mounted */
       }),
     ),
   );
+
+  // Then every other tab, as a safety net for a toolbar left by a worker that
+  // died before it could record where it put one. Deliberately not awaited:
+  // this runs at the start of every recording, and messaging a hundred tabs
+  // that mostly have no content script at all used to be the first thing a
+  // recording did — before the stream, before the controls.
+  void (async () => {
+    try {
+      const tabs = await chrome.tabs.query({});
+      await Promise.all(
+        tabs
+          .map((tab) => tab.id)
+          .filter((id): id is number => id != null && !known.has(id))
+          .map((tabId) => chrome.tabs.sendMessage(tabId, hideMsg).catch(() => {})),
+      );
+    } catch {
+      /* the tracked set above is the part that matters */
+    }
+  })();
+
   toolbarShownOnTabs.clear();
   lastInjectionAtByTab.clear();
   void chrome.storage.session.remove([TOOLBAR_TABS_SESSION_KEY]).catch(() => {});
@@ -1448,17 +1541,28 @@ async function handleStartRecording(
     persistToolbarTabs();
     if (currentRecordingTabId) void recordVisitedUrl(currentRecordingTabId, activeTab?.url);
 
+    // The controls come up first, before any of the plumbing below.
+    //
+    // They used to wait behind setting up dynamic tab audio, which walks every
+    // tab in scope and starts a capture on each — seconds of work on a busy
+    // browser, during which the recording was already running and the person
+    // had nothing to stop or pause it with. Nothing below needs the toolbar to
+    // exist, and the toolbar needs nothing below.
+    setBadge('REC', '#ef4444');
+    elapsedSeconds = 0;
+    startTimer();
+    await injectFloatingToolbar();
+
     // For screen/window shares that produced no direct audio (macOS), start
     // capturing tab audio across the selected scope — the picked window, or the
     // whole browser for entire-screen — and keep following tabs as they play.
+    // Not awaited: it only adds audio sources to a recording that is already
+    // running, so it must not hold up the controls.
     if (options.type === 'screen' && options.systemAudio && startResp?.needsTabAudio) {
-      await setupDynamicTabAudio(startResp.displaySurface, activeTab?.windowId ?? null);
+      void setupDynamicTabAudio(startResp.displaySurface, activeTab?.windowId ?? null).catch(
+        (err) => console.warn('[Background] could not attach tab audio:', err),
+      );
     }
-
-    setBadge('REC', '#ef4444');
-    await injectFloatingToolbar();
-    elapsedSeconds = 0;
-    startTimer();
 
     // Guaranteed-wake backstop for cross-window URL/toolbar tracking — see the
     // alarm listener above for why this exists alongside the 1s setInterval poll.
@@ -2742,6 +2846,58 @@ chrome.runtime.onMessage.addListener(
         return false;
       }
 
+      // The editor is about to save, or has saved. Everything durable about an
+      // upload goes through the queue, so that a tab being closed, a crash or a
+      // server outage cannot be the end of a recording.
+      case 'QUEUE_RECORDING_UPLOAD': {
+        void enqueueRecordingUpload(
+          message.payload as Parameters<typeof enqueueRecordingUpload>[0],
+        ).then((job) => sendResponse({ success: true, job }));
+        return true;
+      }
+
+      case 'RECORDING_UPLOAD_CONFIRMED': {
+        const { recordingId, backendRecordId, videoFileName } = message.payload as {
+          recordingId: string;
+          backendRecordId: string;
+          videoFileName?: string | null;
+        };
+        void confirmRecordingUpload(recordingId, { backendRecordId, videoFileName }).then(() =>
+          sendResponse({ success: true }),
+        );
+        return true;
+      }
+
+      case 'RECORDING_UPLOAD_RETRY': {
+        const { recordingId } = message.payload as { recordingId: string };
+        void resumeRecordingUpload(recordingId).then(() => sendResponse({ success: true }));
+        return true;
+      }
+
+      case 'RECORDING_UPLOAD_FORGET': {
+        const { recordingId } = message.payload as { recordingId: string };
+        void forgetRecordingUpload(recordingId).then(() => sendResponse({ success: true }));
+        return true;
+      }
+
+      // An editor window is showing this recording, so its local copy must
+      // survive the upload being confirmed — it is what the player is playing.
+      case 'HOLD_RECORDING_FILE': {
+        const { recordingId, release } = message.payload as {
+          recordingId: string;
+          release?: boolean;
+        };
+        void (release ? releaseLocalCopy(recordingId) : holdLocalCopy(recordingId)).then(() =>
+          sendResponse({ success: true }),
+        );
+        return true;
+      }
+
+      case 'LIST_RECORDING_UPLOADS': {
+        void listUploadJobs().then((jobs) => sendResponse({ success: true, jobs }));
+        return true;
+      }
+
       case 'AUTH_STATE_CHANGED': {
         const { isAuthenticated } = message.payload as { isAuthenticated: boolean };
         if (!isAuthenticated) void authManager.onLogout();
@@ -2790,10 +2946,23 @@ async function registerDraft(entry: DraftRecording): Promise<void> {
   const kept = next.slice(0, MAX_DRAFTS);
   const evicted = next.slice(MAX_DRAFTS);
 
-  const update: Record<string, unknown> = { [STORAGE_KEYS.DRAFTS_INDEX]: kept };
-  if (evicted.length > 0) {
+  // Eviction may never destroy a recording the server does not have.
+  //
+  // The list is capped at five, and falling off the end used to queue the file
+  // for deletion — so a sixth recording silently deleted the first, uploaded or
+  // not. Anything still owed to the server is kept in the list instead: the cap
+  // is about how much is shown, and it is not a reason to lose a video.
+  const uploaded = (draft: DraftRecording) =>
+    draft.status === 'saved' || Boolean(draft.backendRecordId);
+  const unsafeToDrop = evicted.filter((draft) => !uploaded(draft));
+  const droppable = evicted.filter(uploaded);
+
+  const update: Record<string, unknown> = {
+    [STORAGE_KEYS.DRAFTS_INDEX]: [...kept, ...unsafeToDrop],
+  };
+  if (droppable.length > 0) {
     const cleanup = (result[STORAGE_KEYS.PENDING_BLOB_CLEANUP] as string[] | undefined) ?? [];
-    const evictedIds = evicted.map((d) => d.recordingId);
+    const evictedIds = droppable.map((d) => d.recordingId);
     update[STORAGE_KEYS.PENDING_BLOB_CLEANUP] = [...new Set([...cleanup, ...evictedIds])];
   }
   await chrome.storage.local.set(update);
@@ -2832,6 +3001,8 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         title: readyTitle,
         recordingType: readyRecordingType,
         audioMixed,
+        hasSystemAudio,
+        hasMicAudio,
       } = message.payload as {
         thumbnailDataUrl: string | null;
         duration: number;
@@ -2841,6 +3012,8 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
         title?: string;
         recordingType?: string;
         audioMixed?: boolean;
+        hasSystemAudio?: boolean;
+        hasMicAudio?: boolean;
       };
 
       const editorRecordingId = readyRecordingId ?? 'unknown';
@@ -2867,6 +3040,8 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
               networkCaptures: capture.networkCaptures,
               visitedUrls: capture.visitedUrls,
               audioMixed: audioMixed ?? false,
+              hasSystemAudio: hasSystemAudio ?? false,
+              hasMicAudio: hasMicAudio ?? false,
             },
           });
           await registerDraft({
@@ -2882,6 +3057,8 @@ function handleOffscreenMessage(message: ExtensionMessage & { target?: string })
             // LATEST recording) — so reopening an older draft still reads the right
             // answer for that file rather than the newest one's.
             audioMixed: audioMixed ?? false,
+            hasSystemAudio: hasSystemAudio ?? false,
+            hasMicAudio: hasMicAudio ?? false,
           });
           await chrome.windows.create({
             url: chrome.runtime.getURL(`src/editor/index.html?recordingId=${editorRecordingId}`),

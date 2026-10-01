@@ -1405,6 +1405,98 @@ await scenario('MON shows while monitoring, survives a recording, and clears whe
   return env;
 });
 
+// MON is the only thing most people look at, so it gets a case per way a
+// session can end — and one for a session that is open but capturing nothing.
+
+await scenario('MON goes when the agent dies, and comes back when it does', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(2 * MIN);
+  ok(env.badge === 'MON', `badge "${env.badge}" while capturing`);
+
+  env.agent.crash(); // nothing is being captured from here
+  await env.advance(3 * MIN);
+  ok(env.badge !== 'MON', `badge still "${env.badge}" with no agent and no frames`);
+
+  await new Promise((r) => setTimeout(r, 1200)); // the extension relaunches it
+  await env.advance(3 * MIN);
+  ok(env.badge === 'MON', `badge "${env.badge}" once frames are landing again`);
+  return env;
+});
+
+await scenario('every way a session can end clears MON', async () => {
+  // The user stops.
+  let env = await environment();
+  await env.start();
+  await env.advance(2 * MIN);
+  ok(env.badge === 'MON');
+  await env.stop();
+  ok(env.badge === '', `after a stop: "${env.badge}"`);
+  env.shutdown();
+
+  // An hour with no input.
+  env = await environment();
+  await env.start();
+  await env.advance(2 * MIN);
+  env.os.working = false;
+  await env.advance(62 * MIN);
+  ok((await env.state()).status === 'idle', 'the hour should have ended it');
+  ok(env.badge === '', `after an auto-stop: "${env.badge}"`);
+  env.shutdown();
+
+  // The network goes.
+  env = await environment();
+  await env.start();
+  await env.advance(2 * MIN);
+  env.setOnline(false);
+  await env.advance(3 * MIN);
+  ok(env.badge === '', `after losing the network: "${env.badge}"`);
+  env.shutdown();
+
+  // An administrator stops it.
+  env = await environment();
+  const admin = await env.start();
+  await env.advance(2 * MIN);
+  env.server.adminStop(admin.sessionId);
+  await env.advance(3 * MIN);
+  ok(env.badge === '', `after an administrator stop: "${env.badge}"`);
+  return env;
+});
+
+await scenario('a worker that died mid-session shows no MON for a session that ended meanwhile', async () => {
+  const env = await environment();
+  const first = await env.start();
+  await env.advance(5 * MIN);
+  ok(env.badge === 'MON');
+  // The machine goes off with MON on the toolbar; the server expires the
+  // session while it is away; Chrome comes back.
+  const next = await machineGone(env, 20 * MIN);
+  next.badge = 'MON'; // what the toolbar still shows from before
+  await next.worker.restoreMonitoringSession();
+  await settle(100);
+  await next.advance(2 * MIN);
+  ok(next.session(first.sessionId).status !== 'ACTIVE', 'the session should be over');
+  ok((await next.state()).status === 'idle', `status ${(await next.state()).status}`);
+  ok(next.badge === '', `badge "${next.badge}" after coming back to an ended session`);
+  return next;
+});
+
+await scenario('signed out, still capturing → MON stays, and nothing is thrown away', async () => {
+  const env = await environment();
+  await env.start();
+  await env.advance(5 * MIN);
+  env.server.revokeSignIns();
+  await env.advance(20 * MIN);
+  // Monitoring is genuinely running and frames are genuinely being captured;
+  // they are queued rather than uploaded, which the popup explains. The badge
+  // tells the truth about capture, not about the upload.
+  ok(env.badge === 'MON', `badge "${env.badge}" while still capturing`);
+  const state = await env.state();
+  ok(state.queuedSnapshots > 20, `only ${state.queuedSnapshots} screenshots kept`);
+  ok(state.failedSnapshots === 0, `${state.failedSnapshots} thrown away`);
+  return env;
+});
+
 // ─── An administrator stops a member's monitoring ─────────────────────────────
 
 await scenario('admin stops a member while they work → extension stops within a minute and does not restart', async () => {

@@ -19,6 +19,7 @@ import { useClipboard } from '@/hooks/useClipboard';
 import { useToast } from '@/components/ui/Toast';
 import { formatDuration, formatRelativeDate, formatBytes } from '@/utils';
 import { useDrafts } from '../useDrafts';
+import { describeStage, type UploadJob } from '@/utils/recordingUploadPolicy';
 import type { DraftRecording } from '@/types';
 
 interface LibraryViewProps {
@@ -68,11 +69,13 @@ export function LibraryView({ onBack }: LibraryViewProps) {
                 <DraftCard
                   key={draft.recordingId}
                   draft={draft}
+                  upload={drafts.uploads[draft.recordingId]}
                   index={i}
                   isBusy={drafts.busyId === draft.recordingId}
                   onSave={() => drafts.openInEditor(draft.recordingId)}
                   onDownload={() => drafts.download(draft)}
                   onDiscard={() => drafts.discard(draft.recordingId)}
+                  onRetry={() => drafts.retryUpload(draft.recordingId)}
                 />
               ))}
             </AnimatePresence>
@@ -87,16 +90,33 @@ export function LibraryView({ onBack }: LibraryViewProps) {
 
 interface DraftCardProps {
   draft: DraftRecording;
+  /** What the background queue still owes the server for this recording. */
+  upload?: UploadJob;
   index: number;
   isBusy: boolean;
   onSave: () => void;
   onDownload: () => void;
   onDiscard: () => void;
+  onRetry: () => void;
 }
 
-function DraftCard({ draft, index, isBusy, onSave, onDownload, onDiscard }: DraftCardProps) {
+function DraftCard({
+  draft,
+  upload,
+  index,
+  isBusy,
+  onSave,
+  onDownload,
+  onDiscard,
+  onRetry,
+}: DraftCardProps) {
   const { copied, copy } = useClipboard();
   const { showToast } = useToast();
+
+  // Anything the server has not confirmed yet. A paused job counts: it is not
+  // being retried by itself, but the recording is still here and still owed.
+  const inFlight = Boolean(upload && upload.stage !== 'confirmed');
+  const uploadNote = upload && inFlight ? describeStage(upload, navigator.onLine) : null;
 
   const handleCopyLink = async () => {
     if (!draft.shareUrl) return;
@@ -147,6 +167,13 @@ function DraftCard({ draft, index, isBusy, onSave, onDownload, onDiscard }: Draf
           <Badge variant={draft.status === 'saved' ? 'success' : 'warning'} size="sm" dot>
             {draft.status === 'saved' ? 'Saved' : 'Draft'}
           </Badge>
+          {/* An upload in flight, waiting, or stopped. Never "failed": the
+              video is on this computer and the queue is still on it. */}
+          {inFlight && (
+            <Badge variant={upload?.stage === 'paused' ? 'ghost' : 'info'} size="sm" dot>
+              {upload?.stage === 'uploading' ? 'Uploading' : 'Pending upload'}
+            </Badge>
+          )}
           {draft.status === 'saved' && (
             <Badge variant={draft.isPublic ? 'warning' : 'ghost'} size="sm">
               {draft.isPublic ? <Globe size={10} /> : <Lock size={10} />}
@@ -154,6 +181,21 @@ function DraftCard({ draft, index, isBusy, onSave, onDownload, onDiscard }: Draf
             </Badge>
           )}
         </div>
+
+        {uploadNote && (
+          <p className="text-xxs text-dark-400 mt-1 leading-snug">
+            {uploadNote}
+            {upload?.stage === 'paused' && (
+              <button
+                type="button"
+                onClick={onRetry}
+                className="ml-1 underline text-jam-300 hover:text-jam-200"
+              >
+                Try again
+              </button>
+            )}
+          </p>
+        )}
       </div>
 
       {/* Actions */}

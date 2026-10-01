@@ -14,7 +14,8 @@
  */
 
 import { STORAGE_KEYS } from '@/types';
-import type { AssignedProject, AuthTokens, User } from '@/types';
+import type { AssignedProject, User } from '@/types';
+import { getFreshAccessToken } from '@/services/tokens';
 import { MONITORING_STORAGE_KEYS } from '@/types/monitoring';
 import { API_BASE_URL } from '@/config';
 
@@ -49,8 +50,9 @@ function toOptions(projects: Record<string, AssignedProject> | undefined): Proje
  * accepted rather than assuming one.
  */
 async function fetchAssignedProjectsFromApi(): Promise<Record<string, AssignedProject> | null> {
-  const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-  const token = (stored[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined)?.accessToken;
+  // Refreshed if it is near expiry: this runs from a popup that may have been
+  // closed for hours, and a 401 here would quietly show an empty picker.
+  const token = await getFreshAccessToken();
   if (!token) return null;
 
   try {
@@ -69,20 +71,29 @@ async function fetchAssignedProjectsFromApi(): Promise<Record<string, AssignedPr
 }
 
 /**
- * The user's projects, newest knowledge first.
+ * The user's projects.
+ *
+ * `refresh` asks the server rather than trusting what was stored at sign-in.
+ * Without it, a project someone was added to this morning did not appear until
+ * they signed out and in again — the stored list was only ever consulted, and
+ * only refetched when it was empty. Anywhere a person is about to choose a
+ * project asks for a refresh; the stored list is what is shown meanwhile, and
+ * what is kept if the server cannot be reached.
  *
  * A successful refetch is written back onto the stored user so the next call —
  * and every other part of the extension that reads `AUTH_USER` — sees it too.
  */
-export async function getAssignedProjects(): Promise<ProjectOption[]> {
+export async function getAssignedProjects(options?: {
+  refresh?: boolean;
+}): Promise<ProjectOption[]> {
   const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_USER]);
   const user = stored[STORAGE_KEYS.AUTH_USER] as User | undefined;
-
   const fromStorage = toOptions(user?.assignedProjects);
-  if (fromStorage.length > 0) return fromStorage;
+
+  if (!options?.refresh && fromStorage.length > 0) return fromStorage;
 
   const fetched = await fetchAssignedProjectsFromApi();
-  if (!fetched) return [];
+  if (!fetched) return fromStorage;
 
   if (user) {
     await chrome.storage.local.set({
