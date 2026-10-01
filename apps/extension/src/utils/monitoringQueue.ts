@@ -663,6 +663,32 @@ export async function sessionLiveWork(sessionId: string, now: number): Promise<n
   return work;
 }
 
+/**
+ * The newest moment this session has captured work queued for, or null.
+ *
+ * Used when a session has to be ended at a moment in the past — the network was
+ * lost, the server stopped hearing us — to check how far the machine actually
+ * went on capturing. Work it captured while it was plainly alive belongs inside
+ * the session; ending the session before it would refuse exactly that data.
+ */
+export async function newestCapturedAtMs(sessionId: string): Promise<number | null> {
+  let newest: number | null = null;
+  await read([SNAPSHOTS, ACTIVITIES], async (transaction) => {
+    for (const name of [SNAPSHOTS, ACTIVITIES]) {
+      await iterate<QueuedItemState>(
+        transaction.objectStore(name).index('sessionId'),
+        IDBKeyRange.only(sessionId),
+        'next',
+        (entry) => {
+          if (entry.status !== 'pending') return;
+          if (newest == null || entry.producedAtMs > newest) newest = entry.producedAtMs;
+        },
+      );
+    }
+  });
+  return newest;
+}
+
 // ─── Stats and upkeep ─────────────────────────────────────────────────────────
 
 export interface OutboxStats {
@@ -676,10 +702,31 @@ export interface OutboxStats {
   snapshotBytes: number;
 }
 
-export async function outboxStats(): Promise<OutboxStats> {
+/**
+ * @param deadSince Only count as refused what was given up on at or after this
+ *   moment. Dead items are kept for a week as evidence, but a refusal from an
+ *   outage two days ago is not news about the session running now — reported
+ *   against it, it reads as a live fault that nothing can clear.
+ */
+export async function outboxStats(deadSince: number | null = null): Promise<OutboxStats> {
   return read(DATA_STORES, async (transaction) => {
     const count = (name: string, status: QueuedItemStatus) =>
       request(transaction.objectStore(name).index('status').count(IDBKeyRange.only(status)));
+
+    const countDead = async (name: string): Promise<number> => {
+      if (deadSince == null) return count(name, 'dead');
+      let seen = 0;
+      await iterate<QueuedItemState>(
+        transaction.objectStore(name).index('status'),
+        IDBKeyRange.only('dead'),
+        'next',
+        (entry) => {
+          if ((entry.deadAt ?? entry.producedAtMs) >= deadSince) seen += 1;
+          return true;
+        },
+      );
+      return seen;
+    };
 
     const oldest = async (name: string): Promise<number | null> => {
       let found: number | null = null;
@@ -698,9 +745,9 @@ export async function outboxStats(): Promise<OutboxStats> {
     const [pendingSnapshots, deadSnapshots, pendingActivities, deadActivities, pendingEvents] =
       await Promise.all([
         count(SNAPSHOTS, 'pending'),
-        count(SNAPSHOTS, 'dead'),
+        countDead(SNAPSHOTS),
         count(ACTIVITIES, 'pending'),
-        count(ACTIVITIES, 'dead'),
+        countDead(ACTIVITIES),
         count(EVENTS, 'pending'),
       ]);
     const oldestTimes = (

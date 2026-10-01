@@ -128,6 +128,17 @@ class FakeServer {
     this.sessions = new Map();
     this.down = false;
     this.nextId = 1;
+    // The sign-in server, which is what the extension must keep alive on its
+    // own: tokens expire, refreshing rotates them, and an expired or unknown
+    // token is answered with a plain 401.
+    this.access = new Map(); // token -> expiry
+    this.refreshable = new Set(); // refresh tokens still usable
+    this.tokenLifetimeMs = 60 * MIN;
+    this.ssoDown = false;
+    this.requireAuth = true;
+    this.refreshes = 0;
+    this.unauthorized = 0;
+    this.nextToken = 1;
     /** The sweeper runs every minute while the server is up. */
     this.sweeping = true;
     /** No expiry before this: a restarted server gives clients a full timeout to be heard. */
@@ -141,6 +152,56 @@ class FakeServer {
       const live = s.status === 'ACTIVE' || s.status === 'PAUSED';
       if (live && s.lastHeartbeatAt < NOW - HEARTBEAT_TIMEOUT) this.expire(s.id);
     }
+  }
+
+  /** Issue a fresh pair, as signing in does. */
+  signIn() {
+    const n = this.nextToken++;
+    const accessToken = `access-${n}`;
+    const refreshToken = `refresh-${n}`;
+    this.access.set(accessToken, NOW + this.tokenLifetimeMs);
+    this.refreshable.add(refreshToken);
+    return { accessToken, refreshToken, expiresAt: NOW + this.tokenLifetimeMs };
+  }
+
+  /** Every sign-in is revoked — as a password change or a server restart does. */
+  revokeSignIns() {
+    this.access.clear();
+    this.refreshable.clear();
+  }
+
+  tokenOf(init) {
+    const header = init?.headers?.Authorization ?? init?.headers?.authorization ?? '';
+    return header.startsWith('Bearer ') ? header.slice(7) : null;
+  }
+
+  authorized(init) {
+    if (!this.requireAuth) return true;
+    const token = this.tokenOf(init);
+    const expiry = token == null ? null : this.access.get(token);
+    return expiry != null && expiry > NOW;
+  }
+
+  sso(init) {
+    if (this.ssoDown) throw new TypeError('Failed to fetch');
+    const body = new URLSearchParams(init?.body ?? '');
+    const presented = body.get('refresh_token');
+    if (!presented || !this.refreshable.has(presented)) {
+      return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 });
+    }
+    // Rotation: the token just used stops working, which is what makes two
+    // parts of the extension refreshing at once a race.
+    this.refreshable.delete(presented);
+    this.refreshes += 1;
+    const next = this.signIn();
+    return new Response(
+      JSON.stringify({
+        access_token: next.accessToken,
+        refresh_token: next.refreshToken,
+        expires_in: Math.round(this.tokenLifetimeMs / SEC),
+      }),
+      { status: 200 },
+    );
   }
 
   /** The API process restarts after being down: its sweeper starts with a grace period. */
@@ -244,8 +305,14 @@ class FakeServer {
   }
 
   async fetch(url, init = {}) {
+    const rawPath = new URL(url).pathname;
+    if (rawPath.endsWith('/sso/oauth/token')) return this.sso(init);
     if (this.down) throw new TypeError('Failed to fetch');
-    const path = new URL(url).pathname.replace(/^\/v1\/[^/]+\/monitoring/, '');
+    if (!this.authorized(init)) {
+      this.unauthorized += 1;
+      return new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 });
+    }
+    const path = rawPath.replace(/^\/v1\/[^/]+\/monitoring/, '');
     const body = init.body && typeof init.body === 'string' ? JSON.parse(init.body) : {};
     const reply = (status, payload) =>
       new Response(status === 204 ? null : JSON.stringify(payload ?? {}), { status });
@@ -629,6 +696,13 @@ async function environment({ store, server, keepClock = false } = {}) {
   env.os = new FakeOs();
   env.agent = new FakeAgent(env);
   env.chrome = makeChrome(env);
+  // Signed in, as the person is before they start monitoring. Carried over
+  // when a scenario reuses a store, so a restarted worker keeps its sign-in.
+  if (!env.store.has('st_auth_tokens')) {
+    env.store.set('st_auth_tokens', env.server.signIn());
+  }
+  env.signIn = () => env.store.set('st_auth_tokens', env.server.signIn());
+  env.tokens = () => env.store.get('st_auth_tokens') ?? null;
   globalThis.chrome = env.chrome;
   globalThis.indexedDB = new fakeIdb.IDBFactory();
   globalThis.IDBKeyRange = fakeIdb.IDBKeyRange;
@@ -1023,7 +1097,7 @@ async function machineGone(env, awayMs) {
   return next;
 }
 
-await scenario('internet lost while working → monitoring stops within ~2 min, session ends at the loss; nothing stuck', async () => {
+await scenario('internet lost while working → stops within ~2 min, ends where capture did; nothing refused or stuck', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(10 * MIN);
@@ -1037,12 +1111,22 @@ await scenario('internet lost while working → monitoring stops within ~2 min, 
   await env.advance(10 * MIN); // back online: queued data and the stop go up
   const old = env.session(first.sessionId);
   ok(old.status === 'COMPLETED', `session ${old.status}`);
-  near((old.endedAt - lostAt) / MIN, 0, 1.2, 'session end vs the network loss (min)');
+  // Not at the moment the network went: at the moment monitoring really
+  // stopped. The minute in between was worked and captured, and ending the
+  // session before it is what used to have the server refuse those frames.
+  ok(old.endedAt >= lostAt, 'the end is not before the loss');
+  near((old.endedAt - lostAt) / MIN, 1.5, 1.5, 'session end vs the network loss (min)');
   ok(env.server.sessions.size === 1, 'no new session was started by itself');
   ok(env.session(first.sessionId).snapshots.size >= 19, 'everything from before the loss was uploaded');
   const after = await env.state();
   ok(after.queuedSnapshots + after.pendingSyncItems === 0,
     `still "uploading": ${after.queuedSnapshots} screenshots, ${after.pendingSyncItems} records`);
+  // The session ends where contact was lost, but the machine went on capturing
+  // for the minute it took to notice. That minute is real work, so the end
+  // covers it and the server takes it — it used to be refused and dropped.
+  ok(after.failedSnapshots === 0, `${after.failedSnapshots} screenshots refused after the stop`);
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
   ok(inactiveReport(env.server).minutes === 0, inactiveReport(env.server).detail);
   const again = await env.start();
   ok(again.status === 'monitoring' && again.sessionId !== first.sessionId, 'starts again normally');
@@ -1360,15 +1444,140 @@ await scenario('admin clears a member whose laptop is off → ends at the last b
   return next;
 });
 
-await scenario('a server expiry ends monitoring here too — it is not resumed in a new session', async () => {
+// ─── The server expired it: which of the two actually went away ───────────────
+//
+// An expiry only says the server stopped hearing this machine. If the machine
+// was asleep, off or unplugged, nobody was being monitored and monitoring ends
+// where it stopped — the laptop, sleep and browser-closed scenarios above. If
+// the machine kept running and only the path to the server broke, the work was
+// real and everything from it is queued, so it is kept.
+
+await scenario('the server is unreachable for an hour while the laptop works on → the hour is kept, nothing refused', async () => {
+  const env = await environment();
+  const first = await env.start();
+  await env.advance(60 * MIN);
+  const reachable = env.server.fetch.bind(env.server);
+  env.server.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+  await env.advance(60 * MIN); // still working; the sweeper expires the session meanwhile
+  ok(env.session(first.sessionId).status === 'EXPIRED', env.session(first.sessionId).status);
+  env.server.fetch = reachable;
+  await env.advance(60 * MIN); // reachable again, and still working
+
+  const state = await env.state();
+  ok(state.status === 'monitoring', `status ${state.status}`);
+  ok(state.failedSnapshots === 0, `${state.failedSnapshots} screenshots refused`);
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
+  const monitored = [...env.server.sessions.values()]
+    .reduce((sum, s) => sum + ((s.endedAt ?? NOW) - s.startedAt), 0);
+  near(monitored / MIN, 180, 2, 'monitored minutes across the sessions');
+  const idle = inactiveReport(env.server);
+  ok(idle.minutes === 0, `worked throughout, yet ${idle.minutes} min inactive: ${idle.detail}`);
+  return env;
+});
+
+await scenario('an expiry while this machine is demonstrably alive → it carries on in a successor session', async () => {
   const env = await environment();
   const first = await env.start();
   await env.advance(5 * MIN);
   env.server.expire(first.sessionId);
-  await env.advance(2 * MIN);
+  await env.advance(3 * MIN);
   const state = await env.state();
+  ok(state.status === 'monitoring', `status ${state.status}`);
+  ok(state.sessionId && state.sessionId !== first.sessionId, 'a successor session took over');
+  const old = env.session(first.sessionId);
+  ok(old.status === 'COMPLETED', `the expired session was re-settled, not left ${old.status}`);
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
+  return env;
+});
+
+await scenario('an expiry after this machine went quiet → monitoring ends, and is not resumed', async () => {
+  const env = await environment();
+  const first = await env.start();
+  await env.advance(5 * MIN);
+  const next = await machineGone(env, 10 * MIN); // off: the sweeper expires it meanwhile
+  ok(next.session(first.sessionId).status === 'EXPIRED', next.session(first.sessionId).status);
+  await next.advance(2 * MIN);
+  const state = await next.state();
   ok(state.status === 'idle', `${state.status}`);
-  ok(env.server.sessions.size === 1, 'no new session was started by itself');
+  ok(next.server.sessions.size === 1, 'no new session was started by itself');
+  return next;
+});
+
+// ─── The sign-in ──────────────────────────────────────────────────────────────
+//
+// Monitoring runs in a service worker nobody is watching, for hours. A sign-in
+// that lapses there is invisible until a day's work is sitting in the outbox
+// being refused, so these cover the whole life of a token: expiring on time,
+// expiring while the sign-in server is unreachable, and being revoked outright.
+
+await scenario('the access token expires twice during a shift → it refreshes itself, nothing is refused', async () => {
+  const env = await environment();
+  env.server.tokenLifetimeMs = 45 * MIN;
+  const first = await env.start();
+  const firstToken = env.tokens().accessToken;
+  await env.advance(3 * HOUR);
+
+  const state = await env.state();
+  ok(state.status === 'monitoring', `status ${state.status}`);
+  ok(state.sessionId === first.sessionId, 'the same session ran throughout');
+  ok(env.server.refreshes >= 3, `only ${env.server.refreshes} refreshes in three hours`);
+  ok(env.tokens().accessToken !== firstToken, 'the stored sign-in was renewed');
+  ok(state.failedSnapshots === 0, `${state.failedSnapshots} screenshots refused`);
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
+  ok(env.session(first.sessionId).status === 'ACTIVE', env.session(first.sessionId).status);
+  return env;
+});
+
+await scenario('the sign-in server is down for an hour while the token expires → nothing is lost, and the hour is kept', async () => {
+  const env = await environment();
+  env.server.tokenLifetimeMs = 20 * MIN;
+  const first = await env.start();
+  await env.advance(30 * MIN);
+  env.server.ssoDown = true;
+  await env.advance(60 * MIN); // token expires, every call 401s, the sweeper expires the session
+  const during = await env.state();
+  ok(during.status === 'monitoring', `monitoring stopped during the outage: ${during.status}`);
+  ok(during.queuedSnapshots > 50, `only ${during.queuedSnapshots} screenshots were kept`);
+  ok(during.failedSnapshots === 0, `${during.failedSnapshots} refused while signed out`);
+
+  env.server.ssoDown = false;
+  await env.advance(45 * MIN); // signs itself back in, then catches up
+
+  const state = await env.state();
+  ok(state.status === 'monitoring', `status ${state.status}`);
+  ok(state.failedSnapshots === 0, `${state.failedSnapshots} screenshots refused`);
+  ok(state.queuedSnapshots === 0, `${state.queuedSnapshots} screenshots still queued`);
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
+  const monitored = [...env.server.sessions.values()]
+    .reduce((sum, s) => sum + ((s.endedAt ?? NOW) - s.startedAt), 0);
+  near(monitored / MIN, 135, 3, 'monitored minutes across the sessions');
+  return env;
+});
+
+await scenario('the sign-in is revoked → monitoring keeps capturing, and it all uploads after signing in again', async () => {
+  const env = await environment();
+  const first = await env.start();
+  await env.advance(20 * MIN);
+  env.server.revokeSignIns(); // password changed, or the sign-in server forgot us
+  await env.advance(40 * MIN);
+
+  const out = await env.state();
+  ok(out.status === 'monitoring', `monitoring stopped when the sign-in went: ${out.status}`);
+  ok(out.queuedSnapshots > 50, `only ${out.queuedSnapshots} screenshots were kept`);
+  ok(out.failedSnapshots === 0, `${out.failedSnapshots} refused with no sign-in`);
+  ok(env.tokens() == null, 'a revoked sign-in is cleared, so the popup asks for one');
+
+  env.signIn(); // the person signs in again
+  await env.advance(45 * MIN);
+  const state = await env.state();
+  ok(state.queuedSnapshots === 0, `${state.queuedSnapshots} screenshots still queued`);
+  ok(state.failedSnapshots === 0, `${state.failedSnapshots} screenshots refused`);
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
   return env;
 });
 

@@ -1,164 +1,126 @@
 /**
- * BackgroundAuthManager — production-grade auth lifecycle for MV3 service workers.
+ * BackgroundAuthManager — keeps the sign-in alive for a service worker that
+ * nobody is watching.
  *
- * Key design decisions:
- *  - Uses chrome.alarms (persistent across SW termination) not setTimeout/setInterval.
- *  - Schedules refresh 2 minutes before token expiry so users never see 401s.
- *  - On startup, re-hydrates alarm from stored token if one isn't already set.
- *  - Broadcasts AUTH_STATE_CHANGED so the popup can re-render without polling.
- *  - All token storage is in chrome.storage.local (cookie-independent — required for extensions).
+ * Two things were wrong here and both ended the same way, with monitoring
+ * holding a day's data it could not upload:
+ *
+ *  1. It refreshed against `${API_BASE_URL}/auth/refresh`, an endpoint of the
+ *     old Node backend that this deployment does not serve. Every scheduled
+ *     refresh therefore failed, and an answer of 401 from whatever did reply
+ *     was taken as "the person is signed out" and wiped the sign-in.
+ *  2. The refresh was scheduled as a one-shot alarm at expiry minus two
+ *     minutes. An alarm missed — a laptop asleep across that moment, an
+ *     extension update, a worker torn down at the wrong instant — was never
+ *     rescheduled, so the token simply ran out.
+ *
+ * Now it delegates to the one shared refresh (see services/tokens.ts) and
+ * checks on a repeating alarm, so a missed check costs five minutes rather than
+ * a sign-in. Signing out is left to that module, which does it only when the
+ * server says the refresh token is no longer valid.
  */
 
-import axios from 'axios';
-import type { AuthTokens } from '@/types';
-import { STORAGE_KEYS, AUTH_REFRESH_ALARM } from '@/types';
-import { API_BASE_URL } from '@/config';
+import { AUTH_POLICY, needsRefresh, refreshRetryDelayMs } from '@/utils/authRefreshPolicy';
+import { clearTokens, readTokens, refreshTokens } from '@/services/tokens';
+import { AUTH_REFRESH_ALARM } from '@/types';
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-
-/** Schedule refresh this many ms before expiry. */
-const REFRESH_BUFFER_MS = 2 * 60 * 1000; // 2 minutes
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-async function getStoredTokens(): Promise<AuthTokens | null> {
-  try {
-    const result = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-    return (result[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined) ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function broadcastAuthState(isAuthenticated: boolean): void {
-  chrome.runtime
-    .sendMessage({
-      type: 'AUTH_STATE_CHANGED',
-      payload: { isAuthenticated },
-    })
-    .catch(() => {
-      // Popup may be closed — safe to ignore
-    });
-}
-
-// ─── Auth Manager ─────────────────────────────────────────────────────────────
+/** Consecutive failed attempts, for backoff while the server is unreachable. */
+let failures = 0;
 
 export const authManager = {
-  /**
-   * Called on extension startup and install.
-   * Re-creates the alarm if a valid token is already stored.
-   */
+  /** Called on startup and install: make sure the repeating check exists. */
   async initialize(): Promise<void> {
-    const tokens = await getStoredTokens();
+    await this.ensureAlarm();
+    const tokens = await readTokens();
     if (!tokens) return;
+    if (needsRefresh(tokens.expiresAt, Date.now())) await this.performRefresh();
+  },
 
-    if (tokens.expiresAt > Date.now()) {
-      await this.scheduleRefreshAlarm(tokens.expiresAt);
-    } else {
-      // Already expired — try to refresh immediately
-      await this.performRefresh();
+  /** A repeating alarm, created only when it is missing so it is not reset. */
+  async ensureAlarm(): Promise<void> {
+    try {
+      const existing = await chrome.alarms.get(AUTH_REFRESH_ALARM);
+      if (existing?.periodInMinutes === AUTH_POLICY.CHECK_INTERVAL_MINUTES) return;
+      await chrome.alarms.clear(AUTH_REFRESH_ALARM);
+      chrome.alarms.create(AUTH_REFRESH_ALARM, {
+        periodInMinutes: AUTH_POLICY.CHECK_INTERVAL_MINUTES,
+        delayInMinutes: AUTH_POLICY.CHECK_INTERVAL_MINUTES,
+      });
+    } catch (err) {
+      console.warn('[AuthManager] could not schedule the sign-in check:', err);
     }
   },
 
   /**
-   * Schedule (or reschedule) the token-refresh alarm using chrome.alarms.
-   * Alarms survive service worker termination, unlike setTimeout.
+   * Kept for callers that used to pass an expiry. The check is periodic now, so
+   * there is nothing to schedule; an expiry already inside the buffer is
+   * refreshed immediately.
    */
   async scheduleRefreshAlarm(expiresAt: number): Promise<void> {
-    const fireAt = expiresAt - REFRESH_BUFFER_MS;
-
-    // Don't schedule in the past
-    if (fireAt <= Date.now()) {
-      await this.performRefresh();
-      return;
-    }
-
-    await chrome.alarms.clear(AUTH_REFRESH_ALARM);
-    chrome.alarms.create(AUTH_REFRESH_ALARM, { when: fireAt });
+    await this.ensureAlarm();
+    if (needsRefresh(expiresAt, Date.now())) await this.performRefresh();
   },
 
-  /**
-   * Handle the refresh alarm firing.
-   * Called from the alarms.onAlarm listener in background/index.ts.
-   */
+  /** The repeating alarm fired: refresh only if the token is near expiry. */
   async handleRefreshAlarm(): Promise<void> {
+    const tokens = await readTokens();
+    if (!tokens?.accessToken) return;
+    if (!needsRefresh(tokens.expiresAt, Date.now())) {
+      failures = 0;
+      return;
+    }
     await this.performRefresh();
   },
 
   /**
-   * Perform the actual token refresh.
-   * On success: stores new tokens and reschedules the alarm.
-   * On failure: clears auth state and notifies the popup.
+   * Refresh now.
+   *
+   * A failure that is not a verdict on the sign-in schedules a sooner retry and
+   * leaves everything in place; the periodic alarm is the backstop if even that
+   * retry is lost.
    */
   async performRefresh(): Promise<void> {
-    const tokens = await getStoredTokens();
-    if (!tokens?.refreshToken) {
-      await this.clearAuth();
+    const outcome = await refreshTokens();
+    if (outcome.ok) {
+      failures = 0;
+      await this.ensureAlarm();
       return;
     }
-
+    if (outcome.verdict === 'invalid' || outcome.verdict === 'no-refresh-token') {
+      failures = 0;
+      return;
+    }
+    failures += 1;
+    const delayMinutes = refreshRetryDelayMs(failures) / 60_000;
     try {
-      const response = await axios.post<{
-        success: boolean;
-        data: { tokens: AuthTokens };
-      }>(
-        `${API_BASE_URL}/auth/refresh`,
-        { refreshToken: tokens.refreshToken },
-        { timeout: 15_000 },
-      );
-
-      const newTokens = response.data.data.tokens;
-
-      await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: newTokens });
-
-      // Reschedule for the new expiry
-      await this.scheduleRefreshAlarm(newTokens.expiresAt);
-
-      // Notify popup so it can update its in-memory accessToken
-      chrome.runtime
-        .sendMessage({
-          type: 'TOKEN_REFRESHED',
-          payload: { accessToken: newTokens.accessToken, expiresAt: newTokens.expiresAt },
-        })
-        .catch(() => {});
-    } catch (err) {
-      console.error('[AuthManager] Token refresh failed:', err);
-
-      // Check if it's a network error vs auth error
-      if (axios.isAxiosError(err) && err.response?.status === 401) {
-        // Refresh token itself is invalid — full logout
-        await this.clearAuth();
-      } else {
-        // Transient error — retry in 30 seconds
-        chrome.alarms.create(AUTH_REFRESH_ALARM, { delayInMinutes: 0.5 });
-      }
+      chrome.alarms.create(AUTH_REFRESH_ALARM, {
+        delayInMinutes: Math.max(delayMinutes, 0.5),
+        periodInMinutes: AUTH_POLICY.CHECK_INTERVAL_MINUTES,
+      });
+    } catch {
+      /* the next periodic check covers it */
     }
   },
 
-  /**
-   * Called when the popup sends a TOKEN_REFRESHED message after
-   * a successful login/register so the background reschedules the alarm.
-   */
-  async onTokenRefreshed(expiresAt: number): Promise<void> {
-    await this.scheduleRefreshAlarm(expiresAt);
+  /** The popup signed in or refreshed: make sure the check is running. */
+  async onTokenRefreshed(_expiresAt: number): Promise<void> {
+    failures = 0;
+    await this.ensureAlarm();
   },
 
-  /**
-   * Called when the popup sends AUTH_STATE_CHANGED { isAuthenticated: false }
-   * (user logged out) so the background cancels the alarm.
-   */
+  /** The person signed out deliberately. */
   async onLogout(): Promise<void> {
-    await chrome.alarms.clear(AUTH_REFRESH_ALARM);
+    failures = 0;
+    try {
+      await chrome.alarms.clear(AUTH_REFRESH_ALARM);
+    } catch {
+      /* nothing to clear */
+    }
   },
 
-  /** Wipe all auth storage and notify popup. */
+  /** Wipe the sign-in. Monitoring keeps its outbox either way. */
   async clearAuth(): Promise<void> {
-    await chrome.alarms.clear(AUTH_REFRESH_ALARM);
-    await chrome.storage.local.remove([
-      STORAGE_KEYS.AUTH_USER,
-      STORAGE_KEYS.AUTH_TOKENS,
-      STORAGE_KEYS.AUTH_SESSION_ID,
-    ]);
-    broadcastAuthState(false);
+    await this.onLogout();
+    await clearTokens();
   },
 };

@@ -193,8 +193,50 @@ export function probeDelayMs(
 }
 
 /** Delay before the next backlog batch. */
-export function backlogDelayMs(random: () => number = Math.random): number {
-  return Math.round(SYNC_POLICY.BACKLOG_INTERVAL_MS + random() * SYNC_POLICY.BACKLOG_JITTER_MS);
+export function backlogDelayMs(
+  random: () => number = Math.random,
+  intervalMs: number = SYNC_POLICY.BACKLOG_INTERVAL_MS,
+): number {
+  // The jitter scales with the interval: it exists to keep an office full of
+  // clients from recovering in lockstep, and a minute of spread on a
+  // thirty-second cadence would undo the cadence instead.
+  const jitter = Math.min(SYNC_POLICY.BACKLOG_JITTER_MS, intervalMs / 2);
+  return Math.round(intervalMs + random() * jitter);
+}
+
+/**
+ * How hard to push the backlog, given how much of it there is.
+ *
+ * The gentle fixed rate this started with — fifteen screenshots every two
+ * minutes — is right for the tail of an outage and far too slow for its body:
+ * a day queued behind an expired sign-in is nearly three thousand frames, which
+ * at that rate is six hours of "uploading" that the next outage overtakes. The
+ * server's own ceiling is 240 snapshot uploads a minute per user, so the real
+ * constraint was never the server.
+ *
+ * So the rate follows the depth. A small leftover trickles as before; a genuine
+ * catch-up runs at up to two frames a second, still half of what the server
+ * allows, and collapses back to the gentle rate the moment the server says it
+ * has had enough (a 429 pauses sync outright) or anything else fails.
+ */
+export function backlogPlan(depth: number): {
+  /** Snapshots per batch. */
+  batch: number;
+  /** Batches this pass may send back to back while every one of them lands. */
+  batchesPerPass: number;
+  /** Spacing to the next backlog pass. */
+  intervalMs: number;
+} {
+  // Each tier is batch × batchesPerPass screenshots per interval: 120, 90 and
+  // 50 a minute against a server that allows 240.
+  if (depth > 1_000) return { batch: 40, batchesPerPass: 3, intervalMs: 60_000 };
+  if (depth > 300) return { batch: 30, batchesPerPass: 3, intervalMs: 60_000 };
+  if (depth > 50) return { batch: 25, batchesPerPass: 2, intervalMs: 60_000 };
+  return {
+    batch: SYNC_POLICY.BACKLOG_SNAPSHOTS_PER_BATCH,
+    batchesPerPass: 1,
+    intervalMs: SYNC_POLICY.BACKLOG_INTERVAL_MS,
+  };
 }
 
 /** Delay before the first backlog batch after the server comes back. */

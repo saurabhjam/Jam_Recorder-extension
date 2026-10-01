@@ -78,6 +78,7 @@ import {
 import {
   SYNC_POLICY,
   backlogDelayMs,
+  backlogPlan,
   classifyFailure,
   haltsSync,
   itemBackoffMs,
@@ -125,6 +126,12 @@ interface SyncHooks {
    * lost connection) it was captured after the end and belongs nowhere.
    */
   isCurrentSession?: (sessionId: string) => boolean;
+  /**
+   * Oldest refusal worth reporting, as a timestamp — normally the start of the
+   * run being monitored. Older ones stay in the outbox as evidence but are not
+   * counted against the present.
+   */
+  deadCountSince?: () => number | null | Promise<number | null>;
 }
 
 let hooks: SyncHooks | null = null;
@@ -316,6 +323,25 @@ async function noteSessionClosed(
   void Promise.resolve(hooks?.onSessionClosed(sessionId)).catch(() => {});
 }
 
+/**
+ * Is this session's own stop still waiting to go up?
+ *
+ * While it is, the session's end is not settled: the stop carries the end this
+ * client can vouch for, which is normally later than the one the server
+ * arrived at by giving up on a silent client. So an item the server refuses
+ * right now may well be inside the session once that stop lands, and giving up
+ * on it before then throws away work that was about to be accepted.
+ */
+async function stopStillPending(sessionId: string): Promise<boolean> {
+  try {
+    return (await listPendingEvents()).some(
+      (event) => event.sessionId === sessionId && event.kind === 'stop',
+    );
+  } catch {
+    return false;
+  }
+}
+
 type Outcome = 'done' | 'retry' | 'parked' | 'halted';
 
 /** The failure paths every kind of item shares. */
@@ -349,9 +375,14 @@ async function settleFailure<T extends QueuedItemState>(context: {
         await context.rehome(successor);
         return 'done';
       }
-      if (hooks?.isCurrentSession && !hooks.isCurrentSession(context.sessionId)) {
-        // Captured after its session ended, with nowhere else to go. Holding it
-        // would only show as "uploading" for two days.
+      if (
+        hooks?.isCurrentSession &&
+        !hooks.isCurrentSession(context.sessionId) &&
+        !(await stopStillPending(context.sessionId))
+      ) {
+        // Captured after its session ended, with nowhere else to go and no stop
+        // left that could move the end. Holding it would only show as
+        // "uploading" for two days.
         await context.save(kill(entry, `After its session ended: ${message}`));
         return 'done';
       }
@@ -517,18 +548,22 @@ async function sendEvent(
 
 // ─── Snapshots ────────────────────────────────────────────────────────────────
 
-async function drainSnapshots(lane: SyncLane, limit: number, pass: Pass): Promise<void> {
-  if (exhausted(pass)) return;
+/** @returns how many queued screenshots this call got through. */
+async function drainSnapshots(lane: SyncLane, limit: number, pass: Pass): Promise<number> {
+  if (exhausted(pass)) return 0;
   const due = await nextSnapshots({
     lane,
     now: pass.now,
     limit: Math.min(limit, pass.budget - pass.sends),
   });
   if (lane === 'backlog' && due.length > 0) pass.backlogTouched = true;
+  let handled = 0;
   for (const entry of due) {
-    if (exhausted(pass)) return;
+    if (exhausted(pass)) return handled;
     await uploadSnapshot(entry, pass);
+    handled += 1;
   }
+  return handled;
 }
 
 /**
@@ -764,12 +799,14 @@ async function rehomeOrPark(
 ): Promise<void> {
   const session = await getSyncSession(sessionId);
   const ended = Boolean(hooks?.isCurrentSession && !hooks.isCurrentSession(sessionId));
+  const stopPending = ended ? await stopStillPending(sessionId) : false;
   let parked = false;
   const updated = rows.map((row) => {
     const successor = successorFor(session, Date.parse(row.payload.startedAt));
     if (successor) return { ...row, sessionId: successor };
-    // See settleFailure: after an ended session, there is nowhere to hold it for.
-    if (ended) return kill(row, `After its session ended: ${message}`);
+    // See settleFailure: after an ended session, there is nowhere to hold it
+    // for — unless its stop has yet to go up and may still move the end.
+    if (ended && !stopPending) return kill(row, `After its session ended: ${message}`);
     parked = true;
     return park(row, message);
   });
@@ -846,10 +883,19 @@ async function runPass(reason: DrainReason): Promise<void> {
       !paced.offlineSince &&
       now >= paced.nextBacklogAt
     ) {
-      await drainSnapshots('backlog', SYNC_POLICY.BACKLOG_SNAPSHOTS_PER_BATCH, pass);
-      await drainActivities('backlog', SYNC_POLICY.BACKLOG_ACTIVITIES_PER_BATCH, pass);
+      const plan = backlogPlan(await backlogDepth());
+      for (let batch = 0; batch < plan.batchesPerPass; batch += 1) {
+        const sent = await drainSnapshots('backlog', plan.batch, pass);
+        await drainActivities('backlog', SYNC_POLICY.BACKLOG_ACTIVITIES_PER_BATCH, pass);
+        // Stop as soon as a batch comes up short: either the backlog is drained
+        // or something failed, and pushing harder is the wrong answer to both.
+        if (exhausted(pass) || sent < plan.batch) break;
+      }
       if (pass.backlogTouched) {
-        await saveHealth({ ...(await loadHealth()), nextBacklogAt: Date.now() + backlogDelayMs() });
+        await saveHealth({
+          ...(await loadHealth()),
+          nextBacklogAt: Date.now() + backlogDelayMs(Math.random, plan.intervalMs),
+        });
       }
     }
   } catch (err) {
@@ -861,10 +907,20 @@ async function runPass(reason: DrainReason): Promise<void> {
 
 let lastPublished = '';
 let alarmArmed: boolean | null = null;
+/** Outbox depth as of the last publish, so pacing does not re-count every pass. */
+let lastDepth: number | null = null;
+
+async function backlogDepth(): Promise<number> {
+  if (lastDepth != null) return lastDepth;
+  const stats = await outboxStats();
+  lastDepth = stats.pendingSnapshots;
+  return lastDepth;
+}
 
 async function publish(): Promise<void> {
   try {
-    const stats = await outboxStats();
+    const stats = await outboxStats((await hooks?.deadCountSince?.()) ?? null);
+    lastDepth = stats.pendingSnapshots;
     const current = await loadHealth();
     const pending = stats.pendingSnapshots + stats.pendingActivities + stats.pendingEvents;
     await scheduleAlarm(pending > 0);

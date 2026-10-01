@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { refreshTokens } from '@/services/tokens';
 import { authApi } from '@/services/api';
 import type { User, AuthTokens } from '@/types';
 import { STORAGE_KEYS } from '@/types';
@@ -249,27 +250,17 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     }
   },
 
+  /**
+   * Refresh through the one shared implementation (services/tokens.ts).
+   *
+   * Refreshing here on its own used to rotate the refresh token behind the
+   * back of the service worker and the offscreen document, whose next attempt
+   * was then rejected — and that rejection was what signed the person out.
+   */
   refreshToken: async () => {
-    const result = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-    const tokens = result[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined;
-
-    if (!tokens?.refreshToken) {
-      throw new Error('No refresh token available');
-    }
-
-    const newTokens = await authApi.refreshToken(tokens.refreshToken);
-
-    await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: newTokens });
-
-    // Reschedule refresh alarm in background
-    chrome.runtime
-      .sendMessage({
-        type: 'TOKEN_REFRESHED',
-        payload: { expiresAt: newTokens.expiresAt },
-      })
-      .catch(() => {});
-
-    set({ accessToken: newTokens.accessToken });
+    const outcome = await refreshTokens();
+    if (!outcome.ok) throw new Error(outcome.error ?? 'Could not refresh the sign-in');
+    set({ accessToken: outcome.tokens.accessToken });
   },
 
   clearError: () => set({ error: null }),

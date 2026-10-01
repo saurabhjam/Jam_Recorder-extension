@@ -72,8 +72,10 @@ import {
   unparkSession,
   updateSyncSession,
   type MonitoringEventKind,
+  newestCapturedAtMs,
 } from '@/utils/monitoringQueue';
 import {
+  SYNC_POLICY,
   currentRunStartMs,
   extendLiveness,
   settledEndMs,
@@ -145,6 +147,9 @@ import {
   configureActivitySink,
   takeLegacyActivityBuffer,
 } from './monitoring.activity';
+
+/** How far back refusals are still reported when nothing is being monitored. */
+const DEAD_REPORTING_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 let state: MonitoringState = { ...INITIAL_MONITORING_STATE };
 let hydrated = false;
@@ -306,6 +311,11 @@ export function configureMonitoringOffscreen(bridge: {
         await hydrate();
         if (sessionId === state.sessionId) await continueAfterRemoteClose();
       })();
+    },
+    deadCountSince: async () => {
+      await hydrate();
+      const started = state.startedAt ? Date.parse(state.startedAt) : NaN;
+      return Number.isFinite(started) ? started : Date.now() - DEAD_REPORTING_WINDOW_MS;
     },
     isCurrentSession: (sessionId) =>
       sessionId === state.sessionId && state.status !== 'idle' && state.status !== 'error',
@@ -639,9 +649,48 @@ async function endIfOffline(): Promise<boolean> {
   console.warn('[Monitoring] this device lost its network — ending the session');
   await stopMonitoringSession({
     at: new Date(stopAt),
+    coverCaptured: true,
     notice: `Monitoring stopped because this computer lost its internet connection at ${formatStopTime(stopAt)}. Start it again once you are back online.`,
   });
   return true;
+}
+
+/**
+ * The moment a session ends, for a stop issued at `stoppedAt`.
+ *
+ * When contact with the server is what ended the session — the device went
+ * offline, or the server expired it while this machine was away — the stop is
+ * dated back to the last moment contact is known to have existed. The machine
+ * itself usually went on working for a little longer, and everything it
+ * captured in that stretch is sitting in the outbox. Ending the session before
+ * it means the server refuses exactly that data ("captured after the session
+ * ended") and the person loses both the screenshots and the minutes.
+ *
+ * So for those stops the end is carried forward to the newest work actually
+ * captured, bounded by what the liveness log can vouch for. A machine that
+ * stopped — asleep, shut down — captured nothing after it stopped, so this
+ * changes nothing there, which is the point: the end follows the evidence.
+ */
+async function sessionEndFor(
+  sessionId: string,
+  stoppedAt: Date,
+  coverCaptured: boolean,
+): Promise<number> {
+  const vouched = await settledSessionEnd(stoppedAt.getTime());
+  if (!coverCaptured) return vouched;
+  const captured = await newestCapturedAtMs(sessionId).catch(() => null);
+  if (captured == null) return vouched;
+  // Bounded by the run of liveness the end falls in. Work captured after a gap
+  // in that log — the first frame after a laptop wakes, or after Chrome is
+  // reopened — is not evidence that monitoring continued through the gap, and
+  // crediting it would stretch the session across a sleep.
+  // The log is brought up to this moment first — it is written once a minute,
+  // so it trails reality by up to a tick, and that tick is exactly where the
+  // last frames before a stop sit. Extending it here is a read, not a write: a
+  // machine that slept still starts a new run rather than closing the gap.
+  const segments = extendLiveness(await readLiveness(), Date.now());
+  const limit = settledEndMs(segments, vouched, Date.now());
+  return Math.min(Math.max(vouched, captured), limit);
 }
 
 /** The end this client can vouch for, for a stop issued at `atMs`. */
@@ -934,7 +983,7 @@ async function defaultProjectOrNull(): Promise<string | null> {
  * the session is gone locally. Stopping during an outage loses nothing.
  */
 export function stopMonitoringSession(
-  options: { at?: Date; notice?: string } = {},
+  options: { at?: Date; notice?: string; coverCaptured?: boolean } = {},
 ): Promise<MonitoringState> {
   if (stopInFlight) return stopInFlight;
   stopInFlight = runStop(options).finally(() => {
@@ -943,7 +992,11 @@ export function stopMonitoringSession(
   return stopInFlight;
 }
 
-async function runStop(options: { at?: Date; notice?: string }): Promise<MonitoringState> {
+async function runStop(options: {
+  at?: Date;
+  notice?: string;
+  coverCaptured?: boolean;
+}): Promise<MonitoringState> {
   // A Stop pressed while a Start is still resolving would otherwise tear down
   // first and then be undone by the start finishing after it.
   if (startInFlight) await startInFlight.catch(() => undefined);
@@ -975,7 +1028,9 @@ async function runStop(options: { at?: Date; notice?: string }): Promise<Monitor
       // 2. The stop, at the end this client can vouch for. Online that is
       //    simply the stop time; if the server expired the session during an
       //    outage, it is what the server re-settles the session to.
-      const endedAt = new Date(await settledSessionEnd(stoppedAt.getTime())).toISOString();
+      const endedAt = new Date(
+        await sessionEndFor(sessionId, stoppedAt, options.coverCaptured === true),
+      ).toISOString();
       await enqueueEvent({
         sessionId,
         project,
@@ -1162,22 +1217,40 @@ async function runContinuation(): Promise<void> {
     return;
   }
 
-  // Expired: the server stopped hearing from this machine — network gone,
-  // laptop asleep or shut down. That ends monitoring; it is not resumed in a new
-  // session behind the person's back. The session ends where the server last
-  // heard from us. (An older server sends no reason, but the status says it.)
+  // Expired: the server stopped hearing from this machine. Which of the two
+  // went away decides what happens, and this machine's own liveness log — a
+  // mark every minute it was running — is the evidence.
+  //
+  //  - It stopped: asleep, shut down, Chrome closed, or off the network. The
+  //    person was not being monitored, so monitoring ends where it stopped.
+  //  - It ran right through: only the server was unreachable. Monitoring was
+  //    real the whole time and everything captured is queued, so the session is
+  //    re-settled over the outage below and carries on. Ending it here instead
+  //    threw away the outage — an hour of work refused as "captured after the
+  //    session ended", and an hour missing from the day's total.
   if (
     closed?.endReason === 'EXPIRED' ||
     (closed && !closed.endReason && closed.status === 'EXPIRED')
   ) {
-    const lastHeard = state.lastServerContactAt ? Date.parse(state.lastServerContactAt) : NaN;
-    const at = Number.isFinite(lastHeard) ? lastHeard : Date.now();
-    console.warn(`[Monitoring] session ${closedId} expired while this machine was unreachable`);
-    await stopMonitoringSession({
-      at: new Date(at),
-      notice: `Monitoring stopped because this computer was offline, asleep or switched off from ${formatStopTime(at)}. Start it again when you are ready.`,
-    });
-    return;
+    const nowMs = Date.now();
+    const vouchedEnd = await settledSessionEnd(nowMs);
+    const deviceOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    const ranThrough = !deviceOffline && nowMs - vouchedEnd <= SYNC_POLICY.LIVENESS_GAP_MS;
+
+    if (!ranThrough) {
+      const lastHeard = state.lastServerContactAt ? Date.parse(state.lastServerContactAt) : NaN;
+      const at = Math.min(Number.isFinite(lastHeard) ? lastHeard : nowMs, vouchedEnd);
+      console.warn(`[Monitoring] session ${closedId} expired while this machine was away`);
+      await stopMonitoringSession({
+        at: new Date(at),
+        coverCaptured: true,
+        notice: `Monitoring stopped because this computer was offline, asleep or switched off from ${formatStopTime(at)}. Start it again when you are ready.`,
+      });
+      return;
+    }
+    console.log(
+      `[Monitoring] session ${closedId} expired while the server was unreachable, but this machine kept monitoring — re-settling over the outage`,
+    );
   }
 
   const wasPaused = state.status === 'paused';

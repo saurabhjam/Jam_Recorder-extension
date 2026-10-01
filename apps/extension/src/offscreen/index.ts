@@ -16,7 +16,8 @@
  * data never has to cross the message boundary to the background service worker.
  */
 
-import type { RecordingOptions, RecordingQuality, UploadProgress, AuthTokens } from '@/types';
+import type { RecordingOptions, RecordingQuality, UploadProgress } from '@/types';
+import { getFreshAccessToken } from '@/services/tokens';
 import { STORAGE_KEYS, QUALITY_PRESETS } from '@/types';
 import { generateId, retryWithBackoff, sleep } from '@/utils';
 import {
@@ -26,12 +27,7 @@ import {
   systemBlobKey,
   loadBlobFromOPFS,
 } from '@/utils/blobStorage';
-import {
-  buildShareUrl,
-  API_BASE_URL as REPORTS_URL,
-  SSO_TOKEN_URL,
-  SSO_AUTH_HEADER,
-} from '@/config';
+import { buildShareUrl, API_BASE_URL as REPORTS_URL } from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -76,61 +72,17 @@ async function getProject(token: string): Promise<string> {
   return 'superadmin_personal';
 }
 
+/**
+ * The offscreen document's sign-in, through the one shared refresh.
+ *
+ * It used to refresh on its own and wipe the stored sign-in whenever that
+ * failed — including when the failure was only this realm losing the race with
+ * the popup or the service worker, whose rotation had just invalidated the
+ * token this one was holding. That logged the person out mid-recording.
+ */
 async function getAccessToken(): Promise<string | null> {
   try {
-    const result = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-    const tokens = result[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined;
-
-    if (!tokens?.accessToken) return null;
-
-    // Token is still valid — return it directly
-    if (tokens.expiresAt > Date.now() + 10_000) {
-      return tokens.accessToken;
-    }
-
-    // Token expired or expiring within 10s — try to silently refresh
-    if (!tokens.refreshToken) return null;
-
-    const refreshRes = await fetch(SSO_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: SSO_AUTH_HEADER,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-      },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: tokens.refreshToken,
-      }).toString(),
-    });
-
-    if (!refreshRes.ok) {
-      // Refresh rejected — clear stale tokens so popup shows login view
-      await chrome.storage.local.remove([
-        STORAGE_KEYS.AUTH_TOKENS,
-        STORAGE_KEYS.AUTH_USER,
-        STORAGE_KEYS.AUTH_SESSION_ID,
-      ]);
-      sendToBackground('AUTH_STATE_CHANGED', { isAuthenticated: false });
-      return null;
-    }
-
-    const sso = (await refreshRes.json()) as {
-      access_token: string;
-      refresh_token: string;
-      expires_in: number;
-    };
-    const newTokens: AuthTokens = {
-      accessToken: sso.access_token,
-      refreshToken: sso.refresh_token,
-      expiresAt: Date.now() + sso.expires_in * 1000,
-    };
-    if (!newTokens?.accessToken) return null;
-
-    await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: newTokens });
-    // Notify background to reschedule the refresh alarm
-    sendToBackground('TOKEN_REFRESHED', { expiresAt: newTokens.expiresAt });
-    return newTokens.accessToken;
+    return await getFreshAccessToken();
   } catch {
     return null;
   }

@@ -19,6 +19,7 @@ import {
   haltsSync,
   probeDelayMs,
   backlogDelayMs,
+  backlogPlan,
   recoveryDelayMs,
   itemBackoffMs,
   laneOf,
@@ -258,6 +259,55 @@ t('an item moves to the successor only if the successor had begun', () => {
   eq(successorFor(session, T0 + HOUR - 1), null);
   eq(successorFor(null, T0), null);
   eq(successorFor({ successorId: null, successorStartedAtMs: null }, T0), null);
+});
+
+// ── Pacing follows the size of the backlog ──
+t('a small leftover still trickles at the gentle rate', () => {
+  const plan = backlogPlan(20);
+  eq(plan.batch, SYNC_POLICY.BACKLOG_SNAPSHOTS_PER_BATCH);
+  eq(plan.batchesPerPass, 1);
+  eq(plan.intervalMs, SYNC_POLICY.BACKLOG_INTERVAL_MS);
+});
+
+t('a real catch-up goes faster, and never above half what the server allows', () => {
+  const deep = backlogPlan(2_000);
+  const perMinute = (p) => (p.batch * p.batchesPerPass * 60_000) / p.intervalMs;
+  ok(perMinute(deep) >= 100, `only ${perMinute(deep)} screenshots a minute`);
+  // The server's own ceiling is 240 snapshot uploads a minute per user.
+  ok(perMinute(deep) <= 120, `${perMinute(deep)} a minute is too close to the server's limit`);
+});
+
+t('the rate rises with the depth and never falls as it grows', () => {
+  const rate = (depth) => {
+    const p = backlogPlan(depth);
+    return (p.batch * p.batchesPerPass * 60_000) / p.intervalMs;
+  };
+  const depths = [10, 51, 301, 1_001, 10_000];
+  for (let i = 1; i < depths.length; i++) {
+    ok(rate(depths[i]) >= rate(depths[i - 1]), `rate fell between ${depths[i - 1]} and ${depths[i]}`);
+  }
+});
+
+t("a day's backlog clears in under an hour", () => {
+  // 30-second screenshots for eight hours, the shape of a sign-in that lapsed
+  // in the morning and was noticed in the afternoon.
+  let left = 8 * 60 * 2;
+  let minutes = 0;
+  while (left > 0 && minutes < 600) {
+    const plan = backlogPlan(left);
+    left -= Math.round((plan.batch * plan.batchesPerPass * 60_000) / plan.intervalMs);
+    minutes += 1;
+  }
+  ok(left <= 0, 'the backlog never cleared');
+  ok(minutes <= 60, `took ${minutes} minutes`);
+});
+
+t('jitter never swamps a short interval', () => {
+  for (const interval of [20_000, 30_000, 120_000]) {
+    const high = backlogDelayMs(() => 1, interval);
+    ok(high <= interval * 1.5, `${high} for an interval of ${interval}`);
+    ok(backlogDelayMs(() => 0, interval) === interval);
+  }
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

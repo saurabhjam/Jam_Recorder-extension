@@ -18,6 +18,7 @@ import type {
   AssignedProject,
 } from '@/types';
 import { STORAGE_KEYS, toBackendRecordingType } from '@/types';
+import { getFreshAccessToken, refreshTokens } from '@/services/tokens';
 import { API_BASE_URL as REPORTS_API_URL, SSO_TOKEN_URL, SSO_AUTH_HEADER } from '@/config';
 
 // ─── Base URLs ────────────────────────────────────────────────────────────────
@@ -176,11 +177,8 @@ const apiClient: AxiosInstance = axios.create({
 apiClient.interceptors.request.use(
   async (config: InternalAxiosRequestConfig) => {
     try {
-      const result = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-      const tokens = result[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined;
-      if (tokens?.accessToken) {
-        config.headers.Authorization = `Bearer ${tokens.accessToken}`;
-      }
+      const token = await getFreshAccessToken();
+      if (token) config.headers.Authorization = `Bearer ${token}`;
     } catch {
       // Running outside extension context (tests, offscreen with mock)
     }
@@ -219,40 +217,21 @@ apiClient.interceptors.response.use(
     isRefreshing = true;
 
     try {
-      const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-      const currentTokens = stored[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined;
-
-      if (!currentTokens?.refreshToken) {
-        throw new Error('No refresh token available');
+      // One shared refresh for the whole extension: it holds a lock across
+      // realms, recovers from the rotation race that used to log people out,
+      // and clears the sign-in only when the server rejects the refresh token
+      // itself. A refresh that merely failed — no network, a gateway error —
+      // leaves the person signed in and this request failing as a 401, which
+      // every caller already treats as "try again later".
+      const outcome = await refreshTokens();
+      if (!outcome.ok) {
+        onRefreshFailed();
+        return Promise.reject(error);
       }
 
-      const sso = await callSso({
-        grant_type: 'refresh_token',
-        refresh_token: currentTokens.refreshToken,
-      });
-      const newTokens: AuthTokens = {
-        accessToken: sso.access_token,
-        refreshToken: sso.refresh_token,
-        expiresAt: Date.now() + sso.expires_in * 1000,
-      };
-
-      await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: newTokens });
-
-      onRefreshed(newTokens.accessToken);
-      originalRequest.headers.Authorization = `Bearer ${newTokens.accessToken}`;
+      onRefreshed(outcome.tokens.accessToken);
+      originalRequest.headers.Authorization = `Bearer ${outcome.tokens.accessToken}`;
       return apiClient(originalRequest);
-    } catch (refreshError) {
-      onRefreshFailed();
-      // Clear stale auth data — popup will redirect to login
-      await chrome.storage.local.remove([
-        STORAGE_KEYS.AUTH_USER,
-        STORAGE_KEYS.AUTH_TOKENS,
-        STORAGE_KEYS.AUTH_SESSION_ID,
-      ]);
-      chrome.runtime
-        .sendMessage({ type: 'AUTH_STATE_CHANGED', payload: { isAuthenticated: false } })
-        .catch(() => {});
-      return Promise.reject(refreshError);
     } finally {
       isRefreshing = false;
     }

@@ -9,9 +9,8 @@
  * refresh Just Work.
  */
 
-import { STORAGE_KEYS } from '@/types';
 import { MONITORING_STORAGE_KEYS } from '@/types/monitoring';
-import type { AuthTokens } from '@/types';
+import { getFreshAccessToken } from '@/services/tokens';
 import type {
   ActivityBatchResponse,
   DailyMonitoringReportResource,
@@ -75,12 +74,6 @@ function extractCode(body: unknown): string | null {
   return match ? match[1] : null;
 }
 
-async function getAccessToken(): Promise<string | null> {
-  const stored = await chrome.storage.local.get([STORAGE_KEYS.AUTH_TOKENS]);
-  const tokens = stored[STORAGE_KEYS.AUTH_TOKENS] as AuthTokens | undefined;
-  return tokens?.accessToken ?? null;
-}
-
 /**
  * The project monitoring writes to.
  *
@@ -100,8 +93,36 @@ export async function setMonitoringProject(project: string): Promise<void> {
   await chrome.storage.local.set({ [MONITORING_STORAGE_KEYS.PROJECT]: project });
 }
 
+/**
+ * One monitoring request, with the sign-in kept fresh.
+ *
+ * The token is refreshed before it expires rather than after: this code runs in
+ * a service worker woken by an alarm, often with no popup open and nobody to
+ * notice a sign-in that quietly lapsed. Reading the stored token and using it
+ * expired — which is what this did before — turned every upload into a 401 for
+ * as long as the person did not open the extension, which in practice was
+ * hours, and the session on the server went silent and was expired.
+ *
+ * A 401 even so is retried once with a forced refresh, for the case where the
+ * server considers the token dead before its own stated expiry.
+ */
 async function request<T>(project: string, path: string, init: RequestInit = {}): Promise<T> {
-  const token = await getAccessToken();
+  const first = await attempt<T>(project, path, init, await getFreshAccessToken());
+  if (!('unauthorized' in first)) return first.value;
+
+  const token = await getFreshAccessToken({ force: true });
+  if (!token) throw first.unauthorized;
+  const second = await attempt<T>(project, path, init, token);
+  if ('unauthorized' in second) throw second.unauthorized;
+  return second.value;
+}
+
+async function attempt<T>(
+  project: string,
+  path: string,
+  init: RequestInit,
+  token: string | null,
+): Promise<{ value: T } | { unauthorized: MonitoringApiError }> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}/v1/${project}/monitoring${path}`, {
@@ -120,7 +141,7 @@ async function request<T>(project: string, path: string, init: RequestInit = {})
     throw new MonitoringApiError(err instanceof Error ? err.message : 'Network error', 0, null);
   }
 
-  if (response.status === 204) return undefined as T;
+  if (response.status === 204) return { value: undefined as T };
 
   const raw = await response.text();
   let body: unknown = null;
@@ -135,10 +156,12 @@ async function request<T>(project: string, path: string, init: RequestInit = {})
   if (!response.ok) {
     const message =
       (body as { message?: string })?.message ?? `Request failed (${response.status})`;
-    throw new MonitoringApiError(message, response.status, extractCode(body));
+    const error = new MonitoringApiError(message, response.status, extractCode(body));
+    if (response.status === 401) return { unauthorized: error };
+    throw error;
   }
 
-  return body as T;
+  return { value: body as T };
 }
 
 // ─── Session lifecycle ────────────────────────────────────────────────────────

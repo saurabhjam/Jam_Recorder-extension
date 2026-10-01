@@ -27,6 +27,7 @@ execFileSync(
     resolve(here, '..', 'src', 'utils', 'encodeBudget.ts'),
     resolve(here, '..', 'src', 'utils', 'monitoringSyncPolicy.ts'),
     resolve(here, '..', 'src', 'utils', 'monitoringInactivity.ts'),
+    resolve(here, '..', 'src', 'utils', 'authRefreshPolicy.ts'),
     '--outDir',
     outDir,
     '--module',
@@ -47,6 +48,7 @@ execFileSync(process.execPath, [resolve(here, 'monitoringSyncPolicy.test.mjs')],
 execFileSync(process.execPath, [resolve(here, 'monitoringInactivity.test.mjs')], {
   stdio: 'inherit',
 });
+execFileSync(process.execPath, [resolve(here, 'authRefreshPolicy.test.mjs')], { stdio: 'inherit' });
 
 // The real background code end to end, against a simulated agent, OS, server
 // and chrome.*. Skips itself, with a note, when fake-indexeddb is not available.
