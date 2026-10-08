@@ -539,10 +539,14 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
         {captureBroken && (
           <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
             <p className="flex items-start gap-2 text-xs font-semibold text-amber-200">
-              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              {state.capture.status === 'failed' ? (
+                <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              ) : (
+                <Loader2 size={14} className="mt-0.5 shrink-0 animate-spin" />
+              )}
               {state.capture.status === 'failed'
                 ? 'Screenshots cannot be captured'
-                : 'Screen capture disconnected'}
+                : 'Reconnecting to the BestQ agent'}
             </p>
             {/*
               The actual reason, not a generic sentence. "Screen capture
@@ -555,16 +559,21 @@ export function MonitoringView({ onBack }: MonitoringViewProps) {
               {state.capture.error ??
                 'No new screenshots are being captured. Everything already captured is safe, and activity is still being recorded.'}
             </p>
-            <Button
-              variant="secondary"
-              size="sm"
-              fullWidth
-              loading={busy}
-              leftIcon={<MonitorOff size={14} />}
-              onClick={() => run('MONITORING_RECONNECT_CAPTURE')}
-            >
-              Retry capture
-            </Button>
+            {/* A reconnect needs nobody's help — it is already happening, and
+                offering a button implies the opposite. It stays available for
+                a capture that has genuinely failed. */}
+            {state.capture.status === 'failed' && (
+              <Button
+                variant="secondary"
+                size="sm"
+                fullWidth
+                loading={busy}
+                leftIcon={<MonitorOff size={14} />}
+                onClick={() => run('MONITORING_RECONNECT_CAPTURE')}
+              >
+                Retry capture
+              </Button>
+            )}
           </div>
         )}
 

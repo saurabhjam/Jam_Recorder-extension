@@ -87,18 +87,33 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         return;
       }
 
-      // Token expired → try to refresh
-      try {
-        await get().refreshToken();
-        // refreshToken() updates accessToken in the store; mark session as authenticated
-        set({ user, isAuthenticated: true });
-      } catch {
-        await chrome.storage.local.remove([
-          STORAGE_KEYS.AUTH_USER,
-          STORAGE_KEYS.AUTH_TOKENS,
-          STORAGE_KEYS.AUTH_SESSION_ID,
-        ]);
+      // Token expired → try to refresh.
+      //
+      // A refresh that merely could not happen — no network, the sign-in server
+      // down, the popup opened on a train — must not sign anybody out. This
+      // used to wipe the stored session on ANY failure, so opening the popup
+      // offline with an expired token was enough to lose it. The shared refresh
+      // clears the sign-in itself, and only when the server rejects the refresh
+      // token; here, anything else leaves it exactly where it is to be retried.
+      const outcome = await refreshTokens();
+      if (outcome.ok) {
+        set({
+          user,
+          accessToken: outcome.tokens.accessToken,
+          sessionId: sessionId ?? null,
+          isAuthenticated: true,
+        });
+      } else if (outcome.verdict === 'invalid' || outcome.verdict === 'no-refresh-token') {
+        // tokens.ts has already cleared the sign-in for a definitive rejection.
         set({ user: null, accessToken: null, sessionId: null, isAuthenticated: false });
+      } else {
+        console.warn('[AuthStore] could not refresh yet — keeping the session:', outcome.error);
+        set({
+          user,
+          accessToken: tokens.accessToken,
+          sessionId: sessionId ?? null,
+          isAuthenticated: true,
+        });
       }
     } catch (err) {
       console.error('[AuthStore] Initialize error:', err);

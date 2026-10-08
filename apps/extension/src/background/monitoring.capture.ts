@@ -58,6 +58,15 @@ export function resetCaptureHealth(): void {
 /** What the agent must report before a session may start capturing. */
 export interface AgentCaptureReadiness {
   connected: boolean;
+  /**
+   * The agent is not connected right now but is expected back — it is
+   * reconnecting, or it has worked in this session already.
+   *
+   * This is the difference between "you never installed it" and "it stopped
+   * answering for a moment", and telling people the first when the second is
+   * true sends them to reinstall something that is working.
+   */
+  reconnecting?: boolean;
   /** The agent's own answer to "can I read the whole screen". */
   screenCapture: boolean;
   /** True when the OS grant is the thing that is missing. */
@@ -88,6 +97,18 @@ export function startCapture(
   health: CaptureHealth;
 } {
   if (!readiness.connected) {
+    // Reconnecting is not a failure, and must not read like one. Capture
+    // resumes by itself the moment the agent answers again; nothing is asked
+    // of the person and nothing needs reinstalling.
+    if (readiness.reconnecting) {
+      health = {
+        ...INITIAL_CAPTURE_HEALTH,
+        status: 'reconnect',
+        error:
+          'The BestQ agent stopped responding for a moment. Reconnecting — screenshots will resume on their own.',
+      };
+      return { started: false, health };
+    }
     health = {
       ...INITIAL_CAPTURE_HEALTH,
       status: 'failed',

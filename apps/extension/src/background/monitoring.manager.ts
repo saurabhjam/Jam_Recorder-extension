@@ -63,6 +63,7 @@ import {
   setMonitoringProject,
   MonitoringApiError,
 } from '@/services/monitoring.api';
+import { readTokens } from '@/services/tokens';
 import {
   enqueueActivity,
   enqueueEvent,
@@ -148,6 +149,16 @@ import {
   configureActivitySink,
   takeLegacyActivityBuffer,
 } from './monitoring.activity';
+
+/**
+ * Is anybody signed in?
+ *
+ * Read on the minute tick rather than asked for at draw time, because drawing
+ * the badge is synchronous and this lives in storage. Monitoring never stops
+ * for a missing sign-in — it keeps capturing and keeps what it captures — so
+ * this exists to say so on the toolbar.
+ */
+let signedOutNow = false;
 
 /** How far back refusals are still reported when nothing is being monitored. */
 const DEAD_REPORTING_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -924,6 +935,13 @@ async function beginCapture(): Promise<void> {
   const result = startCapture(
     {
       connected: isNativeAgentTracking(),
+      // Coming back, rather than never there: the agent is mid-reconnect, or
+      // it has already answered once on this machine. Either way the honest
+      // thing to say is "reconnecting", not "install it".
+      reconnecting:
+        agent.status === 'connecting' ||
+        agent.status === 'disconnected' ||
+        Boolean(agent.agentVersion),
       screenCapture: agent.capabilities?.screenCapture === true,
       permissionMissing: agent.permissions?.screenRecording === false,
       unsupported: agent.status === 'unsupported-platform',
@@ -943,6 +961,41 @@ async function beginCapture(): Promise<void> {
     // with no screenshots is not what they asked for.
     error: result.started ? null : (result.health.error ?? 'Screen capture could not be started.'),
   });
+}
+
+/**
+ * Keep capture in step with the agent that performs it.
+ *
+ * Two jobs, both of which used to need a person: while the agent is away, say
+ * that capture is reconnecting instead of leaving a session reporting healthy
+ * capture it is not doing — and once it answers again, start capturing without
+ * anybody pressing Retry. The session itself is never touched; time, activity
+ * and inactivity carry on throughout.
+ */
+async function syncCaptureWithAgent(): Promise<void> {
+  if (state.status !== 'monitoring' || !state.sessionId) return;
+  if (startInFlight || stopInFlight) return;
+
+  const agent = getNativeAgentState();
+  const usable = agent.status === 'connected' || agent.status === 'monitoring';
+
+  if (!usable) {
+    if (state.capture.status === 'active' || state.capture.status === 'capturing') {
+      await persist({
+        capture: noteFrameFailed(
+          'The BestQ agent stopped responding. Reconnecting — screenshots will resume on their own.',
+          false,
+        ),
+      });
+      renderBadge();
+    }
+    return;
+  }
+
+  if (state.capture.status !== 'active' && state.capture.status !== 'capturing') {
+    console.log('[Monitoring] the agent is back — resuming capture');
+    await reconnectMonitoringCapture();
+  }
 }
 
 /**
@@ -1419,6 +1472,25 @@ export async function handleMonitoringAlarm(): Promise<void> {
   // permission — and the badge must not keep saying MON through it.
   renderBadge();
 
+  // The agent is the thing that takes screenshots, and on Windows its
+  // connection drops from time to time — a frame the browser would not carry,
+  // security software, an update. The session is unaffected, so this keeps the
+  // two in step: say so while it is away, and start capturing again when it is
+  // back. Done here rather than the moment the agent's state changes, because
+  // this runs on its own and cannot land in the middle of a start or a stop.
+  await syncCaptureWithAgent();
+
+  // Signed out while monitoring: everything keeps being recorded and kept, but
+  // none of it can go anywhere until somebody signs in. The toolbar says so,
+  // because nothing else about a running session looks any different.
+  const tokens = await readTokens().catch(() => null);
+  const signedOut = !tokens?.accessToken;
+  if (signedOut !== signedOutNow) {
+    signedOutNow = signedOut;
+    renderBadge();
+    await setToolbarTitle();
+  }
+
   // Inactivity checked against the OS before the heartbeat reports it — and
   // an hour of it ends the session here.
   if (await reconcileAndMaybeAutoStop()) return;
@@ -1809,6 +1881,7 @@ let shownBadge: BadgeView | null = null;
  */
 function renderBadge(): void {
   const view = badgeFor({
+    signedOut: signedOutNow,
     status: state.status,
     captureStatus: state.capture.status,
     agentStatus: state.native.status,
@@ -1830,6 +1903,22 @@ function renderBadge(): void {
     if (view.color) {
       chrome.action.setBadgeBackgroundColor({ color: view.color }).catch(() => {});
     }
+  } catch {
+    /* no chrome.action in this context */
+  }
+}
+
+/**
+ * The toolbar tooltip, which has room for a sentence where the badge has four
+ * characters.
+ */
+async function setToolbarTitle(): Promise<void> {
+  const title =
+    signedOutNow && isMonitoringSessionLive()
+      ? 'BestQ — monitoring is running, but you are signed out. Sign in to upload what it has recorded.'
+      : 'BestQ';
+  try {
+    await chrome.action.setTitle({ title });
   } catch {
     /* no chrome.action in this context */
   }

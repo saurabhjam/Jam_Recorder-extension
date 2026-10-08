@@ -50,6 +50,15 @@ export const BADGE = {
   PAUSED: { text: '❚❚', color: '#7a6cc4' },
   /** A session is open but nothing is being captured — the honest warning. */
   STALLED: { text: '!', color: '#d78706' },
+  /**
+   * Monitoring is running and recording, but nobody is signed in, so none of it
+   * can be uploaded until somebody does.
+   *
+   * Its own badge rather than the ordinary MON: the session looks completely
+   * normal from the outside — screenshots are being taken, time is counting —
+   * and the one thing that needs a person is invisible without this.
+   */
+  SIGNED_OUT: { text: 'LOG', color: '#dc2626' },
   /** No badge at all. */
   NONE: { text: '', color: null },
 } as const;
@@ -76,6 +85,8 @@ export interface BadgeInput {
   nowMs: number;
   /** A screen recording is showing REC; monitoring must not fight it for the badge. */
   recordingOwnsBadge: boolean;
+  /** Nobody is signed in: captured work is kept, but nothing can be uploaded. */
+  signedOut?: boolean;
 }
 
 /**
@@ -95,7 +106,7 @@ export function badgeFor(input: BadgeInput): BadgeView | null {
       return BADGE.NONE;
 
     case 'paused':
-      return BADGE.PAUSED;
+      return input.signedOut ? BADGE.SIGNED_OUT : BADGE.PAUSED;
 
     // Asked for, not yet proven. The badge waits for the first frame rather
     // than promising on the strength of a request that may still fail.
@@ -103,6 +114,10 @@ export function badgeFor(input: BadgeInput): BadgeView | null {
       return BADGE.NONE;
 
     case 'monitoring':
+      // Signing in is the one thing here that only a person can do, so it is
+      // said first. A stalled capture usually recovers on its own; a session
+      // with nobody signed in stays that way until somebody acts.
+      if (input.signedOut) return BADGE.SIGNED_OUT;
       return capturing(input) ? BADGE.ACTIVE : BADGE.STALLED;
 
     default:

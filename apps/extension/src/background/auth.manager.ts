@@ -21,7 +21,8 @@
  */
 
 import { AUTH_POLICY, needsRefresh, refreshRetryDelayMs } from '@/utils/authRefreshPolicy';
-import { clearTokens, readTokens, refreshTokens } from '@/services/tokens';
+import { clearTokens, readTokens, refreshTokens, sessionStartedAt } from '@/services/tokens';
+import { describeSignOut, sessionSignOutReason } from '@/utils/sessionLifetime';
 import { AUTH_REFRESH_ALARM } from '@/types';
 
 /** Consecutive failed attempts, for backoff while the server is unreachable. */
@@ -33,6 +34,8 @@ export const authManager = {
     await this.ensureAlarm();
     const tokens = await readTokens();
     if (!tokens) return;
+    // A machine that was switched off overnight comes back here first.
+    if (await this.endSessionIfDue()) return;
     if (needsRefresh(tokens.expiresAt, Date.now())) await this.performRefresh();
   },
 
@@ -65,6 +68,7 @@ export const authManager = {
   async handleRefreshAlarm(): Promise<void> {
     const tokens = await readTokens();
     if (!tokens?.accessToken) return;
+    if (await this.endSessionIfDue()) return;
     if (!needsRefresh(tokens.expiresAt, Date.now())) {
       failures = 0;
       return;
@@ -106,6 +110,26 @@ export const authManager = {
   async onTokenRefreshed(_expiresAt: number): Promise<void> {
     failures = 0;
     await this.ensureAlarm();
+  },
+
+  /**
+   * End the sign-in if policy says it is time — overnight, or at the age limit.
+   *
+   * Deliberate, and nothing to do with the failures that used to sign people
+   * out: monitoring keeps running and keeps everything it captures, and the
+   * next sign-in uploads it. Checked on the same five-minute alarm as the
+   * refresh, and again at startup, so a machine that was off at two in the
+   * morning is signed out the first time it is used instead of never.
+   */
+  async endSessionIfDue(): Promise<boolean> {
+    const reason = sessionSignOutReason({
+      signedInAt: await sessionStartedAt(),
+      nowMs: Date.now(),
+    });
+    if (!reason) return false;
+    console.log(`[AuthManager] ending the sign-in (${reason}) — ${describeSignOut(reason)}`);
+    await clearTokens();
+    return true;
   },
 
   /** The person signed out deliberately. */

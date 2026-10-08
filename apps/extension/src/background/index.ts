@@ -27,6 +27,17 @@ import type {
 } from '@/types';
 import { STORAGE_KEYS, MAX_DRAFTS, AUTH_REFRESH_ALARM } from '@/types';
 import {
+  coveredExtent,
+  looksTiled,
+  marginsLookStatic,
+  planPageCanvas,
+  planScrollPositions,
+  planStrips,
+  tileDraw,
+  tileVerdict,
+} from '@/utils/fullPagePlan';
+import type { OpenedPage } from '@/content/pageOpener';
+import {
   RECORDING_UPLOAD_ALARM,
   configureUploader,
   confirmRecordingUpload,
@@ -1923,7 +1934,14 @@ async function ensureMinWidth(dataUrl: string, minWidth = MIN_FULL_PAGE_WIDTH): 
     return dataUrl;
   }
   const scale = minWidth / bitmap.width;
-  const canvas = new OffscreenCanvas(minWidth, Math.round(bitmap.height * scale));
+  const height = Math.round(bitmap.height * scale);
+  // A long page already drawn as large as a canvas allows: upscaling it would
+  // produce an empty image, not a wider one.
+  if (height > 32_000 || minWidth * height > 160_000_000) {
+    bitmap.close();
+    return dataUrl;
+  }
+  const canvas = new OffscreenCanvas(minWidth, height);
   canvas.getContext('2d')!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
   return blobToDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
@@ -1959,6 +1977,179 @@ interface CaptureStrip {
   srcH: number; // physical px height of new content to draw from this capture
   destX: number; // physical px destination X on the final canvas
   destY: number; // physical px destination Y on the final canvas
+  destW?: number; // drawn at this width instead of srcW (a stretched fill)
+  destH?: number; // drawn at this height instead of srcH
+}
+
+/**
+ * Do two frames show the same thing INSIDE the scrolling column?
+ *
+ * The scroll position a page reports is not evidence that anything moved. An
+ * element can have its `scrollTop` advanced — because it was the wrong element,
+ * because a handler put it back, because the real scrolling happens somewhere
+ * else — while what is on screen stays exactly where it was. Believing the
+ * number is how a capture ends up as the same screen stamped out down the
+ * image; this looks at the pixels instead.
+ */
+async function sameColumnContent(
+  firstDataUrl: string,
+  laterDataUrl: string,
+  column: { x: number; y: number; width: number; height: number },
+): Promise<boolean> {
+  try {
+    const [first, later] = await Promise.all(
+      [firstDataUrl, laterDataUrl].map(async (url) =>
+        createImageBitmap(await (await fetch(url)).blob()),
+      ),
+    );
+    try {
+      return sameRegion(first, later, column);
+    } finally {
+      first.close();
+      later.close();
+    }
+  } catch (err) {
+    logFullPage('Full-page: could not compare two frames:', String(err));
+    return false;
+  }
+}
+
+/**
+ * The whole region, shrunk to a thumbnail, compared.
+ *
+ * A thin band was not enough: sampled across the middle of a page it lands in
+ * whitespace as often as not, and a featureless sample proves nothing — so the
+ * check abstained and every repeated frame was kept. Shrinking the entire
+ * region instead keeps its structure (headers, cards, rows) while averaging
+ * away cursors and anti-aliasing, so there is something to compare wherever the
+ * content happens to be.
+ */
+const COMPARE_THUMBNAIL = 72;
+
+function sameRegion(
+  first: ImageBitmap,
+  later: ImageBitmap,
+  region: { x: number; y: number; width: number; height: number },
+): boolean {
+  const width = Math.min(region.width, first.width - region.x, later.width - region.x);
+  const height = Math.min(region.height, first.height - region.y, later.height - region.y);
+  if (width <= 0 || height <= 0) return false;
+
+  const shrink = (bitmap: ImageBitmap): Uint8ClampedArray => {
+    const canvas = new OffscreenCanvas(COMPARE_THUMBNAIL, COMPARE_THUMBNAIL);
+    const context = canvas.getContext('2d')!;
+    context.drawImage(
+      bitmap,
+      region.x,
+      region.y,
+      width,
+      height,
+      0,
+      0,
+      COMPARE_THUMBNAIL,
+      COMPARE_THUMBNAIL,
+    );
+    return context.getImageData(0, 0, COMPARE_THUMBNAIL, COMPARE_THUMBNAIL).data;
+  };
+  return looksTiled(shrink(first), shrink(later), { tolerance: 6, minVariance: 0.01 });
+}
+
+/**
+ * Did this render come back as one screen stamped out repeatedly?
+ *
+ * The failure it catches: a clip taller than the document, which Chrome fills by
+ * re-rasterising the viewport instead of rendering content that is not in the
+ * document at all. Two bands exactly one viewport apart are compared; if they
+ * are identical — and have anything in them to compare — the image is a repeat
+ * and worth nothing.
+ */
+async function looksRepeated(
+  dataUrl: string,
+  viewportHeightCss: number,
+  scale: number,
+): Promise<boolean> {
+  try {
+    const bitmap = await createImageBitmap(await (await fetch(dataUrl)).blob());
+    try {
+      const viewportPx = Math.round(viewportHeightCss * scale);
+      // Nothing to compare: the image is not even two screens tall.
+      if (viewportPx < 32 || bitmap.height < viewportPx * 2) return false;
+
+      const bandHeight = Math.max(8, Math.round(viewportPx * 0.05));
+      const offset = Math.round(viewportPx * 0.25);
+      const width = Math.min(bitmap.width, 512);
+      const read = (y: number): Uint8ClampedArray => {
+        const canvas = new OffscreenCanvas(width, bandHeight);
+        const context = canvas.getContext('2d')!;
+        context.drawImage(bitmap, 0, y, width, bandHeight, 0, 0, width, bandHeight);
+        return context.getImageData(0, 0, width, bandHeight).data;
+      };
+      // A quarter of the way down the first screen, and the same place on the
+      // second. On a real page those show different content; on a tiled render
+      // they are the same pixels.
+      return looksTiled(read(offset), read(offset + viewportPx));
+    } finally {
+      bitmap.close();
+    }
+  } catch (err) {
+    logFullPage('Full-page: could not check the single-shot render:', String(err));
+    return false;
+  }
+}
+
+/**
+ * Do two captured frames show the same thing outside the scrolling column?
+ *
+ * Sampled rather than compared whole: a few bands of pixels down each side
+ * answer the question at a fraction of the cost, and the question is only
+ * whether that furniture moved.
+ */
+async function sameOutsideColumn(
+  firstDataUrl: string,
+  laterDataUrl: string,
+  columnX: number,
+  columnWidth: number,
+): Promise<boolean> {
+  try {
+    const [first, later] = await Promise.all(
+      [firstDataUrl, laterDataUrl].map(async (url) =>
+        createImageBitmap(await (await fetch(url)).blob()),
+      ),
+    );
+    try {
+      const regions: Array<{ x: number; w: number }> = [];
+      if (columnX > 2) regions.push({ x: 0, w: Math.min(columnX, 64) });
+      const rightX = columnX + columnWidth;
+      if (first.width - rightX > 2) {
+        regions.push({ x: Math.max(0, first.width - 64), w: Math.min(64, first.width - rightX) });
+      }
+      if (regions.length === 0) return false;
+
+      for (const region of regions) {
+        const height = Math.min(first.height, later.height);
+        const canvasA = new OffscreenCanvas(region.w, height);
+        const canvasB = new OffscreenCanvas(region.w, height);
+        canvasA
+          .getContext('2d')!
+          .drawImage(first, region.x, 0, region.w, height, 0, 0, region.w, height);
+        canvasB
+          .getContext('2d')!
+          .drawImage(later, region.x, 0, region.w, height, 0, 0, region.w, height);
+        const a = canvasA.getContext('2d')!.getImageData(0, 0, region.w, height).data;
+        const b = canvasB.getContext('2d')!.getImageData(0, 0, region.w, height).data;
+        if (!marginsLookStatic(a, b)) return false;
+      }
+      return true;
+    } finally {
+      first.close();
+      later.close();
+    }
+  } catch (err) {
+    // Unreadable frames are not evidence of anything; do not repeat furniture
+    // on a guess.
+    logFullPage('Full-page: could not compare frames beside the scroll column:', String(err));
+    return false;
+  }
 }
 
 /** Stitch non-overlapping strips into one full-page image. */
@@ -1982,8 +2173,8 @@ async function stitchCaptures(
         strip.srcH, // source rect
         strip.destX,
         strip.destY,
-        strip.srcW,
-        strip.srcH, // dest rect
+        strip.destW ?? strip.srcW,
+        strip.destH ?? strip.srcH, // dest rect — differs only for a stretched fill
       );
       bitmap.close();
     } catch (err) {
@@ -2026,17 +2217,7 @@ async function captureVisibleThrottled(windowId: number): Promise<string> {
 }
 
 /** Non-overlapping scroll positions covering `scrollHeight`, plus the final bottom. */
-function buildScrollPositions(scrollHeight: number, clipHeight: number): number[] {
-  const maxScrollY = Math.max(0, scrollHeight - clipHeight);
-  const positions: number[] = [];
-  for (let y = 0; y < maxScrollY; y += clipHeight) {
-    positions.push(Math.round(y));
-  }
-  if (positions.length === 0 || positions[positions.length - 1] !== maxScrollY) {
-    positions.push(maxScrollY);
-  }
-  return positions;
-}
+const buildScrollPositions = planScrollPositions;
 
 /**
  * Problems from the most recent captureFullPage() run — surfaced in the preview UI
@@ -2048,6 +2229,13 @@ function buildScrollPositions(scrollHeight: number, clipHeight: number): number[
  * instead, so a successful capture shows no warning banner at all.
  */
 let fullPageWarnings: string[] = [];
+
+/**
+ * One line of plain fact about the last full-page capture, shown in the
+ * preview: which build, what it measured, which path it took. Without it a
+ * report about a screenshot can only be answered by guessing.
+ */
+let fullPageDetails = '';
 
 function fmt(parts: unknown[]): string {
   return parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' ');
@@ -2065,87 +2253,282 @@ function logFullPage(...parts: unknown[]): void {
   console.log('[Background]', fmt(parts));
 }
 
-/**
- * Capture the whole page in ONE shot via the DevTools Protocol.
- *
- * This is the good path. `captureBeyondViewport` makes Chrome's compositor render
- * the entire document at once, so there is no scrolling, no tiling and no stitching
- * — which means none of the failure modes that plague the scroll-and-stitch path:
- * the page can't lazily re-render or reset its scroll position mid-capture, tiles
- * can't misalign, and no seams or gaps are possible.
- *
- * Returns null (never throws) when CDP isn't usable — most commonly because DevTools
- * is open on the tab, since Chrome allows only one debugger client per tab. The
- * caller falls back to the scroll-and-stitch path in that case.
- */
-async function captureFullPageViaCDP(
-  tabId: number,
-  width: number,
-  height: number,
-  scale: number,
-): Promise<string | null> {
-  // Chrome refuses textures beyond ~16384px on a side; past that CDP returns an
-  // empty/black image rather than an error, so bail out to tiling instead.
-  const MAX_DIMENSION = 16000;
-  if (width * scale > MAX_DIMENSION || height * scale > MAX_DIMENSION) {
-    logFullPage(
-      'Full-page: page too large for a single-shot capture',
-      `(${Math.round(width * scale)}x${Math.round(height * scale)})`,
-      '— falling back to tiled capture',
-    );
-    return null;
-  }
+// ─── Full page: the page opened out, photographed a screen at a time ──────────
+//
+// The content script lays the page out at full size (pageOpener.ts): every
+// scroll container — the main panel, the panels nested in it, the sideways ones
+// — shows all of its content in the document, and everything pinned to the
+// window is moved onto the page so it appears once. The window is then scrolled
+// over that document and photographed a screen at a time, and each photograph is
+// drawn where the window really was. Nothing is zoomed: every photograph is at
+// the screen's own density, and the image is the page at its real size.
 
-  const target: chrome.debugger.Debuggee = { tabId };
-  let weAttached = false;
+/**
+ * Pages taller than this are cut, with a warning. A feed that has loaded
+ * thousands of items is still finite, but photographing it takes minutes and
+ * the image is too large to open. Around forty screens.
+ */
+const MAX_PAGE_HEIGHT_CSS = 40_000;
+
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function openPageForCapture(tabId: number): Promise<OpenedPage> {
+  return chrome.tabs.sendMessage(tabId, {
+    type: 'SCREENSHOT_EXPAND_PAGE',
+  } as ExtensionMessage) as Promise<OpenedPage>;
+}
+
+async function scrollPageForCapture(
+  tabId: number,
+  x: number,
+  y: number,
+  hideLate: boolean,
+): Promise<{ x: number; y: number }> {
+  return (await chrome.tabs.sendMessage(tabId, {
+    type: 'SCREENSHOT_PAGE_SCROLL',
+    payload: { x, y, hideLate },
+  } as ExtensionMessage)) as { x: number; y: number };
+}
+
+async function restorePageAfterCapture(tabId: number): Promise<void> {
   try {
-    // Our own recording flow may already hold the debugger on this tab; reuse it
-    // rather than fighting over the single-client limit.
-    if (cdpTabId !== tabId) {
-      await chrome.debugger.attach(target, '1.3');
-      weAttached = true;
-    }
-    const result = (await chrome.debugger.sendCommand(target, 'Page.captureScreenshot', {
-      format: 'png',
-      captureBeyondViewport: true,
-      fromSurface: true,
-      clip: { x: 0, y: 0, width, height, scale },
-    })) as { data?: string } | undefined;
-    if (!result?.data) return null;
-    return `data:image/png;base64,${result.data}`;
-  } catch (err) {
-    const msg = String((err as Error)?.message ?? err);
-    logFullPage(
-      'Full-page: single-shot capture unavailable —',
-      msg.includes('Another debugger') || msg.includes('devtools')
-        ? 'DevTools is open on this tab (close it for the best full-page result); using tiled capture'
-        : `${msg}; using tiled capture`,
-    );
-    return null;
-  } finally {
-    if (weAttached) {
-      try {
-        await chrome.debugger.detach(target);
-      } catch {
-        /* already gone */
-      }
-    }
+    await chrome.tabs.sendMessage(tabId, { type: 'SCREENSHOT_RESTORE_PAGE' } as ExtensionMessage);
+  } catch {
+    /* the page navigated away — nothing left to put back */
   }
 }
 
-/** Undo SCREENSHOT_EXPAND_SCROLLERS. Safe to call even if nothing was expanded. */
-async function restoreScrollers(tabId: number): Promise<void> {
-  try {
-    await chrome.tabs.sendMessage(tabId, {
-      type: 'SCREENSHOT_RESTORE_SCROLLERS',
-    } as ExtensionMessage);
-  } catch {
-    /* ignore — page may have navigated away */
+/**
+ * Let lazily-loaded content arrive before anything is photographed.
+ *
+ * Opened out, the page is one long document, so walking the window down it
+ * brings every lazy image and every load-more-as-you-scroll section into view
+ * the way a person scrolling would. What arrives may hold scroll containers of
+ * its own, so the page is opened out again and re-measured, until a round adds
+ * nothing.
+ */
+async function settleOpenedPage(tabId: number, page: OpenedPage): Promise<OpenedPage> {
+  const MAX_ROUNDS = 5;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    if (page.height <= page.viewportHeight + 2 && page.width <= page.viewportWidth + 2) return page;
+    const reach = Math.min(page.height, MAX_PAGE_HEIGHT_CSS);
+    for (const y of planScrollPositions(reach, page.viewportHeight)) {
+      await scrollPageForCapture(tabId, 0, y, false).catch(() => undefined);
+      await pause(60);
+    }
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'SCREENSHOT_WAIT_SETTLED',
+        payload: { timeoutMs: 4000, quietMs: 400, minWaitMs: 600 },
+      } as ExtensionMessage);
+    } catch {
+      /* measure whatever is there */
+    }
+    const next = await openPageForCapture(tabId);
+    if (!next?.ok) return next;
+    const grew = next.height > page.height + 4 || next.width > page.width + 4;
+    page = next;
+    if (!grew) return page;
   }
+  warnFullPage(
+    'Full-page: the page was still loading more content after',
+    MAX_ROUNDS,
+    'rounds — anything further down may be missing',
+  );
+  return page;
+}
+
+/** Photograph the opened page a screen at a time, into one image. */
+async function photographOpenedPage(
+  tabId: number,
+  windowId: number,
+  page: OpenedPage,
+): Promise<string> {
+  const viewport = { width: page.viewportWidth, height: page.viewportHeight };
+  const target = { width: page.width, height: Math.min(page.height, MAX_PAGE_HEIGHT_CSS) };
+  if (page.height > MAX_PAGE_HEIGHT_CSS) {
+    warnFullPage(
+      'Full-page: the page is',
+      Math.round(page.height),
+      'px tall — the image stops after the first',
+      MAX_PAGE_HEIGHT_CSS,
+      'px',
+    );
+  }
+  const columns = planScrollPositions(target.width, viewport.width);
+  const rows = planScrollPositions(target.height, viewport.height);
+
+  let canvas: OffscreenCanvas | null = null;
+  let context: OffscreenCanvasRenderingContext2D | null = null;
+  let ratio = 1;
+  let scale = 1;
+  const placed: Array<{ x: number; y: number; column: number }> = [];
+  let previousRowY: number | null = null;
+
+  rows: for (const y of rows) {
+    for (let column = 0; column < columns.length; column++) {
+      const x = columns[column]!;
+      let at: { x: number; y: number } | null = null;
+      let frame: string | null = null;
+      for (let attempt = 0; attempt < 2 && !frame; attempt++) {
+        try {
+          at = await scrollPageForCapture(tabId, x, y, true);
+          frame = await captureVisibleThrottled(windowId);
+        } catch (err) {
+          if (attempt === 0) {
+            await pause(CAPTURE_MIN_INTERVAL_MS);
+          } else {
+            warnFullPage('Full-page: could not photograph the page at', { x, y }, String(err));
+          }
+        }
+      }
+      if (!frame || !at) continue;
+
+      // The window would go no further down: every later row would be this
+      // one again, so stop here rather than photograph it over and over.
+      if (column === 0) {
+        if (
+          previousRowY != null &&
+          tileVerdict(
+            { actualScrollY: previousRowY },
+            { actualScrollY: at.y },
+            { expectedAdvance: viewport.height, toleranceCssPx: 0.5 },
+          ) === 'stop'
+        ) {
+          break rows;
+        }
+        previousRowY = at.y;
+      }
+
+      const bitmap = await createImageBitmap(await (await fetch(frame)).blob());
+      try {
+        if (!canvas || !context) {
+          // The photograph's own size says how dense the screen is; the
+          // reported devicePixelRatio has been seen to disagree with it.
+          ratio = bitmap.width / page.innerWidth;
+          const plan = planPageCanvas(target, ratio);
+          scale = plan.scale;
+          canvas = new OffscreenCanvas(plan.width, plan.height);
+          context = canvas.getContext('2d')!;
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, plan.width, plan.height);
+          if (scale < ratio - 0.001) {
+            logFullPage(
+              'Full-page: the page is too large to draw at full density —',
+              `drawn at ${scale.toFixed(2)} px per CSS px instead of ${ratio.toFixed(2)}`,
+            );
+          }
+        }
+        const draw = tileDraw(at, viewport, ratio, scale);
+        context.drawImage(
+          bitmap,
+          draw.srcX,
+          draw.srcY,
+          Math.min(draw.srcW, bitmap.width),
+          Math.min(draw.srcH, bitmap.height),
+          draw.destX,
+          draw.destY,
+          draw.destW,
+          draw.destH,
+        );
+        placed.push({ x: at.x, y: at.y, column });
+      } finally {
+        bitmap.close();
+      }
+    }
+  }
+
+  if (!canvas || placed.length === 0) throw new Error('no part of the page could be photographed');
+
+  let output: OffscreenCanvas = canvas;
+  const covered = coveredExtent(placed, viewport, target);
+  if (covered.height < target.height - 1 || covered.width < target.width - 1) {
+    warnFullPage(
+      'Full-page: only',
+      `${Math.round(covered.width)}×${Math.round(covered.height)}`,
+      'of the',
+      `${Math.round(target.width)}×${Math.round(target.height)}`,
+      'page could be photographed — the image stops there',
+    );
+    const width = Math.max(1, Math.round(covered.width * scale));
+    const height = Math.max(1, Math.round(covered.height * scale));
+    output = new OffscreenCanvas(width, height);
+    output.getContext('2d')!.drawImage(canvas, 0, 0, width, height, 0, 0, width, height);
+  }
+  fullPageDetails += ` · ${placed.length} frame(s) → ${output.width}×${output.height}`;
+  return blobToDataUrl(await output.convertToBlob({ type: 'image/png' }));
+}
+
+/** One line of plain fact about an opened page, for the preview. */
+function describeOpenedPage(page: OpenedPage): string {
+  const parts = [
+    `BestQ ${chrome.runtime.getManifest().version}`,
+    `view ${Math.round(page.viewportWidth)}×${Math.round(page.viewportHeight)} @${page.devicePixelRatio}x`,
+    `page ${Math.round(page.width)}×${Math.round(page.height)}`,
+    `opened ${page.opened} scroll area(s)` +
+      (page.nested || page.sideways ? ` (${page.nested} nested, ${page.sideways} sideways)` : ''),
+  ];
+  if (page.pinned) parts.push(`${page.pinned} pinned element(s) placed once`);
+  return parts.join(' · ');
 }
 
 async function captureFullPage(tabId: number, windowId: number): Promise<string> {
   fullPageWarnings = [];
+  fullPageDetails = '';
+
+  let page: OpenedPage;
+  try {
+    page = await openPageForCapture(tabId);
+  } catch (err) {
+    warnFullPage(
+      'Full-page: could not reach the page —',
+      String(err),
+      '— captured the visible screen',
+    );
+    return ensureMinWidth(await captureVisibleThrottled(windowId));
+  }
+
+  let image: string | null = null;
+  if (page?.ok) {
+    try {
+      page = await settleOpenedPage(tabId, page);
+      if (page?.ok) {
+        fullPageDetails = describeOpenedPage(page);
+        if (page.tooWide > 0) {
+          warnFullPage(
+            'Full-page:',
+            page.tooWide,
+            page.tooWide === 1
+              ? 'very wide sideways-scrolling area was'
+              : 'very wide sideways-scrolling areas were',
+            'left as they are — only the part on screen is in the image',
+          );
+        }
+        image = await photographOpenedPage(tabId, windowId, page);
+      }
+    } catch (err) {
+      warnFullPage('Full-page: photographing the opened page failed —', String(err));
+    } finally {
+      await restorePageAfterCapture(tabId);
+    }
+  }
+  if (image) return ensureMinWidth(image);
+
+  // The page could not be laid out at full size faithfully — it lost height,
+  // or something it could not reach still clips the content — and it has been
+  // put back exactly as it was. Scroll its main panel instead: that captures
+  // the panel completely, though not panels nested inside it.
+  logFullPage(
+    'Full-page: the page could not be opened out —',
+    page?.reason ?? 'no answer from the page',
+    '— scrolling its main panel instead',
+  );
+  return captureByScrollingPanel(tabId, windowId);
+}
+
+// ─── Full page, fallback: scroll the main panel and stitch its column ─────────
+
+async function captureByScrollingPanel(tabId: number, windowId: number): Promise<string> {
   // ── 1. Get page dimensions ────────────────────────────────────────────────
   let dims: {
     scrollHeight: number; // content height of the scroll target (CSS px)
@@ -2161,32 +2544,9 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     clipWidth: number;
     clipHeight: number;
     scrollTargetDescription: string;
+    documentScrollHeight: number;
+    documentScrollWidth: number;
   };
-
-  // Flatten inner scroll containers FIRST, so the page lays out as one long document
-  // and the measurement below describes the whole thing. Capturing an inner scroller
-  // tile-by-tile is what made SPA pages (Jira et al) re-render mid-capture and come
-  // out truncated; flattened, they take the plain-long-document path that works.
-  try {
-    const flattened = (await chrome.tabs.sendMessage(tabId, {
-      type: 'SCREENSHOT_EXPAND_SCROLLERS',
-    } as ExtensionMessage)) as { expanded: number; scrollHeight: number; reverted?: boolean };
-    if (flattened?.reverted) {
-      warnFullPage(
-        'Full-page: flattening collapsed the layout — reverted, capturing the inner',
-        'scroll container instead',
-      );
-    } else if (flattened?.expanded) {
-      logFullPage(
-        'Full-page: flattened',
-        flattened.expanded,
-        'scroll container(s) → document height',
-        flattened.scrollHeight,
-      );
-    }
-  } catch {
-    /* non-fatal — fall through to the scroll-the-inner-container path */
-  }
 
   try {
     dims = (await chrome.tabs.sendMessage(tabId, {
@@ -2194,14 +2554,19 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     } as ExtensionMessage)) as typeof dims;
   } catch (err) {
     warnFullPage('Full-page: failed to get dimensions, falling back:', String(err));
-    await restoreScrollers(tabId);
-    return ensureMinWidth(await chrome.tabs.captureVisibleTab(windowId, { format: 'png' }));
+    return ensureMinWidth(await captureVisibleThrottled(windowId));
   }
+
   // Always surfaced (not just on error) — this is the single most useful fact for
   // diagnosing a capture that confidently stops short with no other warning: exactly
   // which element was chosen as "the thing that scrolls," and how tall IT thinks the
   // page is at the very start, before any settling/pagination logic runs.
   logFullPage('Full-page: scroll target =', dims.scrollTargetDescription);
+  fullPageDetails =
+    `BestQ ${chrome.runtime.getManifest().version} · ` +
+    `view ${Math.round(dims.viewportWidth)}×${Math.round(dims.viewportHeight)} @${dims.devicePixelRatio}x · ` +
+    `doc ${Math.round(dims.documentScrollHeight)} · ` +
+    `scrolls ${dims.scrollTargetDescription} (${Math.round(dims.scrollHeight)})`;
 
   const {
     viewportWidth,
@@ -2218,9 +2583,7 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
 
   // Content already fits the scroll target — nothing to scroll, simple capture.
   if (scrollHeight <= clipHeight + 2) {
-    const shot = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
-    await restoreScrollers(tabId);
-    return ensureMinWidth(shot);
+    return ensureMinWidth(await captureVisibleThrottled(windowId));
   }
 
   // ── 2. Pre-pass: sweep + settle, REPEATED until a full sweep adds no more height.
@@ -2252,19 +2615,12 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     // mid-reflow shows whatever happened to be there at that moment, not real content.
     let grew = false;
     try {
-      await chrome.tabs.sendMessage(tabId, {
+      const settled = (await chrome.tabs.sendMessage(tabId, {
         type: 'SCREENSHOT_WAIT_SETTLED',
         payload: { timeoutMs: 6000, quietMs: 500 },
-      } as ExtensionMessage);
-      // Re-flatten AFTER settling: whatever just finished loading may have re-created
-      // a scroll container (re-clipping the page and collapsing the document back to
-      // viewport height). Re-measure only once the page is flat again, so the height
-      // we plan tiles from is the flattened one the capture will actually scroll.
-      const reflattened = (await chrome.tabs.sendMessage(tabId, {
-        type: 'SCREENSHOT_EXPAND_SCROLLERS',
       } as ExtensionMessage)) as { scrollHeight: number };
-      if (reflattened.scrollHeight > scrollHeight) {
-        scrollHeight = reflattened.scrollHeight;
+      if (settled.scrollHeight > scrollHeight) {
+        scrollHeight = settled.scrollHeight;
         grew = true;
       }
     } catch {
@@ -2295,33 +2651,7 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     'settle round(s)',
   );
 
-  // ── 3. Preferred path: render the whole page in ONE shot via CDP ─────────
-  // Nothing scrolls, so the page can't re-render or reset its scroll under us, and
-  // there are no tiles to misalign. Only if this is unavailable (DevTools open on
-  // the tab, or a page too large for one texture) do we fall back to tiling below.
-  {
-    const oneShot = await captureFullPageViaCDP(
-      tabId,
-      viewportWidth,
-      clipY + scrollHeight,
-      Math.min(2, Math.max(1, dpr || 1)),
-    );
-    if (oneShot) {
-      logFullPage('Full-page: captured in a single shot (no scrolling needed)');
-      await restoreScrollers(tabId);
-      try {
-        await chrome.tabs.sendMessage(tabId, {
-          type: 'SCREENSHOT_RESTORE_SCROLL',
-          payload: { x: currentScrollX, y: currentScrollY },
-        } as ExtensionMessage);
-      } catch {
-        /* ignore */
-      }
-      return ensureMinWidth(oneShot);
-    }
-  }
-
-  // ── 4. Classify fixed/sticky overlays (header/sidebar/footer/composer) ───
+  // ── 3. Classify fixed/sticky overlays (header/sidebar/footer/composer) ───
   try {
     await chrome.tabs.sendMessage(tabId, {
       type: 'SCREENSHOT_PREPARE_CAPTURE',
@@ -2338,6 +2668,7 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
   // leaves an undrawn gap with no way to recover it later.
   const rawCaptures: Array<{ dataUrl: string; actualScrollY: number; isFirst: boolean }> = [];
   let warnedLayoutBroken = false;
+  let stoppedEarlyAt: number | null = null;
 
   for (let i = 0; i < positions.length; i++) {
     const targetY = positions[i]!;
@@ -2358,17 +2689,84 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
           );
         }
 
-        const scrolled = (await chrome.tabs.sendMessage(tabId, {
+        await chrome.tabs.sendMessage(tabId, {
           type: 'SCREENSHOT_SCROLL_TO',
           payload: { x: 0, y: targetY },
-        } as ExtensionMessage)) as { actualScrollX: number; actualScrollY: number };
+        } as ExtensionMessage);
 
         // captureVisibleThrottled enforces the ~2/sec quota gap; the page renders
         // (and overlay visibility settles) during that wait. Add a small floor so the
         // compositor paints even on the first (un-throttled) capture.
         await new Promise<void>((r) => setTimeout(r, 120));
 
+        // Where is the page NOW?
+        //
+        // Not where it was put a moment ago. An application that re-renders
+        // while this waits — a live dashboard, a list that refreshes — restores
+        // its own scroll position in exactly that gap, so the photograph is of
+        // the top of the page while the number said otherwise. Recording the
+        // number instead of the truth is what let the same screen be stitched
+        // down the whole image with every tile looking like progress.
+        let scrolled = (await chrome.tabs.sendMessage(tabId, {
+          type: 'SCREENSHOT_GET_SCROLL',
+        } as ExtensionMessage)) as { actualScrollX: number; actualScrollY: number };
+
+        if (Math.abs(scrolled.actualScrollY - targetY) > 4) {
+          // It moved back. Put it where it belongs and give it one more moment;
+          // many apps restore once, on the render that follows the scroll.
+          await chrome.tabs.sendMessage(tabId, {
+            type: 'SCREENSHOT_SCROLL_TO',
+            payload: { x: 0, y: targetY },
+          } as ExtensionMessage);
+          await new Promise<void>((r) => setTimeout(r, 200));
+          scrolled = (await chrome.tabs.sendMessage(tabId, {
+            type: 'SCREENSHOT_GET_SCROLL',
+          } as ExtensionMessage)) as { actualScrollX: number; actualScrollY: number };
+          if (Math.abs(scrolled.actualScrollY - targetY) > 4) {
+            logFullPage(
+              'Full-page: the page moved itself back from',
+              targetY,
+              'to',
+              scrolled.actualScrollY,
+            );
+          }
+        }
+
         const dataUrl = await captureVisibleThrottled(windowId);
+
+        // Did anything actually change? A scroll that did not move, or a frame
+        // identical to the one before it, means the page is not scrolling —
+        // most often because the element we are scrolling is not the one that
+        // holds the content. Stitching those photographs is what produced
+        // captures showing the same screen over and over.
+        const previous = rawCaptures.length
+          ? {
+              actualScrollY: rawCaptures[rawCaptures.length - 1]!.actualScrollY,
+              key: rawCaptures[rawCaptures.length - 1]!.dataUrl,
+            }
+          : null;
+        const verdict = tileVerdict(previous, {
+          actualScrollY: scrolled.actualScrollY,
+          key: dataUrl,
+        });
+        // The reported position said it moved — did the picture? A frame whose
+        // scrolling column is pixel-identical to the one before it carries
+        // nothing new, whatever the scroll position claims.
+        const unchanged =
+          verdict === 'keep' &&
+          previous != null &&
+          (await sameColumnContent(previous.key, dataUrl, {
+            x: Math.round(clipX * (dpr || 1)),
+            y: Math.round(clipY * (dpr || 1)),
+            width: Math.round(clipWidth * (dpr || 1)),
+            height: Math.round(clipHeight * (dpr || 1)),
+          }));
+        if (verdict === 'stop' || unchanged) {
+          stoppedEarlyAt = scrolled.actualScrollY;
+          lastErr = undefined;
+          break;
+        }
+
         rawCaptures.push({ dataUrl, actualScrollY: scrolled.actualScrollY, isFirst: i === 0 });
         lastErr = undefined;
         break;
@@ -2384,6 +2782,17 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     if (lastErr) {
       warnFullPage('Full-page: skipping position after retry', targetY, String(lastErr));
     }
+    if (stoppedEarlyAt != null) break;
+  }
+
+  if (stoppedEarlyAt != null && rawCaptures.length < positions.length) {
+    warnFullPage(
+      'Full-page: the page stopped scrolling at',
+      stoppedEarlyAt,
+      'of',
+      scrollHeight,
+      'px — captured what was reachable rather than repeating the same screen',
+    );
   }
 
   // ── 5. Restore overlays and original scroll position ─────────────────────
@@ -2404,11 +2813,8 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     /* ignore */
   }
 
-  // Un-flatten before returning — the page must be left exactly as we found it.
-  await restoreScrollers(tabId);
-
   if (rawCaptures.length === 0) {
-    return ensureMinWidth(await chrome.tabs.captureVisibleTab(windowId, { format: 'png' }));
+    return ensureMinWidth(await captureVisibleThrottled(windowId));
   }
 
   // ── 6. Build strips ──────────────────────────────────────────────────────
@@ -2436,97 +2842,89 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
     logFullPage('Full-page: devicePixelRatio mismatch — reported', dpr, 'measured', { dprX, dprY });
   }
 
-  const canvasW = Math.round(viewportWidth * dprX);
-  const colSrcX = Math.round(clipX * dprX);
-  const colW = Math.round(clipWidth * dprX);
-  const strips: CaptureStrip[] = [];
-  let prevEndY = 0; // CSS px, in scroll-target content coordinates
-
-  for (const { dataUrl, actualScrollY, isFirst } of rawCaptures) {
-    if (isFirst) {
-      // Full viewport → top of canvas. Covers content rows [0, clipHeight).
-      strips.push({
-        dataUrl,
-        srcX: 0,
-        srcY: 0,
-        srcW: canvasW,
-        srcH: Math.round(viewportHeight * dprY),
-        destX: 0,
-        destY: 0,
-      });
-      prevEndY = clipHeight;
-      continue;
-    }
-
-    const newStart = Math.max(prevEndY, actualScrollY);
-    const newEnd = Math.min(actualScrollY + clipHeight, scrollHeight);
-    if (newEnd <= newStart) continue;
-
-    strips.push({
-      dataUrl,
-      srcX: colSrcX,
-      srcY: Math.round((clipY + (newStart - actualScrollY)) * dprY),
-      srcW: colW,
-      srcH: Math.round((newEnd - newStart) * dprY),
-      destX: colSrcX,
-      destY: Math.round((clipY + newStart) * dprY),
-    });
-    prevEndY = newEnd;
+  // Is the furniture beside the scrolling column really static?
+  //
+  // Tiles after the first only redraw the scrolling column, so whatever sits
+  // beside it is painted from the first frame alone. Repeating that down the
+  // image is right for a sidebar that stays put and catastrophic for anything
+  // that was in fact scrolling — it manufactures content that never existed.
+  // So it is checked rather than assumed, by comparing those columns in two
+  // real frames.
+  const marginsStatic =
+    clipX <= 0 && clipWidth >= viewportWidth - 1
+      ? false // no furniture to repeat
+      : rawCaptures.length < 2
+        ? false
+        : await sameOutsideColumn(
+            rawCaptures[0]!.dataUrl,
+            rawCaptures[1]!.dataUrl,
+            Math.round(clipX * dprX),
+            Math.round(clipWidth * dprX),
+          );
+  if (clipX > 0 && !marginsStatic && rawCaptures.length > 1) {
+    logFullPage(
+      'Full-page: the area beside the scroll column changes between frames —',
+      'not repeating it down the image',
+    );
   }
 
-  if (prevEndY < scrollHeight - 1) {
+  const planned = planStrips(
+    rawCaptures.map((capture) => ({ actualScrollY: capture.actualScrollY })),
+    {
+      viewportWidth,
+      viewportHeight,
+      clipX,
+      clipY,
+      clipWidth,
+      clipHeight,
+      contentHeight: scrollHeight,
+      dprX,
+      dprY,
+    },
+    { marginsStatic },
+  );
+  const strips: CaptureStrip[] = planned.strips.map((strip) => ({
+    dataUrl: rawCaptures[strip.tile]!.dataUrl,
+    srcX: strip.srcX,
+    srcY: strip.srcY,
+    srcW: strip.srcW,
+    srcH: strip.srcH,
+    destX: strip.destX,
+    destY: strip.destY,
+    destW: strip.destW,
+    destH: strip.destH,
+  }));
+  const canvasW = planned.canvasWidth;
+  const canvasH = planned.canvasHeight;
+
+  if (planned.coveredCssHeight < scrollHeight - 1) {
     warnFullPage(
       'Full-page: only captured',
-      prevEndY,
+      Math.round(planned.coveredCssHeight),
       'of',
-      scrollHeight,
+      Math.round(scrollHeight),
       '— cropping output instead of leaving a blank tail',
     );
   }
-  const canvasH = Math.round((clipY + prevEndY) * dprY);
-
-  // A full-height sidebar/margin sitting OUTSIDE the scroll column (a flex sibling of
-  // the scroll target, not itself detected as an overlay — e.g. Jira's own left nav)
-  // shows the SAME pixels in every tile, since it doesn't scroll. But tiles after the
-  // first only redraw the scroll column, never that margin's X-range, so it would
-  // otherwise sit at the canvas's default black fill for the rest of the page. Tile
-  // frame 1's own margin columns downward to cover the remaining height instead.
-  const frameH = Math.round(viewportHeight * dprY);
-  if (canvasH > frameH) {
-    const rightMarginX = colSrcX + colW;
-    const rightMarginW = canvasW - rightMarginX;
-    for (let y = frameH; y < canvasH; y += frameH) {
-      const h = Math.min(frameH, canvasH - y);
-      if (colSrcX > 0) {
-        strips.push({
-          dataUrl: firstDataUrl,
-          srcX: 0,
-          srcY: 0,
-          srcW: colSrcX,
-          srcH: h,
-          destX: 0,
-          destY: y,
-        });
-      }
-      if (rightMarginW > 0) {
-        strips.push({
-          dataUrl: firstDataUrl,
-          srcX: rightMarginX,
-          srcY: 0,
-          srcW: rightMarginW,
-          srcH: h,
-          destX: rightMarginX,
-          destY: y,
-        });
-      }
-    }
-  }
 
   try {
-    return await ensureMinWidth(await stitchCaptures(strips, canvasW, canvasH));
+    const stitched = await stitchCaptures(strips, canvasW, canvasH);
+    // The last word on the result, whatever produced it. Nothing that is one
+    // screen stamped out repeatedly is worth handing to anybody: a single
+    // honest screenful is better than a long image that looks like the page
+    // until you read it.
+    if (await looksRepeated(stitched, viewportHeight, dprY)) {
+      warnFullPage(
+        'Full-page: the stitched image came out as the same screen repeated — this page',
+        'did not scroll, so a single screen was captured instead',
+      );
+      return ensureMinWidth(rawCaptures[0]!.dataUrl);
+    }
+    fullPageDetails += ` · ${rawCaptures.length}/${positions.length} frames → ${canvasW}×${canvasH}`;
+    return await ensureMinWidth(stitched);
   } catch (err) {
     warnFullPage('Full-page: stitch failed, falling back:', String(err));
-    return ensureMinWidth(await chrome.tabs.captureVisibleTab(windowId, { format: 'png' }));
+    return ensureMinWidth(await captureVisibleThrottled(windowId));
   }
 }
 
@@ -2536,10 +2934,7 @@ async function captureFullPage(tabId: number, windowId: number): Promise<string>
  */
 async function ensureContentScript(tabId: number): Promise<void> {
   try {
-    // Ping via a lightweight synchronous handler
-    await chrome.tabs.sendMessage(tabId, {
-      type: 'SCREENSHOT_GET_DIMENSIONS',
-    } as ExtensionMessage);
+    await chrome.tabs.sendMessage(tabId, { type: 'SCREENSHOT_PING' } as ExtensionMessage);
   } catch {
     // Content script not present (page was open before extension loaded/reloaded) — inject it
     try {
@@ -2581,6 +2976,7 @@ async function handleTakeScreenshot(
 
     let dataUrl: string;
     let warnings: string[] = [];
+    let details = '';
 
     if (screenshotType === 'visible') {
       dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'png' });
@@ -2590,6 +2986,7 @@ async function handleTakeScreenshot(
       // visible to whoever took it, not just to someone who happens to have the
       // background service worker's devtools console open.
       warnings = [...fullPageWarnings];
+      details = fullPageDetails;
     } else {
       // area — show the selector overlay; preview fires after SCREENSHOT_AREA_SELECTED
       await chrome.tabs.sendMessage(tabId, {
@@ -2603,7 +3000,7 @@ async function handleTakeScreenshot(
     try {
       await chrome.tabs.sendMessage(tabId, {
         type: 'SCREENSHOT_SHOW_PREVIEW',
-        payload: { dataUrl, warnings },
+        payload: { dataUrl, warnings, details },
       } as ExtensionMessage);
     } catch {
       await downloadScreenshot(dataUrl);

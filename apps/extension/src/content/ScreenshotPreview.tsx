@@ -3,10 +3,18 @@ import { useState, useCallback } from 'react';
 interface ScreenshotPreviewProps {
   dataUrl: string;
   warnings?: string[];
+  /**
+   * One line of plain fact about how this capture was taken.
+   *
+   * Shown always, quietly. A report about a screenshot is impossible to act on
+   * without knowing which build took it, what it measured and which path it
+   * used, and that information is only ever in a console nobody has open.
+   */
+  details?: string;
   onClose: () => void;
 }
 
-export function ScreenshotPreview({ dataUrl, warnings, onClose }: ScreenshotPreviewProps) {
+export function ScreenshotPreview({ dataUrl, warnings, details, onClose }: ScreenshotPreviewProps) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState(false);
   const [warningsExpanded, setWarningsExpanded] = useState(false);
@@ -140,6 +148,20 @@ export function ScreenshotPreview({ dataUrl, warnings, onClose }: ScreenshotPrev
             Close
           </button>
         </div>
+
+        {details && (
+          <div
+            style={{
+              fontSize: 11,
+              color: 'rgba(148,163,184,0.75)',
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              padding: '2px 2px 0',
+              userSelect: 'text',
+            }}
+          >
+            {details}
+          </div>
+        )}
 
         {/* Capture warnings — surfaces a partial/incomplete full-page capture
             directly, so it's visible without opening devtools. */}

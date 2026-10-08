@@ -1481,19 +1481,51 @@ await scenario('a worker that died mid-session shows no MON for a session that e
   return next;
 });
 
-await scenario('signed out, still capturing → MON stays, and nothing is thrown away', async () => {
+await scenario('signed out, still capturing → the toolbar asks for a sign-in, nothing is lost', async () => {
   const env = await environment();
   await env.start();
   await env.advance(5 * MIN);
   env.server.revokeSignIns();
   await env.advance(20 * MIN);
+
   // Monitoring is genuinely running and frames are genuinely being captured;
-  // they are queued rather than uploaded, which the popup explains. The badge
-  // tells the truth about capture, not about the upload.
-  ok(env.badge === 'MON', `badge "${env.badge}" while still capturing`);
+  // they are queued rather than uploaded. From the outside such a session looks
+  // completely normal, so the badge stops saying MON and asks for the one thing
+  // only a person can do.
+  ok(env.badge !== 'MON', 'a signed-out session still looked like a healthy one');
+  ok(env.badge === 'LOG', `badge "${env.badge}" while signed out`);
   const state = await env.state();
   ok(state.queuedSnapshots > 20, `only ${state.queuedSnapshots} screenshots kept`);
   ok(state.failedSnapshots === 0, `${state.failedSnapshots} thrown away`);
+  ok(state.status === 'monitoring', `monitoring stopped at sign-out: ${state.status}`);
+  return env;
+});
+
+await scenario('the agent drops mid-session → capture resumes by itself, and says so meanwhile', async () => {
+  const env = await environment();
+  const first = await env.start();
+  await env.advance(5 * MIN);
+  const before = env.agent.framesSent;
+
+  env.agent.crash(); // the native port dies, as it does on Windows
+  await env.advance(2 * MIN);
+  const during = await env.state();
+  ok(during.status === 'monitoring', `the session ended over a dropped agent: ${during.status}`);
+  ok(during.capture.status !== 'active', `capture still claims to be working: ${during.capture.status}`);
+  ok(
+    !/install/i.test(during.capture.error ?? ''),
+    `told to reinstall an agent that was working: ${during.capture.error}`,
+  );
+
+  await new Promise((r) => setTimeout(r, 1200)); // the extension relaunches it
+  await env.advance(5 * MIN);
+
+  const after = await env.state();
+  ok(after.capture.status === 'active', `capture did not resume by itself: ${after.capture.status}`);
+  ok(env.agent.framesSent > before, 'no frames after the agent came back');
+  ok(env.server.totalSnapshots() === env.agent.framesSent,
+    `${env.server.totalSnapshots()} stored of ${env.agent.framesSent} captured`);
+  ok(env.session(first.sessionId).status === 'ACTIVE', 'the session should still be live');
   return env;
 });
 

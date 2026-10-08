@@ -17,6 +17,7 @@ import { FloatingToolbar } from './FloatingToolbar';
 import { AnnotationCanvas } from './AnnotationCanvas';
 import { ScreenshotSelector } from './ScreenshotSelector';
 import { ScreenshotPreview } from './ScreenshotPreview';
+import { openPage, restoreOpenedPage, scrollOpenedPage } from './pageOpener';
 
 declare global {
   interface Window {
@@ -132,11 +133,6 @@ let screenshotOverlays: Array<{ el: HTMLElement; anchor: OverlayAnchor; prevVisi
 // observer, etc.) and reflow anyway. Comparing against this after hiding catches that
 // instead of silently capturing a page whose layout just collapsed.
 let screenshotLayoutBaseline = 0;
-
-// Inline styles saved before a full-page capture "flattens" the page — see
-// SCREENSHOT_EXPAND_SCROLLERS. Restored verbatim afterwards.
-let expandedScrollers: Array<{ el: HTMLElement; cssText: string }> = [];
-let flattenedEls = new WeakSet<HTMLElement>();
 
 /**
  * Find the element that actually scrolls the bulk of the page.
@@ -662,7 +658,7 @@ function unmountScreenshotSelector(): void {
 
 // ─── Screenshot Preview Management ───────────────────────────────────────────
 
-function mountScreenshotPreview(dataUrl: string, warnings?: string[]): void {
+function mountScreenshotPreview(dataUrl: string, warnings?: string[], details?: string): void {
   console.log(
     '[Content Script] mountScreenshotPreview called with dataUrl length:',
     dataUrl.length,
@@ -680,6 +676,7 @@ function mountScreenshotPreview(dataUrl: string, warnings?: string[]): void {
     createElement(ScreenshotPreview, {
       dataUrl,
       warnings,
+      details,
       onClose: unmountScreenshotPreview,
     }),
   );
@@ -907,135 +904,31 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
 
     // ── Screenshot workflow ──────────────────────────────────────────────────
 
-    case 'SCREENSHOT_EXPAND_SCROLLERS': {
-      // "Flatten" the page before a full-page capture: every inner scroll container
-      // is expanded to its full content height and its clipping removed, so ALL the
-      // content lands in normal document flow and the DOCUMENT becomes the scroller.
-      //
-      // Why this matters: SPAs like Jira keep the document at viewport height and
-      // scroll an inner div. Capturing that means scrolling the inner box tile by
-      // tile — which fights lazy-loading, re-renders content mid-capture (the page
-      // visibly "refreshing"), repeats sticky bars, and leaves gaps wherever the
-      // geometry shifted between tiles. Flattened, the page behaves like a plain
-      // long document, which is the case that captures reliably.
-      // Additive on purpose: an SPA can re-create a scroll container AFTER we've
-      // flattened it (a loading-skeleton swap, a route re-render), which silently
-      // restores its clipping and collapses the document back to viewport height.
-      // So this runs repeatedly during a capture, and only records a node's ORIGINAL
-      // cssText the first time it's seen — re-saving later would capture our own
-      // flattened styles and make RESTORE a no-op.
-      const save = (el: HTMLElement) => {
-        if (!flattenedEls.has(el)) {
-          flattenedEls.add(el);
-          expandedScrollers.push({ el, cssText: el.style.cssText });
-        }
-      };
-      /** Remove clipping only — never touches height, so % chains stay intact. */
-      const unclip = (el: HTMLElement) => {
-        save(el);
-        el.style.setProperty('overflow-y', 'visible', 'important');
-        el.style.setProperty('overflow-x', 'visible', 'important');
-      };
-      /** Expand a scroll container to its full content height AND remove clipping. */
-      const expand = (el: HTMLElement) => {
-        save(el);
-        el.style.setProperty('height', 'auto', 'important');
-        el.style.setProperty('max-height', 'none', 'important');
-        el.style.setProperty('overflow-y', 'visible', 'important');
-        el.style.setProperty('overflow-x', 'visible', 'important');
-      };
+    case 'SCREENSHOT_PING': {
+      // Cheap liveness probe: is a current instance of this script listening?
+      sendResponse({ ok: true });
+      break;
+    }
 
-      // What the page could show BEFORE we touch it. If flattening ends up making the
-      // page shorter than this, the layout collapsed (e.g. a `height:100%` chain lost
-      // its definite parent height) and we must put everything back — a collapsed page
-      // captures far worse than the un-flattened one we started from.
-      const before = Math.max(
-        document.documentElement.scrollHeight,
-        screenshotScrollEl?.scrollHeight ?? 0,
-      );
-
-      try {
-        // Collect targets BEFORE mutating anything: expanding as we go changes the
-        // very geometry (clientHeight/scrollHeight) used to decide what qualifies.
-        const targets: HTMLElement[] = [];
-        document.querySelectorAll<HTMLElement>('*').forEach((el) => {
-          try {
-            if (el.hasAttribute('data-bestq')) return; // never touch our own UI
-            const style = window.getComputedStyle(el);
-            const scrolls = style.overflowY === 'auto' || style.overflowY === 'scroll';
-            // A tiny widget (emoji picker, dropdown) that happens to scroll isn't page
-            // structure — expanding it would balloon the layout, not reveal content.
-            // Only flatten boxes big enough to be holding real page content.
-            const bigEnough =
-              el.clientHeight >= window.innerHeight * 0.3 &&
-              el.clientWidth >= window.innerWidth * 0.3;
-            if (scrolls && bigEnough && el.scrollHeight > el.clientHeight + 4) targets.push(el);
-          } catch {
-            /* skip elements that throw on getComputedStyle */
-          }
-        });
-
-        for (const el of targets) {
-          expand(el);
-          // An expanded box still gets clipped by any ancestor that hides overflow, so
-          // its new height would never reach the document. Unclip the chain — WITHOUT
-          // changing heights, which is what collapses percentage-based layouts.
-          for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
-            const ps = window.getComputedStyle(p);
-            if (ps.overflowY !== 'visible' || ps.overflowX !== 'visible') unclip(p);
-          }
-        }
-
-        // Neutralise `position: sticky`. In a full-page render a stuck element is
-        // painted wherever it happens to be pinned, so it lands in the MIDDLE of the
-        // image covering real content. As `static` it flows to its natural place and
-        // is shown exactly once. (`fixed` is deliberately left alone — it renders once
-        // at the top, which is what you want for a page header.)
-        document.querySelectorAll<HTMLElement>('*').forEach((el) => {
-          try {
-            if (el.hasAttribute('data-bestq')) return;
-            if (window.getComputedStyle(el).position === 'sticky') {
-              save(el);
-              el.style.setProperty('position', 'static', 'important');
-            }
-          } catch {
-            /* skip elements that throw on getComputedStyle */
-          }
-        });
-
-        // Finally let the viewport itself scroll (overflow only — never height).
-        unclip(document.documentElement);
-        if (document.body) unclip(document.body);
-      } catch {
-        /* ignore on restricted pages */
-      }
-
-      // Let the reflow settle before anyone measures the new document height.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          const after = document.documentElement.scrollHeight;
-          if (after < before - 4) {
-            // Flattening lost content — revert to exactly how we found the page.
-            for (const s of expandedScrollers) s.el.style.cssText = s.cssText;
-            expandedScrollers = [];
-            flattenedEls = new WeakSet<HTMLElement>();
-            screenshotScrollEl = findScrollTarget();
-            sendResponse({ expanded: 0, scrollHeight: before, reverted: true });
-            return;
-          }
-          screenshotScrollEl = null; // the document scrolls now
-          sendResponse({ expanded: expandedScrollers.length, scrollHeight: after });
-        });
-      });
+    case 'SCREENSHOT_EXPAND_PAGE': {
+      // Lay the whole page out at full size — every scroll container, nested
+      // and sideways ones included — so the document holds all of it and the
+      // window can be photographed down it like a plain long page. Additive:
+      // sent again after lazy content loads, it opens only what is new. See
+      // pageOpener.ts.
+      screenshotScrollEl = null; // the window scrolls the opened page
+      void openPage().then(sendResponse);
       return true; // async
     }
 
-    case 'SCREENSHOT_RESTORE_SCROLLERS': {
-      for (const s of expandedScrollers) {
-        s.el.style.cssText = s.cssText;
-      }
-      expandedScrollers = [];
-      flattenedEls = new WeakSet<HTMLElement>();
+    case 'SCREENSHOT_PAGE_SCROLL': {
+      const { x, y, hideLate } = message.payload as { x: number; y: number; hideLate?: boolean };
+      void scrollOpenedPage(x, y, hideLate === true).then(sendResponse);
+      return true; // async
+    }
+
+    case 'SCREENSHOT_RESTORE_PAGE': {
+      restoreOpenedPage();
       sendResponse({ success: true });
       break;
     }
@@ -1063,6 +956,11 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           clipWidth: el.clientWidth,
           clipHeight: el.clientHeight,
           scrollTargetDescription: describeScrollTarget(el),
+          // The DOCUMENT's own size, which is what a single-shot render can
+          // actually produce — here it is typically just one viewport, because
+          // the content is inside this panel rather than in the page.
+          documentScrollHeight: document.documentElement.scrollHeight,
+          documentScrollWidth: document.documentElement.scrollWidth,
         });
       } else {
         // Window/document scrolls — the clip column is the full viewport.
@@ -1078,6 +976,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           clipWidth: window.innerWidth,
           clipHeight: window.innerHeight,
           scrollTargetDescription: 'window/document (whole page scrolls)',
+          documentScrollHeight: document.documentElement.scrollHeight,
+          documentScrollWidth: document.documentElement.scrollWidth,
         });
       }
       break;
@@ -1164,6 +1064,23 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         });
       });
       return true; // async
+    }
+
+    case 'SCREENSHOT_GET_SCROLL': {
+      // Where the page is RIGHT NOW, which is not necessarily where it was put.
+      // An application that re-renders — a live dashboard, a list that refreshes
+      // — restores its own scroll position, and does it in the moment between
+      // being scrolled and being photographed. Asking again at capture time is
+      // the difference between recording where the page was asked to be and
+      // where it actually is.
+      reresolveScrollTargetIfDetached();
+      const current = screenshotScrollEl;
+      sendResponse(
+        current
+          ? { actualScrollX: current.scrollLeft, actualScrollY: current.scrollTop }
+          : { actualScrollX: window.scrollX, actualScrollY: window.scrollY },
+      );
+      break;
     }
 
     case 'SCREENSHOT_RESTORE_SCROLL': {
@@ -1255,9 +1172,16 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
     }
 
     case 'SCREENSHOT_SHOW_PREVIEW': {
-      const { dataUrl, warnings } = message.payload as { dataUrl: string; warnings?: string[] };
+      const { dataUrl, warnings, details } = message.payload as {
+        dataUrl: string;
+        warnings?: string[];
+        details?: string;
+      };
       console.log('[Content Script] Mounting screenshot preview');
-      mountScreenshotPreview(dataUrl, warnings);
+      // The capture's own styles hide our UI; never let a capture that ended
+      // without putting the page back hide the preview of it too.
+      restoreOpenedPage();
+      mountScreenshotPreview(dataUrl, warnings, details);
       sendResponse({ success: true });
       break;
     }

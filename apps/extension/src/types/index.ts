@@ -221,6 +221,7 @@ export type MessageType =
   | 'RECORDING_UPLOAD_FORGET'
   | 'LIST_RECORDING_UPLOADS'
   | 'HOLD_RECORDING_FILE'
+  | 'SCREENSHOT_GET_SCROLL'
   | 'RECORDING_UPLOADS_CHANGED'
   // Screen monitoring — popup ⇄ background. The popup only sends intents; the
   // session itself is owned by the background (see monitoring.manager.ts).
@@ -232,9 +233,11 @@ export type MessageType =
   | 'MONITORING_RECONNECT_CAPTURE'
   | 'MONITORING_STATE_CHANGED'
   // Screenshot workflow messages (background ↔ content script)
+  | 'SCREENSHOT_PING'
   | 'SCREENSHOT_GET_DIMENSIONS'
-  | 'SCREENSHOT_EXPAND_SCROLLERS'
-  | 'SCREENSHOT_RESTORE_SCROLLERS'
+  | 'SCREENSHOT_EXPAND_PAGE'
+  | 'SCREENSHOT_PAGE_SCROLL'
+  | 'SCREENSHOT_RESTORE_PAGE'
   | 'SCREENSHOT_WAIT_SETTLED'
   | 'SCREENSHOT_SCROLL_TO'
   | 'SCREENSHOT_RESTORE_SCROLL'

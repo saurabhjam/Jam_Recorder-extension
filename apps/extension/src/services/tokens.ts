@@ -30,6 +30,16 @@ import {
 
 const LOCK_KEY = 'st_auth_refresh_lock';
 
+/**
+ * When the current sign-in began — not when it was last refreshed.
+ *
+ * Set once, by whichever path first stores tokens, and left alone by every
+ * refresh afterwards. A refresh that reset it would make the session immortal:
+ * the nightly sign-out asks "when did this person sign in", and the answer must
+ * not be "four minutes ago, as always".
+ */
+const SIGNED_IN_AT_KEY = 'st_auth_signed_in_at';
+
 export type RefreshOutcome =
   | { ok: true; tokens: AuthTokens; by: 'this-realm' | 'another-realm' }
   | { ok: false; verdict: RefreshVerdict | 'no-refresh-token'; error?: string };
@@ -48,6 +58,7 @@ export async function readTokens(): Promise<AuthTokens | null> {
 
 export async function writeTokens(tokens: AuthTokens): Promise<void> {
   await chrome.storage.local.set({ [STORAGE_KEYS.AUTH_TOKENS]: tokens });
+  await startSessionClock();
   broadcast('TOKEN_REFRESHED', { accessToken: tokens.accessToken, expiresAt: tokens.expiresAt });
 }
 
@@ -56,11 +67,34 @@ export async function writeTokens(tokens: AuthTokens): Promise<void> {
  * and keeps everything in its outbox, and uploads once the person signs in
  * again. Losing a token is not a reason to lose the day's record.
  */
+/** Note when this sign-in began, if it is not already noted. */
+export async function startSessionClock(): Promise<void> {
+  try {
+    const stored = await chrome.storage.local.get([SIGNED_IN_AT_KEY]);
+    if (typeof stored[SIGNED_IN_AT_KEY] === 'number') return;
+    await chrome.storage.local.set({ [SIGNED_IN_AT_KEY]: Date.now() });
+  } catch {
+    /* without it the nightly sign-out simply does not fire */
+  }
+}
+
+/** When the current sign-in began, or null. */
+export async function sessionStartedAt(): Promise<number | null> {
+  try {
+    const stored = await chrome.storage.local.get([SIGNED_IN_AT_KEY]);
+    const at = stored[SIGNED_IN_AT_KEY];
+    return typeof at === 'number' ? at : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function clearTokens(): Promise<void> {
   await chrome.storage.local.remove([
     STORAGE_KEYS.AUTH_USER,
     STORAGE_KEYS.AUTH_TOKENS,
     STORAGE_KEYS.AUTH_SESSION_ID,
+    SIGNED_IN_AT_KEY,
   ]);
   broadcast('AUTH_STATE_CHANGED', { isAuthenticated: false });
 }

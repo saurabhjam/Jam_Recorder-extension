@@ -62,6 +62,25 @@ let screenshotEverySeconds = 0;
 /** Reconnect bookkeeping. */
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** When the current port was opened, for telling a blip from a flap. */
+let connectedAt = 0;
+/** How long recent connections lasted, newest last. */
+let recentLifetimesMs: number[] = [];
+/** A connection shorter than this did not really work. */
+const SHORT_LIFE_MS = 20_000;
+const FLAP_THRESHOLD = 3;
+
+/**
+ * The largest frame worth asking the agent for, in bytes.
+ *
+ * Chrome refuses a native message over 1 MB and closes the port — which it
+ * reports only as "Error when communicating with the native messaging host",
+ * the message people have been seeing mid-session on large Windows displays.
+ * This leaves room for the message's own envelope and base64's third. An agent
+ * that does not know the field ignores it, so sending it costs nothing.
+ */
+const MAX_FRAME_BYTES = 600_000;
 let wantConnection = false;
 
 /** Last heartbeat, so a silent-but-open port is still detectable. */
@@ -341,6 +360,7 @@ function handleMessage(raw: unknown): void {
 
       reconnectAttempt = 0;
       lastHeartbeatAt = Date.now();
+      connectedAt = Date.now();
 
       // A connected agent that cannot see the foreground window is not usable
       // for application tracking; say which of the two reasons it is.
@@ -367,6 +387,7 @@ function handleMessage(raw: unknown): void {
           // Replayed on re-bind: without it an agent restart would leave the
           // session running with activity but no screenshots at all.
           screenshotIntervalSeconds: screenshotEverySeconds || undefined,
+          maxFrameBytes: MAX_FRAME_BYTES,
         });
       }
       return;
@@ -423,6 +444,7 @@ function handleMessage(raw: unknown): void {
 
     case 'HEARTBEAT':
       lastHeartbeatAt = Date.now();
+      noteStableConnection();
       // Capabilities ride along, so a permission granted mid-session takes
       // effect here too. Held to the same validation as the initial READY —
       // and the previous value is kept if a heartbeat omits them, so an older
@@ -488,19 +510,46 @@ function handleMessage(raw: unknown): void {
   }
 }
 
+/**
+ * Why an agent that was working keeps dropping.
+ *
+ * Chrome ends a native connection with one flat message — "Error when
+ * communicating with the native messaging host" — whatever the cause, and that
+ * sentence tells nobody anything. Repeated short-lived connections narrow it
+ * down to the two things that actually produce it on a machine where the agent
+ * is installed and was working minutes ago.
+ */
+function flappingExplanation(): string | null {
+  const recent = recentLifetimesMs.slice(-FLAP_THRESHOLD);
+  if (recent.length < FLAP_THRESHOLD) return null;
+  if (!recent.every((life) => life < SHORT_LIFE_MS)) return null;
+  return (
+    'The BestQ agent keeps disconnecting moments after it connects. ' +
+    'On Windows this is almost always a screenshot too large for the browser to accept ' +
+    '(a high-resolution or multi-monitor display), or security software closing the agent. ' +
+    'Monitoring keeps running and nothing is lost; screenshots resume when it stays connected.'
+  );
+}
+
 function handleDisconnect(): void {
   const reason = chrome.runtime.lastError?.message ?? null;
   port = null;
+  if (connectedAt > 0) {
+    recentLifetimesMs = [...recentLifetimesMs, Date.now() - connectedAt].slice(-6);
+    connectedAt = 0;
+  }
 
   // "Specified native messaging host not found" is the expected message when
   // the agent was never installed. That is a state to report, not an error to
   // keep retrying — so it stops the backoff.
   const notInstalled = Boolean(reason && /not found|not installed/i.test(reason));
 
+  const flapping = notInstalled ? null : flappingExplanation();
+  if (flapping) console.warn('[NativeAgent]', flapping);
   setState({
     status: notInstalled ? 'unavailable' : 'disconnected',
     lastHeartbeatAt: state.lastHeartbeatAt,
-    error: reason,
+    error: flapping ?? reason,
   });
 
   if (notInstalled || !wantConnection) return;
@@ -515,6 +564,11 @@ function handleDisconnect(): void {
  * and an agent that never comes back should not have the extension spawning a
  * process launch every second for eight hours.
  */
+/** A connection that has lasted is evidence the trouble has passed. */
+function noteStableConnection(): void {
+  if (connectedAt > 0 && Date.now() - connectedAt > SHORT_LIFE_MS) recentLifetimesMs = [];
+}
+
 function scheduleReconnect(): void {
   if (reconnectTimer) return;
   const delay =
@@ -575,6 +629,7 @@ export function startNativeMonitoring(
     // while the browser is in the background — which, for a tool that watches
     // what someone does in *other* applications, is most of the time.
     screenshotIntervalSeconds: screenshotIntervalSeconds || undefined,
+    maxFrameBytes: MAX_FRAME_BYTES,
   });
 }
 

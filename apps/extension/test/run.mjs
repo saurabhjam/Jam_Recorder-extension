@@ -28,9 +28,11 @@ execFileSync(
     resolve(here, '..', 'src', 'utils', 'monitoringSyncPolicy.ts'),
     resolve(here, '..', 'src', 'utils', 'monitoringInactivity.ts'),
     resolve(here, '..', 'src', 'utils', 'authRefreshPolicy.ts'),
+    resolve(here, '..', 'src', 'utils', 'sessionLifetime.ts'),
     resolve(here, '..', 'src', 'utils', 'monitoringBadge.ts'),
     resolve(here, '..', 'src', 'utils', 'recordingUploadPolicy.ts'),
     resolve(here, '..', 'src', 'utils', 'webmDuration.ts'),
+    resolve(here, '..', 'src', 'utils', 'fullPagePlan.ts'),
     '--outDir',
     outDir,
     '--module',
@@ -52,11 +54,13 @@ execFileSync(process.execPath, [resolve(here, 'monitoringInactivity.test.mjs')],
   stdio: 'inherit',
 });
 execFileSync(process.execPath, [resolve(here, 'authRefreshPolicy.test.mjs')], { stdio: 'inherit' });
+execFileSync(process.execPath, [resolve(here, 'sessionLifetime.test.mjs')], { stdio: 'inherit' });
 execFileSync(process.execPath, [resolve(here, 'monitoringBadge.test.mjs')], { stdio: 'inherit' });
 execFileSync(process.execPath, [resolve(here, 'recordingUploadPolicy.test.mjs')], {
   stdio: 'inherit',
 });
 execFileSync(process.execPath, [resolve(here, 'webmDuration.test.mjs')], { stdio: 'inherit' });
+execFileSync(process.execPath, [resolve(here, 'fullPagePlan.test.mjs')], { stdio: 'inherit' });
 
 // The real background code end to end, against a simulated agent, OS, server
 // and chrome.*. Skips itself, with a note, when fake-indexeddb is not available.

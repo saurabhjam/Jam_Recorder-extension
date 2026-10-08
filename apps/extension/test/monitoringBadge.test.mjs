@@ -96,6 +96,33 @@ t('a session that has never captured anything is not MON', () => {
   eq(badge({ lastCaptureAtMs: null }).text, BADGE.STALLED.text);
 });
 
+// ── Signed out, but still recording ──
+t('a session with nobody signed in gets its own badge, not MON', () => {
+  const view = badge({ signedOut: true });
+  eq(view.text, BADGE.SIGNED_OUT.text);
+  ok(!view.text.includes('MON'), 'a signed-out session must not look like a healthy one');
+  ok(view.text.length <= 4, 'the toolbar shows about four characters');
+});
+
+t('signing in is said before a stalled capture, because only a person can do it', () => {
+  eq(badge({ signedOut: true, captureStatus: 'failed' }).text, BADGE.SIGNED_OUT.text);
+  eq(badge({ signedOut: true, agentStatus: 'disconnected' }).text, BADGE.SIGNED_OUT.text);
+});
+
+t('a paused session with nobody signed in says so too', () => {
+  eq(badge({ signedOut: true, status: 'paused' }).text, BADGE.SIGNED_OUT.text);
+});
+
+t('being signed out means nothing when no session is running', () => {
+  eq(badge({ signedOut: true, status: 'idle' }).text, '');
+  eq(badge({ signedOut: true, recordingOwnsBadge: true }), null);
+});
+
+t('signed in is the ordinary case and is unaffected', () => {
+  eq(badge({ signedOut: false }).text, BADGE.ACTIVE.text);
+  eq(badge({}).text, BADGE.ACTIVE.text);
+});
+
 // ── Sharing the toolbar with a recording ──
 t('a recording keeps the badge, and monitoring does not fight it', () => {
   eq(badge({ recordingOwnsBadge: true }), null);

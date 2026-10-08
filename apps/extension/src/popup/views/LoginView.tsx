@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { AlertCircle, KeyRound } from 'lucide-react';
 // import { Lock, User, Eye, EyeOff } from 'lucide-react'; // password-mode icons — see below
@@ -95,6 +95,24 @@ export function LoginView({ onSuccess }: LoginViewProps) {
     }
   };
 
+  // Is a monitoring session running behind this screen? Asked of the background,
+  // which owns the session; the popup only reports it.
+  const [monitoringLive, setMonitoringLive] = useState(false);
+  useEffect(() => {
+    void (async () => {
+      try {
+        // The handler answers with the state itself, not a wrapper.
+        const state = (await chrome.runtime.sendMessage({ type: 'MONITORING_GET_STATE' })) as
+          | { status?: string }
+          | undefined;
+        const status = state?.status;
+        setMonitoringLive(status === 'monitoring' || status === 'paused');
+      } catch {
+        /* the worker is asleep or has nothing to say */
+      }
+    })();
+  }, []);
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
@@ -130,6 +148,20 @@ export function LoginView({ onSuccess }: LoginViewProps) {
             <InstanceBadge size={16} />
           </div>
         </motion.div>
+
+        {/*
+          Being signed out does not stop monitoring, and somebody looking at a
+          login screen has every reason to assume it did. What was recorded
+          while signed out is kept and uploads as soon as they are back in.
+        */}
+        {monitoringLive && (
+          <div className="mt-4 rounded-xl border border-jam-500/30 bg-jam-500/10 px-3 py-2.5">
+            <p className="text-[11px] leading-4 text-jam-100">
+              <span className="font-semibold">Monitoring is still running.</span> It kept recording
+              while you were signed out — sign in and everything it saved will upload.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Form */}
